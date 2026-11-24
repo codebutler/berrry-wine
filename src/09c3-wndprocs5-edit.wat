@@ -1713,22 +1713,15 @@
 	                    (local.get $line_y) (i32.sub (local.get $h) (i32.const 2)) (local.get $lo)
 	                    (i32.const 0) (i32.sub (local.get $total_lines) (i32.const 1))
 	                    (local.get $visible_lines))))
-	                (if (i32.eq (local.get $b) (i32.const 1))
-	                  (then (drop (call $edit_scroll_to (local.get $hwnd) (local.get $state_w)
-	                    (i32.sub (local.get $lo) (i32.const 1))
-	                    (local.get $total_lines) (local.get $visible_lines)))))
-	                (if (i32.eq (local.get $b) (i32.const 2))
-	                  (then (drop (call $edit_scroll_to (local.get $hwnd) (local.get $state_w)
-	                    (i32.add (local.get $lo) (i32.const 1))
-	                    (local.get $total_lines) (local.get $visible_lines)))))
-	                (if (i32.eq (local.get $b) (i32.const 3))
-	                  (then (drop (call $edit_scroll_to (local.get $hwnd) (local.get $state_w)
-	                    (i32.sub (local.get $lo) (local.get $visible_lines))
-	                    (local.get $total_lines) (local.get $visible_lines)))))
-	                (if (i32.eq (local.get $b) (i32.const 4))
-	                  (then (drop (call $edit_scroll_to (local.get $hwnd) (local.get $state_w)
-	                    (i32.add (local.get $lo) (local.get $visible_lines))
-	                    (local.get $total_lines) (local.get $visible_lines)))))
+	                ;; Arrow and page presses scroll through WM_VSCROLL sent to
+	                ;; the control itself, as USER's scrollbar tracking does: a
+	                ;; subclass of the edit sees the scroll before the edit
+	                ;; moves (part 1..4 is SB_LINEUP..SB_PAGEDOWN, one less).
+	                (if (i32.and (i32.ge_u (local.get $b) (i32.const 1))
+	                             (i32.le_u (local.get $b) (i32.const 4)))
+	                  (then (drop (call $wnd_send_message
+	                    (local.get $hwnd) (i32.const 0x0115)
+	                    (i32.sub (local.get $b) (i32.const 1)) (i32.const 0)))))
 	                (if (i32.eq (local.get $b) (i32.const 5))
 	                  (then
 	                    (global.set $edit_sb_drag_anchor_y (local.get $h))
@@ -1837,14 +1830,18 @@
 	            (local.set $a (call $edit_view_metrics (local.get $hwnd) (local.get $state_w)))
 	            (local.set $total_lines (i32.and (local.get $a) (i32.const 0xFFFF)))
 	            (local.set $visible_lines (i32.shr_u (local.get $a) (i32.const 16)))
-	            (drop (call $edit_scroll_to (local.get $hwnd) (local.get $state_w)
-	              (call $sb_page_drag_pos
-	                (local.get $line_y) (local.get $h)
-	                (global.get $edit_sb_drag_anchor_y) (global.get $edit_sb_drag_anchor_top)
-	                (i32.const 0) (i32.sub (local.get $total_lines) (i32.const 1))
-	                (local.get $visible_lines))
-	              (local.get $total_lines) (local.get $visible_lines)))
-	            (call $invalidate_hwnd (local.get $hwnd))
+	            ;; SB_THUMBTRACK with the line the thumb points at, through the
+	            ;; control's own window procedure like the arrows.
+	            (drop (call $wnd_send_message
+	              (local.get $hwnd) (i32.const 0x0115)
+	              (i32.or (i32.const 5) (i32.shl
+	                (call $sb_page_drag_pos
+	                  (local.get $line_y) (local.get $h)
+	                  (global.get $edit_sb_drag_anchor_y) (global.get $edit_sb_drag_anchor_top)
+	                  (i32.const 0) (i32.sub (local.get $total_lines) (i32.const 1))
+	                  (local.get $visible_lines))
+	                (i32.const 16)))
+	              (i32.const 0)))
 	            (return (i32.const 0))))
 	        (local.set $flags (load.field.memarg EditState flags (local.get $state_w)))
         (if (i32.eqz (i32.and (local.get $flags) (i32.const 0x10)))
@@ -2624,7 +2621,44 @@
         (if (i32.eqz (local.get $state)) (then (return (i32.const 0))))
         (return (load.field.memarg EditState scroll_top (call $g2w (local.get $state))))))
 
-    ;; ---------- WM_MOUSEWHEEL (0x020A) ----------
+;; ---------- WM_VSCROLL (0x0115) ----------
+    ;; The scroll requests USER's scrollbar sends a window, and the ones an
+    ;; application sends to scroll an edit itself. SB_LINEUP/DOWN move a line,
+    ;; SB_PAGEUP/DOWN a screenful, SB_THUMBTRACK/THUMBPOSITION go to the line
+    ;; in the high word, SB_TOP/BOTTOM to either end; SB_ENDSCROLL does
+    ;; nothing. Returns 0.
+    (if (i32.eq (local.get $msg) (i32.const 0x0115))
+      (then
+        (if (i32.eqz (local.get $state)) (then (return (i32.const 0))))
+        (local.set $state_w (call $g2w (local.get $state)))
+        (if (i32.eqz (i32.and (call $wnd_get_style (local.get $hwnd)) (i32.const 0x00000004)))
+          (then (return (i32.const 0))))
+        (local.set $a (call $edit_view_metrics (local.get $hwnd) (local.get $state_w)))
+        (local.set $total_lines (i32.and (local.get $a) (i32.const 0xFFFF)))
+        (local.set $visible_lines (i32.shr_u (local.get $a) (i32.const 16)))
+        (local.set $lo (load.field.memarg EditState scroll_top (local.get $state_w)))
+        (local.set $b (i32.and (local.get $wParam) (i32.const 0xFFFF)))
+        (local.set $vk (local.get $lo))
+        (if (i32.eqz (local.get $b))
+          (then (local.set $vk (i32.sub (local.get $lo) (i32.const 1)))))
+        (if (i32.eq (local.get $b) (i32.const 1))
+          (then (local.set $vk (i32.add (local.get $lo) (i32.const 1)))))
+        (if (i32.eq (local.get $b) (i32.const 2))
+          (then (local.set $vk (i32.sub (local.get $lo) (local.get $visible_lines)))))
+        (if (i32.eq (local.get $b) (i32.const 3))
+          (then (local.set $vk (i32.add (local.get $lo) (local.get $visible_lines)))))
+        (if (i32.or (i32.eq (local.get $b) (i32.const 4)) (i32.eq (local.get $b) (i32.const 5)))
+          (then (local.set $vk (i32.shr_u (local.get $wParam) (i32.const 16)))))
+        (if (i32.eq (local.get $b) (i32.const 6))
+          (then (local.set $vk (i32.const 0))))
+        (if (i32.eq (local.get $b) (i32.const 7))
+          (then (local.set $vk (local.get $total_lines))))
+        (if (call $edit_scroll_to (local.get $hwnd) (local.get $state_w)
+              (local.get $vk) (local.get $total_lines) (local.get $visible_lines))
+          (then (call $invalidate_hwnd (local.get $hwnd))))
+        (return (i32.const 0))))
+
+        ;; ---------- WM_MOUSEWHEEL (0x020A) ----------
     ;; wParam hi-word = signed wheel delta (120 per notch, positive = scroll up).
     ;; Only multi-line edits (flags bit 0) scroll; otherwise no-op.
     (if (i32.eq (local.get $msg) (i32.const 0x020A))
