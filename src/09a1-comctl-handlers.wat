@@ -913,7 +913,69 @@
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 20)))  ;; ret + 4 args
   )
 
-  ;; 943: GetIconInfo(hIcon, piconinfo) — 2 args stdcall
+;; DrawStateA(hdc, hbr, lpOutputFunc, lData, wData, x, y, cx, cy, fuFlags)
+  ;; -- 10 args stdcall; args 5..9 are on the guest stack above the return
+  ;; address. Draws an image of the type in the low nibble of fuFlags:
+  ;; DST_TEXT (1) / DST_PREFIXTEXT (2) the string lData (wData chars, 0 =
+  ;; NUL-terminated; the prefix form drops each '&' and doubles "&&" to one),
+  ;; DST_ICON (3) the icon lData at cx x cy (0 = its own size). DST_COMPLEX
+  ;; and DST_BITMAP are not drawn and return FALSE. The state bits
+  ;; (DSS_DISABLED, DSS_UNION, DSS_MONO) are not rendered: the image is drawn
+  ;; in its normal state.
+  (func $handle_DrawStateA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $esp i32) (local $x i32) (local $y i32) (local $cx i32) (local $cy i32)
+    (local $type i32) (local $ok i32) (local $src i32) (local $len i32)
+    (local $buf i32) (local $dst i32) (local $i i32) (local $n i32) (local $c i32)
+    (local.set $esp (i32.load offset=16 (global.get $reg_base)))
+    (local.set $x (call $gl32 (i32.add (local.get $esp) (i32.const 24))))
+    (local.set $y (call $gl32 (i32.add (local.get $esp) (i32.const 28))))
+    (local.set $cx (call $gl32 (i32.add (local.get $esp) (i32.const 32))))
+    (local.set $cy (call $gl32 (i32.add (local.get $esp) (i32.const 36))))
+    (local.set $type (i32.and (call $gl32 (i32.add (local.get $esp) (i32.const 40))) (i32.const 0xF)))
+    (if (i32.eq (local.get $type) (i32.const 3))
+      (then (local.set $ok (i32.ne (call $icon_draw_handle
+        (local.get $arg3) (local.get $arg0)
+        (local.get $x) (local.get $y) (local.get $cx) (local.get $cy)
+        (global.get $DI_NORMAL)) (i32.const 0)))))
+    (if (i32.and
+          (i32.or (i32.eq (local.get $type) (i32.const 1)) (i32.eq (local.get $type) (i32.const 2)))
+          (i32.ne (local.get $arg3) (i32.const 0)))
+      (then
+        (local.set $src (call $g2w (local.get $arg3)))
+        (local.set $len (local.get $arg4))
+        (if (i32.le_s (local.get $len) (i32.const 0))
+          (then (local.set $len (call $strlen (local.get $src)))))
+        (if (i32.eq (local.get $type) (i32.const 2))
+          (then
+            (local.set $buf (call $heap_alloc (i32.add (local.get $len) (i32.const 1))))
+            (if (local.get $buf)
+              (then
+                (local.set $dst (call $g2w (local.get $buf)))
+                (block $done (loop $copy
+                  (br_if $done (i32.ge_s (local.get $i) (local.get $len)))
+                  (local.set $c (i32.load8_u (i32.add (local.get $src) (local.get $i))))
+                  (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                  (if (i32.eq (local.get $c) (i32.const 0x26))
+                    (then
+                      (br_if $done (i32.ge_s (local.get $i) (local.get $len)))
+                      (local.set $c (i32.load8_u (i32.add (local.get $src) (local.get $i))))
+                      (local.set $i (i32.add (local.get $i) (i32.const 1)))))
+                  (i32.store8 (i32.add (local.get $dst) (local.get $n)) (local.get $c))
+                  (local.set $n (i32.add (local.get $n) (i32.const 1)))
+                  (br $copy)))
+                (local.set $ok (i32.ne (call $gdi_native_text_out
+                  (local.get $arg0) (local.get $x) (local.get $y)
+                  (local.get $dst) (local.get $n) (i32.const 0)) (i32.const 0)))
+                (call $heap_free (local.get $buf)))))
+          (else
+            (local.set $ok (i32.ne (call $gdi_native_text_out
+              (local.get $arg0) (local.get $x) (local.get $y)
+              (local.get $src) (local.get $len) (i32.const 0)) (i32.const 0)))))))
+    (i32.store offset=0 (global.get $reg_base) (local.get $ok))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 44)))  ;; 10 args + ret
+  )
+
+    ;; 943: GetIconInfo(hIcon, piconinfo) — 2 args stdcall
   ;; ICONINFO: fIcon(4), xHotspot(4), yHotspot(4), hbmMask(4), hbmColor(4)
   (func $handle_GetIconInfo (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $ptr i32) (local $rec i32)

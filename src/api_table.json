@@ -39242,5 +39242,12 @@
     "nargs": 3,
     "convention": "stdcall",
     "hash": 4187758740
+  },
+  {
+    "id": 4627,
+    "name": "DrawStateA",
+    "nargs": 10,
+    "convention": "stdcall",
+    "hash": 3714461759
   }
 ]
