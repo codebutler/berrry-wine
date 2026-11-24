@@ -1313,7 +1313,7 @@
   ;; lParam is the only DWORD, so it is the two words nearest the top.
   (func $win16_SendDlgItemMessage
     (local $dlg i32) (local $id i32) (local $msg i32)
-    (local $wp i32) (local $lp i32)
+    (local $wp i32) (local $lp i32) (local $ctl i32) (local $class i32)
     (local.set $dlg (call $win16_h32 (call $win16_arg16 (i32.const 5))))
     (local.set $id (call $win16_arg16 (i32.const 4)))
     (local.set $msg (call $win16_arg16 (i32.const 3)))
@@ -1323,8 +1323,15 @@
     ;; The control is one of ours, so its message needs the Win16-to-Win32
     ;; renumbering — see $win16_ctrl_msg32. Resolving the child here rather
     ;; than inside the handler is the only way to know its class.
-    (local.set $msg (call $win16_ctrl_msg32
-      (call $ctrl_find_by_id (local.get $dlg) (local.get $id)) (local.get $msg)))
+    (local.set $ctl (call $ctrl_find_by_id (local.get $dlg) (local.get $id)))
+    (local.set $class (call $ctrl_table_get_class (local.get $ctl)))
+    (local.set $wp (call $win16_ctrl_wparam32
+      (local.get $class) (local.get $msg) (local.get $wp) (local.get $lp)))
+    (if (i32.and (call $win16_is_edit_class (local.get $class))
+                 (i32.eq (local.get $msg) (i32.const 0x0401)))
+      (then (local.set $lp (call $win16_ctrl_lparam32
+        (local.get $class) (local.get $msg) (local.get $lp)))))
+    (local.set $msg (call $win16_ctrl_msg32 (local.get $ctl) (local.get $msg)))
     (call $win16_call32_begin (i32.const 5))
     (call $handle_SendDlgItemMessageA (local.get $dlg)
       (local.get $id) (local.get $msg) (local.get $wp) (local.get $lp)

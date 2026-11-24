@@ -10030,13 +10030,16 @@
         (i32.store offset=8 (global.get $reg_base) (i32.const 0))
         (call $win16_api_return (i32.const 10))
         (return)))
+    (local.set $wparam (call $win16_ctrl_wparam32
+      (call $ctrl_table_get_class (local.get $hwnd)) (local.get $message)
+      (local.get $wparam) (local.get $lparam)))
     (local.set $lparam (call $win16_ctrl_lparam32
       (call $ctrl_table_get_class (local.get $hwnd)) (local.get $message) (local.get $lparam)))
     (call $win16_call32_begin (i32.const 4))
     (i32.store offset=0 (global.get $reg_base) (call $control_wndproc_dispatch
       (local.get $hwnd)
       (call $win16_ctrl_msg32 (local.get $hwnd) (local.get $message))
-      (call $win16_msg_wparam32 (local.get $message) (local.get $wparam))
+      (local.get $wparam)
       (local.get $lparam)))
     (call $win16_call32_end)
     (i32.store offset=8 (global.get $reg_base) (i32.shr_u (i32.load offset=0 (global.get $reg_base)) (i32.const 16)))
@@ -10079,6 +10082,36 @@
     (global.set $win16_dlg_ended (i32.const 1))
     (i32.const 1))
 
+  ;; EM_SETSEL packs its range differently in the two worlds:
+  ;;
+  ;;   Win32   wParam = start                 lParam = end
+  ;;   Win16   wParam = (scroll flag)         lParam = MAKELPARAM(start, end)
+  ;;
+  ;; Renumbered but not repacked, a task's EM_SETSEL(1, 1) arrived as start 0
+  ;; and end 0x00010001, which the edit clamped to its length: the whole text
+  ;; was selected instead of the caret being placed. An edit subclassed to
+  ;; upper-case what is typed rewrites its text on every keystroke and puts the
+  ;; caret back at the end with EM_SETSEL, so every character replaced the one
+  ;; before it. A word of 0xFFFF is Win16's -1 (no selection / to the end).
+  (func $win16_is_edit_class (param $class i32) (result i32)
+    (i32.or (i32.eq (local.get $class) (i32.const 2))
+      (i32.or (i32.eq (local.get $class) (i32.const 24))
+              (i32.eq (local.get $class) (i32.const 25)))))
+
+  (func $win16_sel_word32 (param $w i32) (result i32)
+    (if (result i32) (i32.eq (local.get $w) (i32.const 0xFFFF))
+      (then (i32.const -1))
+      (else (local.get $w))))
+
+  ;; wParam for a message to one of our controls; lparam is the task's own.
+  (func $win16_ctrl_wparam32 (param $class i32) (param $message i32)
+        (param $wparam i32) (param $lparam i32) (result i32)
+    (if (i32.and (call $win16_is_edit_class (local.get $class))
+                 (i32.eq (local.get $message) (i32.const 0x0401)))
+      (then (return (call $win16_sel_word32
+        (i32.and (local.get $lparam) (i32.const 0xFFFF))))))
+    (call $win16_msg_wparam32 (local.get $message) (local.get $wparam)))
+
   ;; String-bearing LB_/CB_ messages cross this boundary with a packed Win16
   ;; selector:offset lParam. Native WAT controls consume a guest linear
   ;; pointer. Keep the conversion next to the class-specific message mapping
@@ -10086,6 +10119,10 @@
   (func $win16_ctrl_lparam32 (param $class i32) (param $message i32)
         (param $lparam i32) (result i32)
     (local $convert i32)
+    (if (i32.and (call $win16_is_edit_class (local.get $class))
+                 (i32.eq (local.get $message) (i32.const 0x0401)))
+      (then (return (call $win16_sel_word32
+        (i32.shr_u (local.get $lparam) (i32.const 16))))))
     ;; WM_SETTEXT carries a string for every window, including a top-level
     ;; form whose control class is zero. A guest window procedure commonly
     ;; forwards it to DefWindowProc/CallWindowProc, so convert the packed
@@ -10142,7 +10179,7 @@
   (func $win16_CallWindowProc
     (local $proc i32) (local $hwnd i32) (local $message i32)
     (local $wparam i32) (local $lparam i32) (local $ret i32)
-    (local $hwnd32 i32) (local $class i32)
+    (local $hwnd32 i32) (local $class i32) (local $wparam32 i32)
     (local.set $proc (call $win16_arg32 (i32.const 5)))
     (local.set $hwnd (call $win16_arg16 (i32.const 4)))
     (local.set $message (call $win16_arg16 (i32.const 3)))
@@ -10153,6 +10190,8 @@
         (local.set $hwnd32 (call $win16_h32 (local.get $hwnd)))
         (call $win16_adopt_builtin_proc (local.get $hwnd32) (local.get $proc))
         (local.set $class (call $ctrl_table_get_class (local.get $hwnd32)))
+        (local.set $wparam32 (call $win16_ctrl_wparam32
+          (local.get $class) (local.get $message) (local.get $wparam) (local.get $lparam)))
         (local.set $lparam (call $win16_ctrl_lparam32
           (local.get $class) (local.get $message) (local.get $lparam)))
         ;; USER returns a sentinel rather than a callable far procedure when a
@@ -10171,7 +10210,7 @@
             (i32.store offset=0 (global.get $reg_base) (call $control_wndproc_dispatch
               (local.get $hwnd32)
               (call $win16_ctrl_msg32 (local.get $hwnd32) (local.get $message))
-              (call $win16_msg_wparam32 (local.get $message) (local.get $wparam))
+              (local.get $wparam32)
               (local.get $lparam)))
             (call $win16_call32_end)
             (i32.store offset=8 (global.get $reg_base) (i32.shr_u (i32.load offset=0 (global.get $reg_base)) (i32.const 16)))
@@ -11376,6 +11415,8 @@
     (if (i32.eqz (call $win16_is_far_proc (local.get $proc)))
       (then
         (local.set $class (call $ctrl_table_get_class (local.get $hwnd)))
+        (local.set $wp (call $win16_ctrl_wparam32
+          (local.get $class) (local.get $msg) (local.get $wp) (local.get $lp)))
         (local.set $lp (call $win16_ctrl_lparam32
           (local.get $class) (local.get $msg) (local.get $lp)))
         ;; One of ours, so the control-message numbering has to be translated —
@@ -11385,7 +11426,7 @@
         (i32.store offset=0 (global.get $reg_base) (call $wnd_send_message
           (local.get $hwnd)
           (call $win16_ctrl_msg32 (local.get $hwnd) (local.get $msg))
-          (call $win16_msg_wparam32 (local.get $msg) (local.get $wp))
+          (local.get $wp)
           (local.get $lp)))
         (call $win16_call32_end)
         (i32.store offset=8 (global.get $reg_base) (i32.shr_u (i32.load offset=0 (global.get $reg_base)) (i32.const 16)))
