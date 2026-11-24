@@ -8619,6 +8619,22 @@
     },
     {
       "file": "src/13-exports.wat",
+      "name": "export:test_enable_scroll_bar",
+      "writes": 0,
+      "boundaryCalls": [
+        "$enable_scroll_bar_core"
+      ],
+      "exports": [
+        "test_enable_scroll_bar"
+      ],
+      "targets": [],
+      "sha256": "1e0b9306b198a1b621d5e44aca00ec4e19c25a04b6652a1f51be16cc4f981738",
+      "kind": "test-entry",
+      "reason": "Exported test entry can reach an EIP write or nested execution; no ownership exemption.",
+      "ownership": "pending"
+    },
+    {
+      "file": "src/13-exports.wat",
       "name": "export:test_g2w_slow",
       "writes": 0,
       "boundaryCalls": [

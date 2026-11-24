@@ -1375,7 +1375,16 @@
         (local.set $style (call $wnd_get_style (local.get $hwnd)))
         (local.set $vert (i32.ne (i32.and (local.get $style) (i32.const 1)) (i32.const 0)))
         (local.set $changed (call $scroll_arrow_set_slot
-          (local.get $slot) (local.get $vert) (local.get $arrows))))
+          (local.get $slot) (local.get $vert) (local.get $arrows)))
+        ;; Enabling or disabling BOTH arrows of a scroll bar control also
+        ;; enables or disables the control window itself, as USER does with
+        ;; EnableWindow: a SCROLLBAR created WS_DISABLED and later given
+        ;; ESB_ENABLE_BOTH has to take clicks. One arrow alone leaves the
+        ;; window state as it is.
+        (if (i32.or (i32.eqz (local.get $arrows)) (i32.eq (local.get $arrows) (i32.const 3)))
+          (then
+            (drop (call $wnd_enable (local.get $hwnd) (i32.eqz (local.get $arrows))))
+            (call $invalidate_hwnd (local.get $hwnd)))))
       (else
         ;; SB_HORZ=0, SB_VERT=1, SB_BOTH=3. SB_BOTH reports a change if
         ;; either standard bar changed.

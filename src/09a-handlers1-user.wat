@@ -1422,19 +1422,25 @@
   ;; exact Win32 contract: it remembers the owner only when its own disable
   ;; changed state, then re-enables the owner after destroying the sheet.
   (func $handle_EnableWindow (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (i32.store offset=0 (global.get $reg_base)
+      (call $wnd_enable (local.get $arg0) (local.get $arg1)))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))  ;; stdcall, 2 args
+  )
+
+  ;; EnableWindow's effect: set or clear WS_DISABLED and send WM_ENABLE when
+  ;; the state changes. Returns whether the window was disabled before (0 for
+  ;; an unknown window).
+  (func $wnd_enable (param $hwnd i32) (param $enable i32) (result i32)
     (local $idx i32) (local $style i32) (local $new_style i32) (local $prev_disabled i32)
-    (local.set $idx (call $wnd_table_find (local.get $arg0)))
+    (local.set $idx (call $wnd_table_find (local.get $hwnd)))
     (if (i32.eq (local.get $idx) (i32.const -1))
-      (then
-        (i32.store offset=0 (global.get $reg_base) (i32.const 0))
-        (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
-        (return)))
-    (local.set $style (call $wnd_get_style (local.get $arg0)))
+      (then (return (i32.const 0))))
+    (local.set $style (call $wnd_get_style (local.get $hwnd)))
     (local.set $prev_disabled
       (i32.ne
         (i32.and (local.get $style) (i32.const 0x08000000))
         (i32.const 0)))
-    (if (local.get $arg1)
+    (if (local.get $enable)
       (then
         (local.set $new_style
           (i32.and (local.get $style) (i32.const 0xF7FFFFFF))))
@@ -1443,16 +1449,14 @@
           (i32.or (local.get $style) (i32.const 0x08000000)))))
     (if (i32.ne (local.get $new_style) (local.get $style))
       (then
-        (drop (call $wnd_set_style (local.get $arg0) (local.get $new_style)))
+        (drop (call $wnd_set_style (local.get $hwnd) (local.get $new_style)))
         ;; WM_ENABLE(wParam=bEnable). Most built-in controls ignore it, but
         ;; owner/subclassed windows may rely on the notification.
         (drop (call $wnd_send_message
-          (local.get $arg0) (i32.const 0x000A)
-          (select (i32.const 1) (i32.const 0) (local.get $arg1))
+          (local.get $hwnd) (i32.const 0x000A)
+          (select (i32.const 1) (i32.const 0) (local.get $enable))
           (i32.const 0)))))
-    (i32.store offset=0 (global.get $reg_base) (local.get $prev_disabled))
-    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))  ;; stdcall, 2 args
-  )
+    (local.get $prev_disabled))
 
 ;; 114: EndDialog(hDlg, nResult) — end modal dialog, set result
   (func $handle_EndDialog (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
