@@ -134,6 +134,14 @@
     (if (i32.eq (local.get $idx) (i32.const 47)) (then (return "wintrust")))
     (if (i32.eq (local.get $idx) (i32.const 48)) (then (return "ws2_32")))
     (if (i32.eq (local.get $idx) (i32.const 49)) (then (return "wsock32")))
+    ;; The shell's two DLLs map their real file when the system directory has
+    ;; one, and are otherwise the builtin modules their WAT handlers already
+    ;; serve for static imports. Without these slots a LoadLibrary of either
+    ;; failed with ERROR_MOD_NOT_FOUND even though GetProcAddress on the
+    ;; builtin would resolve, and a delay-load import of SHELL32 died with
+    ;; exception 0xC06D007E.
+    (if (i32.eq (local.get $idx) (i32.const 50)) (then (return "shell32")))
+    (if (i32.eq (local.get $idx) (i32.const 51)) (then (return "shlwapi")))
     (if (i32.ge_u (local.get $idx) (i32.const 11)) (then (return "")))
     (local.set $entry (global.get $STATIC_SYS_DLL_NAMES))
     (block $done (loop $skip
@@ -1749,7 +1757,8 @@
       (br $scan))
     (i32.const 0))
 
-  ;; Four legacy identity slots also have explicit native-loadable policy.
+  ;; Four legacy identity slots, and the shell's two, also have explicit
+  ;; native-loadable policy.
   ;; KERNEL32 has its own identity/export image rather than a static slot.
   (func $loadlib_builtin_only (param $name i32) (result i32)
     (if (call $dll_name_match (local.get $name) "kernel32.dll")
@@ -1759,8 +1768,11 @@
     (i32.eqz (i32.or
       (i32.or (call $dll_name_match (local.get $name) "ole32.dll")
               (call $dll_name_match (local.get $name) "comctl32.dll"))
-      (i32.or (call $dll_name_match (local.get $name) "d3drm.dll")
-              (call $dll_name_match (local.get $name) "oleaut32.dll")))))
+      (i32.or
+        (i32.or (call $dll_name_match (local.get $name) "d3drm.dll")
+                (call $dll_name_match (local.get $name) "oleaut32.dll"))
+        (i32.or (call $dll_name_match (local.get $name) "shell32.dll")
+                (call $dll_name_match (local.get $name) "shlwapi.dll"))))))
 
   ;; Optional modules a stock Win98 box does not have, by bare name. Each one
   ;; must fail to load with ERROR_MOD_NOT_FOUND rather than take the
