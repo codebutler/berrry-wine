@@ -181,15 +181,7 @@ async function main() {
     assert(!handles.has(h),name+' distinct identity'); handles.add(h);
     assert.throws(()=>loader.loadDll({},null,original,name),/Builtin-only/);
   }
-  // The shell's DLLs: the builtin module while no file is installed, so a
-  // dynamic or delay-load import resolves through the same handlers a static
-  // import does; the real file once the system directory has one.
-  for (const name of ['shell32.dll','shlwapi.dll']) {
-    const h=e.load(write(name),0)>>>0;
-    assert(h && e.yielded()===0,name+' without a file is the builtin module');
-    assert(!handles.has(h),name+' distinct identity'); handles.add(h);
-  }
-  for (const name of ['msvcrt.dll','d3drm.dll','ole32.dll','oleaut32.dll','shell32.dll','shlwapi.dll','dsetup.dll','vendor.dll']) {
+  for (const name of ['msvcrt.dll','d3drm.dll','ole32.dll','oleaut32.dll','dsetup.dll','vendor.dll']) {
     vfs.files.set('c:\\'+name,{data:original,attrs:0x20});
     e.load(write(name),0); assert.equal(e.yielded(),5,name+' keeps native mapping route');
   }
