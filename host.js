@@ -4581,14 +4581,15 @@ class WineAssembly {
   }
 
   async _decodeMountedImage(data, url) {
-    if (typeof document === 'undefined') return null;
     const lower = String(url || '').toLowerCase();
     const type = lower.endsWith('.png') ? 'image/png' : 'image/jpeg';
-    const blob = new Blob([data], { type });
-    if (typeof createImageBitmap === 'function') {
-      const source = await createImageBitmap(blob);
+    // A Worker host has createImageBitmap and no document: decode there too.
+    if (typeof createImageBitmap === 'function' && typeof Blob === 'function') {
+      const source = await createImageBitmap(new Blob([data], { type }));
       return { width: source.width, height: source.height, source };
     }
+    if (typeof document === 'undefined') return null;
+    const blob = new Blob([data], { type });
 
     // Safari versions without createImageBitmap still decode through the
     // native HTML image pipeline. Materialize RGBA before revoking the blob
