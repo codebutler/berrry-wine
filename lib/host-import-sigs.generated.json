@@ -1,6 +1,6 @@
 {
   "generated_from": "src/main.watx include closure",
-  "count": 298,
+  "count": 312,
   "sigs": {
     "log": {
       "params": [
@@ -122,6 +122,12 @@
       ]
     },
     "real_time_ms": {
+      "params": [],
+      "results": [
+        "i32"
+      ]
+    },
+    "entropy_u32": {
       "params": [],
       "results": [
         "i32"
@@ -345,6 +351,50 @@
       "results": [
         "i32"
       ]
+    },
+    "check_input_token": {
+      "params": [],
+      "results": [
+        "i32"
+      ]
+    },
+    "input_validate": {
+      "params": [
+        "i32"
+      ],
+      "results": [
+        "i32"
+      ]
+    },
+    "input_consumed": {
+      "params": [
+        "i32",
+        "i32",
+        "i32",
+        "i32",
+        "i32"
+      ],
+      "results": [
+        "i32"
+      ]
+    },
+    "di_mouse_receipt": {
+      "params": [
+        "i32",
+        "i32",
+        "i32",
+        "i32",
+        "i32"
+      ],
+      "results": [
+        "i32"
+      ]
+    },
+    "input_pump_idle": {
+      "params": [
+        "i32"
+      ],
+      "results": []
     },
     "check_input_lparam": {
       "params": [],
@@ -695,9 +745,8 @@
         "i32"
       ]
     },
-    "glide_submit": {
+    "gpu_stream_kick": {
       "params": [
-        "i32",
         "i32",
         "i32"
       ],
@@ -869,6 +918,18 @@
         "i32"
       ],
       "results": []
+    },
+    "shared_heap": {
+      "params": [
+        "i32",
+        "i32",
+        "i32",
+        "i32",
+        "i32"
+      ],
+      "results": [
+        "i32"
+      ]
     },
     "ctrl_sb_trace": {
       "params": [
@@ -1966,6 +2027,16 @@
         "i32"
       ]
     },
+    "fs_disk_path_error": {
+      "params": [
+        "i32",
+        "i32",
+        "i32"
+      ],
+      "results": [
+        "i32"
+      ]
+    },
     "fs_volume_label": {
       "params": [
         "i32",
@@ -2142,6 +2213,46 @@
         "i32"
       ]
     },
+    "com_localserver_information": {
+      "params": [
+        "i32",
+        "i32",
+        "i32",
+        "i32"
+      ],
+      "results": [
+        "i32"
+      ]
+    },
+    "com_interface_operation": {
+      "params": [
+        "i32",
+        "i32",
+        "i32"
+      ],
+      "results": [
+        "i32"
+      ]
+    },
+    "com_interface_result": {
+      "params": [
+        "i32",
+        "i32"
+      ],
+      "results": [
+        "i32"
+      ]
+    },
+    "com_proxy_stub": {
+      "params": [
+        "i32",
+        "i32",
+        "i32"
+      ],
+      "results": [
+        "i32"
+      ]
+    },
     "com_create_instance": {
       "params": [
         "i32",
@@ -2193,6 +2304,14 @@
       ]
     },
     "com_uninitialize_thread": {
+      "params": [
+        "i32"
+      ],
+      "results": [
+        "i32"
+      ]
+    },
+    "com_is_initialized": {
       "params": [
         "i32"
       ],
@@ -2760,6 +2879,16 @@
     },
     "computer_name": {
       "params": [
+        "i32",
+        "i32"
+      ],
+      "results": [
+        "i32"
+      ]
+    },
+    "com_treat_as_class": {
+      "params": [
+        "i32",
         "i32",
         "i32"
       ],

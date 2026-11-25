@@ -3,13 +3,25 @@
 // Source-only mutation tests. No wasm compilation, guest execution or model
 // token simulation: these establish inventory enforcement, not jump safety.
 const assert = require('assert');
-const { sourceFiles, scanWat, scanSources, check, checkNonlocalAPIs } = require('../tools/callback-ownership-census');
+const { sourceFiles, scanWat, scanSources, check, checkNonlocalAPIs, loadReviews, chainReviews } = require('../tools/callback-ownership-census');
 const source = `(func $entry (export "inject") (global.set $eip (local.get $callback)))`;
 const sources = [{ file: 'src/fixture.wat', src: source }];
 const entries = scanSources(sources);
 const baseline = { version: 1, entries: entries.map(e => ({ ...e, kind: 'callback',
   reason: 'Fixture callback; retained-context ownership pending.', ownership: 'pending' })) };
 assert.deepStrictEqual(check(entries, baseline), []);
+// A feature can retain new producers in its own review without absorbing
+// another owner's base census. Every shape/hash check still applies.
+const additionStep = { version: 1, revisions: [], additions: baseline.entries };
+const additionReview = chainReviews({ version: 1, revisions: [] }, [additionStep]);
+assert.deepStrictEqual(check(entries, { version: 1, entries: [] }, additionReview), []);
+assert(check([{ ...entries[0], writes: 2 }], { version: 1, entries: [] }, additionReview)
+  .some(e => e.includes('changed producer')));
+assert.throws(() => chainReviews({ version: 1, revisions: [] }, [additionStep, additionStep]), /invalid feature addition/);
+assert.throws(() => chainReviews({ version: 1, revisions: [] },
+  [{ ...additionStep, additions: [{ ...baseline.entries[0], ownership: 'covered' }] }]), /invalid feature addition/);
+assert.throws(() => chainReviews({ version: 1, revisions: [] },
+  [{ ...additionStep, additions: [{ ...baseline.entries[0], sha256: 'bad' }] }]), /invalid feature addition/);
 assert(check(scanSources([{ file: 'src/fixture.wat', src: source.replace('$callback', '$other') }]), baseline)
   .some(e => e.includes('changed producer')), 'target replacement with unchanged count fails');
 assert(check(scanSources([...sources, { file: 'src/new.wat', src: '(func $new (global.set $eip (i32.const 1)))' }]), baseline)
@@ -117,14 +129,15 @@ const root = path.resolve(__dirname, '..');
 const real = { entries: scanSources(sourceFiles(root).map(file => ({ file,
   src: fs.readFileSync(path.join(root, file), 'utf8') }))) };
 const reviewed = require('../tools/callback-ownership-census.json');
-assert.deepStrictEqual(check(real.entries, reviewed), [], 'real source must match reviewed manifest');
+const revisions = loadReviews();
+assert.deepStrictEqual(check(real.entries, reviewed, revisions), [], 'real source must match reviewed manifest');
 const hostSource = fs.readFileSync(path.join(root, 'host.js'), 'utf8');
 const retirement = 'this._processObject.wine = null;';
 assert(hostSource.includes(retirement));
 const changedHost = scanSources([{file: 'host.js', src: hostSource.replace(retirement, 'void this;')}]);
 assert.equal(changedHost.length, 1);
 const changedReal = real.entries.map(e => e.file === 'host.js' ? changedHost[0] : e);
-assert.deepStrictEqual(check(changedReal, reviewed),
+assert.deepStrictEqual(check(changedReal, reviewed, revisions),
   ['changed producer host.js:host-file (sha256); review its lifetime'],
   'removing process-host retirement must reject with an exact producer diagnostic');
 const workerSource = fs.readFileSync(path.join(root, 'lib/guest-worker.js'), 'utf8');
@@ -132,7 +145,7 @@ const guard = '!namedWaitTransport?.consumeNamedWait(msg.namedWaitSequence)';
 assert(workerSource.includes(guard));
 const changedWorker = scanSources([{file: 'lib/guest-worker.js', src: workerSource.replace(guard, 'false')}]);
 assert.equal(changedWorker.length, 1);
-assert.deepStrictEqual(check(real.entries.map(e => e.file === 'lib/guest-worker.js' ? changedWorker[0] : e), reviewed),
+assert.deepStrictEqual(check(real.entries.map(e => e.file === 'lib/guest-worker.js' ? changedWorker[0] : e), reviewed, revisions),
   ['changed producer lib/guest-worker.js:host-file (sha256); review its lifetime'],
   'removing single-completion ownership must reject');
 // Startup integration: pin transport, first-show selection and saved invocation
@@ -172,7 +185,7 @@ for (const [file, name, before, after] of startupMutations) {
   const replacement = scanned.find(e => e.file === file && e.name === name);
   assert(replacement, `producer survives: ${name}`);
   assert.deepStrictEqual(check(real.entries.map(e =>
-    e.file === file && e.name === name ? replacement : e), reviewed),
+    e.file === file && e.name === name ? replacement : e), reviewed, revisions),
     [`changed producer ${file}:${name} (sha256); review its lifetime`],
     `startup semantic mutation must reject: ${name} in ${file}`);
 }
@@ -200,7 +213,7 @@ for (const [file, before, after] of hostReviewMutations) {
   const scanned = scanSources([...watSources, {file, src: original.replace(before, after)}]);
   const replacement = scanned.find(e => e.file === file && e.name === 'host-file');
   assert(replacement, `host producer survives: ${file}`);
-  assert.deepStrictEqual(check(real.entries.map(e => e.file === file ? replacement : e), reviewed),
+  assert.deepStrictEqual(check(real.entries.map(e => e.file === file ? replacement : e), reviewed, revisions),
     [`changed producer ${file}:host-file (sha256); review its lifetime`]);
 }
 console.log('callback ownership census mutation tests PASS (fixtures, two lifetime, nine startup and nine host review mutations; source inventory only)');

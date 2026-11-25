@@ -247,14 +247,15 @@
   ;; loop is the C-locale fold; bound over a real MSVCRT/MSVCR7x it defers to
   ;; the authentic export once setlocale has left "C", like _wcsicmp.
   (func $handle__stricmp (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $wa1 i32) (local $wa2 i32) (local $c1 i32) (local $c2 i32)
+    (local $p1 i32) (local $p2 i32) (local $c1 i32) (local $c2 i32)
     (if (call $crt_locale_changed)
       (then (if (call $crt_fallback) (then (return)))))
-    (local.set $wa1 (call $g2w (local.get $arg0)))
-    (local.set $wa2 (call $g2w (local.get $arg1)))
+    ;; Adjacent guest pages need not have adjacent physical backing.
+    (local.set $p1 (local.get $arg0))
+    (local.set $p2 (local.get $arg1))
     (block $d (loop $l
-      (local.set $c1 (i32.load8_u (local.get $wa1)))
-      (local.set $c2 (i32.load8_u (local.get $wa2)))
+      (local.set $c1 (call $gl8 (local.get $p1)))
+      (local.set $c2 (call $gl8 (local.get $p2)))
       ;; tolower
       (if (i32.and (i32.ge_u (local.get $c1) (i32.const 0x41)) (i32.le_u (local.get $c1) (i32.const 0x5A)))
         (then (local.set $c1 (i32.or (local.get $c1) (i32.const 0x20)))))
@@ -262,8 +263,8 @@
         (then (local.set $c2 (i32.or (local.get $c2) (i32.const 0x20)))))
       (br_if $d (i32.ne (local.get $c1) (local.get $c2)))
       (br_if $d (i32.eqz (local.get $c1)))
-      (local.set $wa1 (i32.add (local.get $wa1) (i32.const 1)))
-      (local.set $wa2 (i32.add (local.get $wa2) (i32.const 1)))
+      (local.set $p1 (i32.add (local.get $p1) (i32.const 1)))
+      (local.set $p2 (i32.add (local.get $p2) (i32.const 1)))
       (br $l)))
     ;; -1/0/1, not the byte difference: the C-locale path of VC6 msvcrt,
     ;; msvcr70 and msvcr71 alike ends in sbb eax,eax / sbb eax,-1
@@ -276,18 +277,17 @@
 
   ;; _strnicmp(s1, s2, count) — cdecl, ASCII case-insensitive bounded compare.
   (func $handle__strnicmp (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $wa1 i32) (local $wa2 i32) (local $i i32)
+    (local $i i32)
     (local $c1 i32) (local $c2 i32)
     (i32.store offset=0 (global.get $reg_base) (i32.const 0))
     (if (i32.eqz (local.get $arg2))
       (then
         (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
         (return)))
-    (local.set $wa1 (call $g2w (local.get $arg0)))
-    (local.set $wa2 (call $g2w (local.get $arg1)))
+    ;; Translate the guest byte at each position, including page crossings.
     (block $done (loop $compare
-      (local.set $c1 (i32.load8_u (i32.add (local.get $wa1) (local.get $i))))
-      (local.set $c2 (i32.load8_u (i32.add (local.get $wa2) (local.get $i))))
+      (local.set $c1 (call $gl8 (i32.add (local.get $arg0) (local.get $i))))
+      (local.set $c2 (call $gl8 (i32.add (local.get $arg1) (local.get $i))))
       (if (i32.and (i32.ge_u (local.get $c1) (i32.const 0x41))
                    (i32.le_u (local.get $c1) (i32.const 0x5a)))
         (then (local.set $c1 (i32.or (local.get $c1) (i32.const 0x20)))))
@@ -381,8 +381,9 @@
   ;; below all reduce to this question.
   (func $crt_char_in_set (param $set_wa i32) (param $ch i32) (result i32)
     (local $c i32)
+    ;; The set cursor is a guest address; its backing need not be contiguous.
     (block $d (loop $l
-      (local.set $c (i32.load8_u (local.get $set_wa)))
+      (local.set $c (call $gl8 (local.get $set_wa)))
       (br_if $d (i32.eqz (local.get $c)))
       (if (i32.eq (local.get $c) (local.get $ch)) (then (return (i32.const 1))))
       (local.set $set_wa (i32.add (local.get $set_wa) (i32.const 1)))
@@ -392,11 +393,10 @@
   ;; strspn(s, accept) — length of the initial run of s made only of accept
   ;; characters. cdecl, so only the return address comes off here.
   (func $handle_strspn (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $wa i32) (local $set i32) (local $n i32) (local $c i32)
-    (local.set $wa (call $g2w (local.get $arg0)))
-    (local.set $set (call $g2w (local.get $arg1)))
+    (local $set i32) (local $n i32) (local $c i32)
+    (local.set $set (local.get $arg1))
     (block $d (loop $l
-      (local.set $c (i32.load8_u (i32.add (local.get $wa) (local.get $n))))
+      (local.set $c (call $gl8 (i32.add (local.get $arg0) (local.get $n))))
       (br_if $d (i32.eqz (local.get $c)))
       (br_if $d (i32.eqz (call $crt_char_in_set (local.get $set) (local.get $c))))
       (local.set $n (i32.add (local.get $n) (i32.const 1)))
@@ -408,11 +408,10 @@
   ;; strcspn(s, reject) — the complement: length of the initial run containing
   ;; none of the reject characters.
   (func $handle_strcspn (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $wa i32) (local $set i32) (local $n i32) (local $c i32)
-    (local.set $wa (call $g2w (local.get $arg0)))
-    (local.set $set (call $g2w (local.get $arg1)))
+    (local $set i32) (local $n i32) (local $c i32)
+    (local.set $set (local.get $arg1))
     (block $d (loop $l
-      (local.set $c (i32.load8_u (i32.add (local.get $wa) (local.get $n))))
+      (local.set $c (call $gl8 (i32.add (local.get $arg0) (local.get $n))))
       (br_if $d (i32.eqz (local.get $c)))
       (br_if $d (call $crt_char_in_set (local.get $set) (local.get $c)))
       (local.set $n (i32.add (local.get $n) (i32.const 1)))
@@ -429,7 +428,7 @@
   (func $handle_strtok (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $s i32) (local $set i32) (local $c i32) (local $tok i32)
     (local.set $s (select (local.get $arg0) (global.get $crt_strtok_next) (i32.ne (local.get $arg0) (i32.const 0))))
-    (local.set $set (call $g2w (local.get $arg1)))
+    (local.set $set (local.get $arg1))
     (i32.store offset=0 (global.get $reg_base) (i32.const 0))
     (block $done
       (br_if $done (i32.eqz (local.get $s)))
@@ -459,18 +458,18 @@
 
   ;; strpbrk(s, accept) — pointer to the first accept character in s, or NULL.
   (func $handle_strpbrk (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $wa i32) (local $set i32) (local $c i32)
-    (local.set $wa (call $g2w (local.get $arg0)))
-    (local.set $set (call $g2w (local.get $arg1)))
+    (local $s i32) (local $set i32) (local $c i32)
+    (local.set $s (local.get $arg0))
+    (local.set $set (local.get $arg1))
     (i32.store offset=0 (global.get $reg_base) (i32.const 0))
     (block $d (loop $l
-      (local.set $c (i32.load8_u (local.get $wa)))
+      (local.set $c (call $gl8 (local.get $s)))
       (br_if $d (i32.eqz (local.get $c)))
       (if (call $crt_char_in_set (local.get $set) (local.get $c))
         (then
-          (i32.store offset=0 (global.get $reg_base) (call $w2g (local.get $wa)))
+          (i32.store offset=0 (global.get $reg_base) (local.get $s))
           (br $d)))
-      (local.set $wa (i32.add (local.get $wa) (i32.const 1)))
+      (local.set $s (i32.add (local.get $s) (i32.const 1)))
       (br $l)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
   )
@@ -548,17 +547,15 @@
 
   ;; 727: strcpy(dest, src) — cdecl
   (func $handle_strcpy (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $dst i32) (local $src i32) (local $ch i32) (local $i i32)
+    (local $dst i32) (local $src i32) (local $ch i32)
     (local.set $dst (call $g2w (local.get $arg0)))
     (local.set $src (call $g2w (local.get $arg1)))
     (block $d (loop $l
-      (br_if $d (i32.ge_u (local.get $i) (i32.const 65536)))
       (local.set $ch (i32.load8_u (local.get $src)))
       (i32.store8 (local.get $dst) (local.get $ch))
       (br_if $d (i32.eqz (local.get $ch)))
       (local.set $dst (i32.add (local.get $dst) (i32.const 1)))
       (local.set $src (i32.add (local.get $src) (i32.const 1)))
-      (local.set $i (i32.add (local.get $i) (i32.const 1)))
       (br $l)))
     (i32.store8 (local.get $dst) (i32.const 0))
     (i32.store offset=0 (global.get $reg_base) (local.get $arg0))
@@ -612,26 +609,21 @@
 
   ;; 729: strcat(dest, src) — cdecl
   (func $handle_strcat (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $dst i32) (local $src i32) (local $ch i32) (local $i i32)
+    (local $dst i32) (local $src i32) (local $ch i32)
     (local.set $dst (call $g2w (local.get $arg0)))
     ;; find end of dest
     (block $d (loop $l
-      (br_if $d (i32.ge_u (local.get $i) (i32.const 65536)))
       (br_if $d (i32.eqz (i32.load8_u (local.get $dst))))
       (local.set $dst (i32.add (local.get $dst) (i32.const 1)))
-      (local.set $i (i32.add (local.get $i) (i32.const 1)))
       (br $l)))
     ;; copy src
     (local.set $src (call $g2w (local.get $arg1)))
-    (local.set $i (i32.const 0))
     (block $d2 (loop $l2
-      (br_if $d2 (i32.ge_u (local.get $i) (i32.const 65536)))
       (local.set $ch (i32.load8_u (local.get $src)))
       (i32.store8 (local.get $dst) (local.get $ch))
       (br_if $d2 (i32.eqz (local.get $ch)))
       (local.set $dst (i32.add (local.get $dst) (i32.const 1)))
       (local.set $src (i32.add (local.get $src) (i32.const 1)))
-      (local.set $i (i32.add (local.get $i) (i32.const 1)))
       (br $l2)))
     (i32.store8 (local.get $dst) (i32.const 0))
     (i32.store offset=0 (global.get $reg_base) (local.get $arg0))
@@ -645,7 +637,7 @@
     ;; skip whitespace
     (block $d (loop $l
       (local.set $ch (i32.load8_u (local.get $wa)))
-      (br_if $d (i32.gt_u (local.get $ch) (i32.const 0x20)))
+      (br_if $d (i32.eqz (call $crt_is_space (local.get $ch))))
       (local.set $wa (i32.add (local.get $wa) (i32.const 1))) (br $l)))
     ;; sign
     (if (i32.eq (local.get $ch) (i32.const 0x2D)) ;; '-'
@@ -675,7 +667,7 @@
     (i32.const -1))
 
   (func $crt_strto32 (param $nptr i32) (param $endptr i32) (param $base_arg i32) (result i32)
-    (local $start_wa i32) (local $wa i32) (local $digits_start i32)
+    (local $start_wa i32) (local $wa i32)
     (local $base i32) (local $ch i32) (local $digit i32)
     (local $neg i32) (local $any i32) (local $value i32)
     (local.set $start_wa (call $g2w (local.get $nptr)))
@@ -702,14 +694,18 @@
               (i32.eq (i32.load8_u (i32.add (local.get $wa) (i32.const 1))) (i32.const 0x78))
               (i32.eq (i32.load8_u (i32.add (local.get $wa) (i32.const 1))) (i32.const 0x58)))))
       (then
-        (local.set $base (i32.const 16))
-        (local.set $wa (i32.add (local.get $wa) (i32.const 2)))))
+        ;; A prefix requires a following hex digit; otherwise parse the initial 0.
+        (if (i32.lt_u
+              (call $crt_digit_value (i32.load8_u (i32.add (local.get $wa) (i32.const 2))))
+              (i32.const 16))
+          (then
+            (local.set $base (i32.const 16))
+            (local.set $wa (i32.add (local.get $wa) (i32.const 2)))))))
     (if (i32.eqz (local.get $base))
       (then
         (local.set $base (i32.const 10))
         (if (i32.eq (i32.load8_u (local.get $wa)) (i32.const 0x30))
           (then (local.set $base (i32.const 8))))))
-    (local.set $digits_start (local.get $wa))
     (block $done (loop $digits
       (local.set $digit (call $crt_digit_value (i32.load8_u (local.get $wa))))
       (br_if $done (i32.lt_s (local.get $digit) (i32.const 0)))
@@ -718,7 +714,7 @@
       (local.set $any (i32.const 1))
       (local.set $wa (i32.add (local.get $wa) (i32.const 1)))
       (br $digits)))
-    (if (i32.eqz (local.get $any)) (then (local.set $wa (local.get $digits_start))))
+    (if (i32.eqz (local.get $any)) (then (local.set $wa (local.get $start_wa))))
     (if (local.get $endptr)
       (then (call $gs32 (local.get $endptr)
         (i32.add (local.get $nptr) (i32.sub (local.get $wa) (local.get $start_wa))))))
@@ -811,6 +807,7 @@
         (if (result i32) (local.get $digits)
           (then (i32.add (local.get $nptr) (i32.sub (local.get $s) (local.get $start))))
           (else (local.get $nptr))))))
+    (if (i32.eqz (local.get $digits)) (then (return (f64.const 0))))
     (if (local.get $neg) (then (return (f64.neg (local.get $fval)))))
     (local.get $fval))
 
@@ -858,6 +855,54 @@
     (call $fpu_push (call $host_math_cos (f64.load (call $g2w (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4))))))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
   )
+
+  ;; MSVCR110+ /arch:SSE2 math helpers (__libm_sse2_*_precise; the import
+  ;; name drops one leading underscore). The compiler calls them directly
+  ;; with the double in XMM0's low qword and takes the result from there
+  ;; (glxgears 401181: cvtps2pd xmm0,xmm0 / call / cvtsd2ss xmm0,xmm0). No
+  ;; stack arguments: only the return address is popped. x87 state, GPRs and
+  ;; the other XMM registers are left alone; XMM0's upper qword is kept.
+  ;; A NaN argument comes back quieted with its sign and payload; an invalid
+  ;; argument (sin/cos of an infinity, sqrt of x < -0) returns the x86 QNaN
+  ;; indefinite and sets errno EDOM, as the CRT's _handle_error path does.
+  ;; $kind: 0 sin, 1 cos, 2 sqrt.
+  (func $libm_sse2_precise (param $kind i32)
+    (local $b i64) (local $x f64) (local $r i64)
+    (local.set $b (i64x2.extract_lane 0 (call $xmm_get (i32.const 0))))
+    (local.set $x (f64.reinterpret_i64 (local.get $b)))
+    (block $done
+      (if (call $sse_is_nan64 (local.get $b)) (then
+        (local.set $r (i64.or (local.get $b) (i64.const 0x0008000000000000)))
+        (br $done)))
+      (if (i32.eq (local.get $kind) (i32.const 2)) (then
+        (if (f64.lt (local.get $x) (f64.const 0)) (then
+          (local.set $r (i64.const 0xfff8000000000000))
+          (call $msvcrt_set_errno (i32.const 33))
+          (br $done)))
+        (local.set $r (i64.reinterpret_f64 (f64.sqrt (local.get $x))))
+        (br $done)))
+      (if (f64.eq (f64.abs (local.get $x)) (f64.const inf)) (then
+        (local.set $r (i64.const 0xfff8000000000000))
+        (call $msvcrt_set_errno (i32.const 33))
+        (br $done)))
+      (local.set $r (i64.reinterpret_f64
+        (if (result f64) (i32.eqz (local.get $kind))
+          (then (call $host_math_sin (local.get $x)))
+          (else (call $host_math_cos (local.get $x)))))))
+    (call $xmm_set (i32.const 0)
+      (i64x2.replace_lane 0 (call $xmm_get (i32.const 0)) (local.get $r))))
+
+  (func $handle__libm_sse2_sin_precise (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (call $libm_sse2_precise (i32.const 0))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4))))
+
+  (func $handle__libm_sse2_cos_precise (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (call $libm_sse2_precise (i32.const 1))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4))))
+
+  (func $handle__libm_sse2_sqrt_precise (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (call $libm_sse2_precise (i32.const 2))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4))))
 
   (func $handle_tan (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (call $fpu_push (call $host_math_tan (f64.load (call $g2w (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4))))))
@@ -960,15 +1005,94 @@
   )
 
   (func $handle_fmod (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $x f64) (local $y f64)
+    (local $x f64) (local $y f64) (local $r f64)
+    (local $scale f64) (local $steps i32)
     (local.set $x (f64.load (call $g2w (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))))
     (local.set $y (f64.load (call $g2w (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))))
-    (call $fpu_push
+    ;; A finite dividend is unchanged by either infinite divisor.
+    (if (i32.and
+          (f64.lt (f64.abs (local.get $x)) (f64.const inf))
+          (f64.eq (f64.abs (local.get $y)) (f64.const inf)))
+      (then
+        (call $fpu_push (local.get $x))
+        (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
+        (return)))
+    ;; Only finite, nonzero operands with an overflowing binary64 quotient.
+    ;; Each exact power-of-two scaling direction is bounded by 2098 steps:
+    ;; maxfinite / minsubnormal spans fewer than 2098 binary exponents.
+    (if (i32.and
+          (i32.and
+            (f64.lt (f64.abs (local.get $x)) (f64.const inf))
+            (f64.lt (f64.abs (local.get $y)) (f64.const inf)))
+          (i32.and
+            (f64.ne (local.get $y) (f64.const 0))
+            (f64.eq (f64.abs (f64.div (local.get $x) (local.get $y))) (f64.const inf))))
+      (then
+        (local.set $r (f64.abs (local.get $x)))
+        (local.set $scale (f64.abs (local.get $y)))
+        (block $scaled
+          (loop $scale_up
+            (br_if $scaled
+              (i32.or
+                (i32.ge_u (local.get $steps) (i32.const 2098))
+                (f64.gt (local.get $scale) (f64.mul (local.get $r) (f64.const 0.5)))))
+            (local.set $scale (f64.mul (local.get $scale) (f64.const 2)))
+            (local.set $steps (i32.add (local.get $steps) (i32.const 1)))
+            (br $scale_up)))
+        (block $reduced
+          (loop $reduce
+            ;; r < 2*scale, so each selected subtraction is exact.
+            (if (f64.ge (local.get $r) (local.get $scale))
+              (then (local.set $r (f64.sub (local.get $r) (local.get $scale)))))
+            (br_if $reduced (i32.eqz (local.get $steps)))
+            (local.set $scale (f64.mul (local.get $scale) (f64.const 0.5)))
+            (local.set $steps (i32.sub (local.get $steps) (i32.const 1)))
+            (br $reduce)))
+        (call $fpu_push (f64.copysign (local.get $r) (local.get $x)))
+        (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
+        (return)))
+    (local.set $r
       (f64.sub
         (local.get $x)
         (f64.mul
           (f64.trunc (f64.div (local.get $x) (local.get $y)))
           (local.get $y))))
+    ;; Recompute only a finite cancellation to zero. Scaling by powers of
+    ;; two is exact; each selected subtraction has scale <= r < 2*scale.
+    ;; Preserve the existing nonzero, nonfinite and quotient-overflow paths.
+    (if (i32.and
+          (f64.eq (local.get $r) (f64.const 0))
+          (i32.and
+            (i32.and
+              (f64.ne (local.get $x) (f64.const 0))
+              (f64.lt (f64.abs (local.get $x)) (f64.const inf)))
+            (i32.and
+              (f64.ne (local.get $y) (f64.const 0))
+              (f64.lt (f64.abs (local.get $y)) (f64.const inf)))))
+      (then
+        (local.set $r (f64.abs (local.get $x)))
+        (local.set $scale (f64.abs (local.get $y)))
+        (block $zero_scaled
+          (loop $zero_scale_up
+            (br_if $zero_scaled
+              (i32.or
+                (i32.ge_u (local.get $steps) (i32.const 2098))
+                (f64.gt (local.get $scale) (f64.mul (local.get $r) (f64.const 0.5)))))
+            (local.set $scale (f64.mul (local.get $scale) (f64.const 2)))
+            (local.set $steps (i32.add (local.get $steps) (i32.const 1)))
+            (br $zero_scale_up)))
+        (block $zero_reduced
+          (loop $zero_reduce
+            (if (f64.ge (local.get $r) (local.get $scale))
+              (then (local.set $r (f64.sub (local.get $r) (local.get $scale)))))
+            (br_if $zero_reduced (i32.eqz (local.get $steps)))
+            (local.set $scale (f64.mul (local.get $scale) (f64.const 0.5)))
+            (local.set $steps (i32.sub (local.get $steps) (i32.const 1)))
+            (br $zero_reduce)))
+        (local.set $r (f64.copysign (local.get $r) (local.get $x)))))
+    (if (f64.eq (local.get $r) (f64.const 0))
+      (then (local.set $r (f64.copysign (local.get $r) (local.get $x)))))
+    (call $fpu_push (local.get $r))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
   )
 
@@ -996,11 +1120,74 @@
   )
 
   (func $handle_ldexp (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $x f64)
+    (local $exp i32)
+    (local.set $x (f64.load (call $g2w (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))))
+    ;; Scale finite nonzero inputs before a separately evaluated 2^exp overflows.
+    (if (i32.gt_s
+          (local.tee $exp (i32.load (call $g2w (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))))
+          (i32.const 1023))
+      (then
+        (if (i32.and
+              (f64.ne (local.get $x) (f64.const 0))
+              (f64.lt (f64.abs (local.get $x)) (f64.const inf)))
+          (then
+            ;; Even 2^-1074 * 2^2098 overflows; bound work for every int exponent.
+            (if (i32.ge_s (local.get $exp) (i32.const 2098))
+              (then (local.set $x (f64.copysign (f64.const inf) (local.get $x))))
+              (else
+                ;; Growing by exact powers cannot underflow or lose significand bits.
+                (local.set $x (f64.mul (local.get $x) (f64.const 0x1p1023)))
+                (local.set $exp (i32.sub (local.get $exp) (i32.const 1023)))
+                (if (i32.gt_s (local.get $exp) (i32.const 1023))
+                  (then
+                    (local.set $x (f64.mul (local.get $x) (f64.const 0x1p1023)))
+                    (local.set $exp (i32.sub (local.get $exp) (i32.const 1023)))))
+                (local.set $x
+                  (f64.mul (local.get $x)
+                    (f64.reinterpret_i64
+                      (i64.shl
+                        (i64.extend_i32_u (i32.add (local.get $exp) (i32.const 1023)))
+                        (i64.const 52)))))))
+            (call $fpu_push (local.get $x))
+            (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
+            (return)))))
+    ;; Keep each scale representable; defer relevant underflow to the final multiply.
+    (if (i32.and
+          (i32.lt_s (local.get $exp) (i32.const -1074))
+          (i32.and
+            (f64.ne (local.get $x) (f64.const 0))
+            (f64.lt (f64.abs (local.get $x)) (f64.const inf))))
+      (then
+        (if (i32.le_s (local.get $exp) (i32.const -2099))
+          (then (local.set $x (f64.copysign (f64.const 0) (local.get $x))))
+          (else
+            ;; Exact 2^-1022; potentially nonzero results start with |x| > 1.
+            (local.set $x (f64.mul (local.get $x) (f64.const 0x1p-1022)))
+            (if (i32.lt_s (local.get $exp) (i32.const -2044))
+              (then
+                ;; Exact 2^-54 keeps the remaining power normal, with no
+                ;; intermediate rounding for any potentially nonzero result.
+                (local.set $x (f64.mul (local.get $x) (f64.const 0x1p-54)))
+                (local.set $exp (i32.add (local.get $exp) (i32.const 54)))))
+            (local.set $x
+              (f64.mul (local.get $x)
+                (f64.reinterpret_i64
+                  (i64.shl
+                    (i64.extend_i32_u (i32.add (local.get $exp) (i32.const 2045)))
+                    (i64.const 52)))))))
+        (call $fpu_push (local.get $x))
+        (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
+        (return)))
+    (if (f64.eq (local.get $x) (f64.const 0))
+      (then (call $fpu_push (local.get $x)))
+      (else
     (call $fpu_push
       (f64.mul
         (f64.load (call $g2w (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4))))
         (call $host_math_pow2
           (f64.convert_i32_s (i32.load (call $g2w (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12))))))))
+      ))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
   )
 
@@ -1013,6 +1200,14 @@
   )
 
   (func $handle_pow (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    ;; A positive unit base is one for every exponent, including a quiet NaN.
+    (if (f64.eq
+          (f64.load (call $g2w (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4))))
+          (f64.const 1))
+      (then
+        (call $fpu_push (f64.const 1))
+        (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
+        (return)))
     (call $fpu_push
       (call $host_math_pow
         (f64.load (call $g2w (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4))))
@@ -1025,6 +1220,12 @@
     (local $exponent f64) (local $base f64)
     (local.set $exponent (call $fpu_pop))
     (local.set $base (call $fpu_pop))
+    ;; A positive unit base is one for every exponent, including a quiet NaN.
+    (if (f64.eq (local.get $base) (f64.const 1))
+      (then
+        (call $fpu_push (f64.const 1))
+        (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
+        (return)))
     (call $fpu_push (call $host_math_pow (local.get $base) (local.get $exponent)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
   )
@@ -1032,15 +1233,93 @@
   ;; _CIfmod is the corresponding MSVC x87-stack remainder helper:
   ;; ST(1)=dividend, ST(0)=divisor, with one result left in ST(0).
   (func $handle__CIfmod (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $divisor f64) (local $dividend f64)
+    (local $divisor f64) (local $dividend f64) (local $result f64)
+    (local $scale f64) (local $steps i32)
     (local.set $divisor (call $fpu_pop))
     (local.set $dividend (call $fpu_pop))
-    (call $fpu_push
+    ;; A finite dividend is unchanged by either infinite divisor.
+    (if (i32.and
+          (f64.lt (f64.abs (local.get $dividend)) (f64.const inf))
+          (f64.eq (f64.abs (local.get $divisor)) (f64.const inf)))
+      (then
+        (call $fpu_push (local.get $dividend))
+        (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
+        (return)))
+    ;; Only finite operands with a nonzero divisor and overflowing quotient.
+    ;; maxfinite / minsubnormal spans fewer than 2098 binary exponents.
+    (if (i32.and
+          (i32.and
+            (f64.lt (f64.abs (local.get $dividend)) (f64.const inf))
+            (f64.lt (f64.abs (local.get $divisor)) (f64.const inf)))
+          (i32.and
+            (f64.ne (local.get $divisor) (f64.const 0))
+            (f64.eq (f64.abs (f64.div (local.get $dividend) (local.get $divisor))) (f64.const inf))))
+      (then
+        (local.set $result (f64.abs (local.get $dividend)))
+        (local.set $scale (f64.abs (local.get $divisor)))
+        (block $scaled
+          (loop $scale_up
+            (br_if $scaled
+              (i32.or
+                (i32.ge_u (local.get $steps) (i32.const 2098))
+                (f64.gt (local.get $scale) (f64.mul (local.get $result) (f64.const 0.5)))))
+            (local.set $scale (f64.mul (local.get $scale) (f64.const 2)))
+            (local.set $steps (i32.add (local.get $steps) (i32.const 1)))
+            (br $scale_up)))
+        (block $reduced
+          (loop $reduce
+            ;; result < 2*scale: every selected subtraction is exact.
+            (if (f64.ge (local.get $result) (local.get $scale))
+              (then (local.set $result (f64.sub (local.get $result) (local.get $scale)))))
+            (br_if $reduced (i32.eqz (local.get $steps)))
+            (local.set $scale (f64.mul (local.get $scale) (f64.const 0.5)))
+            (local.set $steps (i32.sub (local.get $steps) (i32.const 1)))
+            (br $reduce)))
+        (call $fpu_push (f64.copysign (local.get $result) (local.get $dividend)))
+        (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
+        (return)))
+    (local.set $result
       (f64.sub
         (local.get $dividend)
         (f64.mul
           (f64.trunc (f64.div (local.get $dividend) (local.get $divisor)))
           (local.get $divisor))))
+    ;; Recompute only a finite cancellation to zero. Scaling by powers of
+    ;; two is exact; each selected subtraction has scale <= r < 2*scale.
+    ;; Preserve the existing nonzero, nonfinite and quotient-overflow paths.
+    (if (i32.and
+          (f64.eq (local.get $result) (f64.const 0))
+          (i32.and
+            (i32.and
+              (f64.ne (local.get $dividend) (f64.const 0))
+              (f64.lt (f64.abs (local.get $dividend)) (f64.const inf)))
+            (i32.and
+              (f64.ne (local.get $divisor) (f64.const 0))
+              (f64.lt (f64.abs (local.get $divisor)) (f64.const inf)))))
+      (then
+        (local.set $result (f64.abs (local.get $dividend)))
+        (local.set $scale (f64.abs (local.get $divisor)))
+        (block $zero_scaled
+          (loop $zero_scale_up
+            (br_if $zero_scaled
+              (i32.or
+                (i32.ge_u (local.get $steps) (i32.const 2098))
+                (f64.gt (local.get $scale) (f64.mul (local.get $result) (f64.const 0.5)))))
+            (local.set $scale (f64.mul (local.get $scale) (f64.const 2)))
+            (local.set $steps (i32.add (local.get $steps) (i32.const 1)))
+            (br $zero_scale_up)))
+        (block $zero_reduced
+          (loop $zero_reduce
+            (if (f64.ge (local.get $result) (local.get $scale))
+              (then (local.set $result (f64.sub (local.get $result) (local.get $scale)))))
+            (br_if $zero_reduced (i32.eqz (local.get $steps)))
+            (local.set $scale (f64.mul (local.get $scale) (f64.const 0.5)))
+            (local.set $steps (i32.sub (local.get $steps) (i32.const 1)))
+            (br $zero_reduce)))
+        (local.set $result (f64.copysign (local.get $result) (local.get $dividend)))))
+    (if (f64.eq (local.get $result) (f64.const 0))
+      (then (local.set $result (f64.copysign (local.get $result) (local.get $dividend)))))
+    (call $fpu_push (local.get $result))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
   )
 
@@ -1413,7 +1692,7 @@
         (return (local.get $winner))))
     (local.get $iob))
 
-  ;; CRTDLL and MSVCR70 export _iob as a FILE array, not a callable accessor.
+  ;; CRTDLL, MSVCRT and MSVCR70 export _iob as a FILE array, not an accessor.
   ;; Other vendors must still resolve normally. Both loader paths pass linear
   ;; string pointers. Binding this data to a thunk lets freopen overwrite
   ;; adjacent thunk metadata (GLTron's redirected stdout corrupted abs).
@@ -1423,6 +1702,20 @@
     (local $iob i32)
     (if (i32.eqz (call $str_eq (local.get $name_wa) "_iob"))
       (then (return (i32.const 0))))
+    ;; MSVCRT's callable accessor is __p__iob. Its _iob import is the array
+    ;; itself: SDL copies redirected FILEs into +32/+64, so a thunk binding
+    ;; corrupts adjacent API descriptors and their stack-cleanup contracts.
+    (if (i32.and
+          (i32.eq (i32.or (i32.load (local.get $dll_wa)) (i32.const 0x20202020)) (i32.const 0x6376736d))
+          (i32.and
+            (i32.eq (i32.or (i32.load offset=4 (local.get $dll_wa)) (i32.const 0x20202020)) (i32.const 0x642e7472))
+            (i32.and
+              (i32.eq (i32.or (i32.load16_u offset=8 (local.get $dll_wa)) (i32.const 0x2020)) (i32.const 0x6c6c))
+              (i32.eqz (i32.load8_u offset=10 (local.get $dll_wa))))))
+      (then
+        (local.set $iob (call $crt_iob_ensure))
+        (if (i32.eqz (local.get $iob)) (then (unreachable)))
+        (return (local.get $iob))))
     (if (i32.and
           (i32.eq (i32.or (i32.load (local.get $dll_wa)) (i32.const 0x20202020)) (i32.const 0x6376736d))
           (i32.and
@@ -3865,7 +4158,7 @@
       (return (local.get $fn))))
     (i32.const 0))
 
-  ;; Retained init/exit frames: mode 0=_initterm, 1=exit, 2=_cexit.
+  ;; Retained init/exit frames: mode 0=_initterm, 1=exit, 2=_cexit, 3=_initterm_e.
   ;; 0 ret, 4 cursor, 8 end, 12 mode, 16 exit code, 20 expected ESP;
   ;; 32 parent, 40 expected child, 48 root. Sixteen independent partitions.
   (global $CRT_CALLBACK_CONTEXTS i32 (region.addr $CRT_CALLBACK_CONTEXTS 0))
@@ -3873,6 +4166,7 @@
   (global $crt_callback_owner (mut i64) (i64.const 0))
   (global $crt_callback_depth (mut i32) (i32.const 0))
   (global $crt_cexit_thunk (mut i32) (i32.const 0))
+  (global $crt_initterm_e_thunk (mut i32) (i32.const 0))
 
   (func $crt_callback_frame_at (param $index i32) (result i32)
     (i32.add (region.addr $CRT_CALLBACK_CONTEXTS 0)
@@ -3893,7 +4187,7 @@
   ;; then reserve its child identity before committing any callback state.
   (func $crt_callback_slot (param $mode i32) (param $ptr i32) (param $end i32) (result i32)
     (local $n i32)
-    (if (i32.eqz (local.get $mode))
+    (if (i32.or (i32.eqz (local.get $mode)) (i32.eq (local.get $mode) (i32.const 3)))
       (then
         (block $done (loop $scan
           (br_if $done (i32.ge_u (local.get $ptr) (local.get $end)))
@@ -3911,10 +4205,12 @@
     (i32.const 0))
 
   (func $crt_callback_complete (param $mode i32) (param $ret i32) (param $sp i32) (param $code i32)
-    (if (local.get $mode)
+    (if (i32.or (i32.eq (local.get $mode) (i32.const 1)) (i32.eq (local.get $mode) (i32.const 2)))
       (then
         (global.set $atexit_count (i32.const 0))
         (call $crt_stream_close_all)))
+    (if (i32.eq (local.get $mode) (i32.const 3))
+      (then (i32.store (global.get $reg_base) (local.get $code))))
     (i32.store offset=16 (global.get $reg_base) (local.get $sp))
     (if (i32.eq (local.get $mode) (i32.const 1))
       (then
@@ -3928,10 +4224,16 @@
   (func $crt_callback_launch (param $frame i32) (param $slot i32)
     (local $thunk i32) (local $fn i32) (local $sp i32)
     (local.set $fn (call $gl32 (local.get $slot)))
-    (if (i32.eqz (i32.load offset=12 (local.get $frame)))
+    (if (i32.or (i32.eqz (i32.load offset=12 (local.get $frame)))
+          (i32.eq (i32.load offset=12 (local.get $frame)) (i32.const 3)))
       (then
         (i32.store offset=4 (local.get $frame) (i32.add (local.get $slot) (i32.const 4)))
-        (local.set $thunk (global.get $initterm_thunk)))
+        (local.set $thunk (global.get $initterm_thunk))
+        (if (i32.eq (i32.load offset=12 (local.get $frame)) (i32.const 3))
+          (then
+            (if (i32.eqz (global.get $crt_initterm_e_thunk))
+              (then (global.set $crt_initterm_e_thunk (call $com_cont_thunk (i32.const 0xCACA0042)))))
+            (local.set $thunk (global.get $crt_initterm_e_thunk)))))
       (else
         ;; Pop before entering guest code: nested cleanup cannot repeat this callback.
         (global.set $atexit_count (i32.shr_u (i32.sub (local.get $slot) (global.get $atexit_table)) (i32.const 2)))
@@ -3988,7 +4290,14 @@
     (call $invocation_leave (i64.load offset=40 (local.get $frame)))
     (i64.store offset=40 (local.get $frame) (i64.const 0))
     (if (i64.ne (call $invocation_current) (i64.load offset=32 (local.get $frame))) (then (unreachable)))
-    (local.set $slot (call $crt_callback_slot (local.get $mode) (i32.load offset=4 (local.get $frame)) (i32.load offset=8 (local.get $frame))))
+    ;; Read the callback's EAX only after validating its invocation and RET.
+    ;; Each nested walk owns its frame/result; the first failure never scans
+    ;; or invokes a later initializer. Void _initterm still ignores EAX.
+    (if (i32.and (i32.eq (local.get $mode) (i32.const 3))
+          (i32.ne (i32.load (global.get $reg_base)) (i32.const 0)))
+      (then (i32.store offset=16 (local.get $frame) (i32.load (global.get $reg_base))))
+      (else (local.set $slot (call $crt_callback_slot (local.get $mode)
+        (i32.load offset=4 (local.get $frame)) (i32.load offset=8 (local.get $frame))))))
     (if (local.get $slot)
       (then
         (i64.store offset=40 (local.get $frame) (call $invocation_enter))

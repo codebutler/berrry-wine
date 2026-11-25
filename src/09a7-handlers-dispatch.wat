@@ -592,6 +592,21 @@
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
   )
 
+  ;; _time64(__time64_t *timer) — cdecl, MSVCR80+ (time() is an inline
+  ;; wrapper over it in those headers). Same calendar clock as time(), but the
+  ;; full 64-bit second count comes back in EDX:EAX and is stored as a qword.
+  (func $handle__time64 (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $t i64)
+    (local.set $t (i64.div_s
+      (i64.sub (call $wall_clock_read64 (i32.const 2)) (i64.const 116444736000000000))
+      (i64.const 10000000)))
+    (i32.store offset=0 (global.get $reg_base) (i32.wrap_i64 (local.get $t)))
+    (i32.store offset=8 (global.get $reg_base) (i32.wrap_i64 (i64.shr_u (local.get $t) (i64.const 32))))
+    (if (local.get $arg0)
+      (then (call $gs64 (local.get $arg0) (local.get $t))))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
+  )
+
   ;; 746: atol(str) — convert ASCII string to long integer
   (func $handle_atol (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $ptr i32) (local $val i32) (local $ch i32) (local $neg i32)
@@ -599,15 +614,19 @@
     ;; Skip whitespace
     (block $ws_done (loop $ws
       (local.set $ch (i32.load8_u (local.get $ptr)))
-      (br_if $ws_done (i32.ne (local.get $ch) (i32.const 32)))
+      (br_if $ws_done (i32.eqz
+        (i32.or (i32.eq (local.get $ch) (i32.const 32))
+          (i32.and (i32.ge_u (local.get $ch) (i32.const 9))
+                   (i32.le_u (local.get $ch) (i32.const 13))))))
       (local.set $ptr (i32.add (local.get $ptr) (i32.const 1)))
       (br $ws)))
     ;; Check sign
     (if (i32.eq (i32.load8_u (local.get $ptr)) (i32.const 45))  ;; '-'
       (then (local.set $neg (i32.const 1))
-            (local.set $ptr (i32.add (local.get $ptr) (i32.const 1)))))
-    (if (i32.eq (i32.load8_u (local.get $ptr)) (i32.const 43))  ;; '+'
-      (then (local.set $ptr (i32.add (local.get $ptr) (i32.const 1)))))
+            (local.set $ptr (i32.add (local.get $ptr) (i32.const 1))))
+      (else
+        (if (i32.eq (i32.load8_u (local.get $ptr)) (i32.const 43))  ;; '+'
+          (then (local.set $ptr (i32.add (local.get $ptr) (i32.const 1)))))))
     ;; Parse digits
     (block $done (loop $digits
       (local.set $ch (i32.load8_u (local.get $ptr)))
@@ -3339,7 +3358,25 @@
       (if (call $guid_words_equal (local.get $clsid_wa)
             (i32.const 0x25E609E0) (i32.const 0x11CFB259)
             (i32.const 0x4544C7BF) (i32.const 0x00005453))
-        (then (local.set $local_class (i32.const 11))))))
+        (then (local.set $local_class (i32.const 11))))
+      ;; CLSID_WebBrowser {8856F961-340A-11D0-A96B-00C04FD705A2}: the blank
+      ;; control in 09a7l-webbrowser.wat (Game Maker runners' TWebBrowser).
+      (if (call $guid_words_equal (local.get $clsid_wa)
+            (i32.const 0x8856F961) (i32.const 0x11D0340A)
+            (i32.const 0xC0006BA9) (i32.const 0xA205D74F))
+        (then (local.set $local_class (i32.const 12))))
+      ;; CLSID_DirectMusicPerformance {D2AC2881-...} / CLSID_DirectMusicLoader
+      ;; {D2AC2892-...} (09a7m-directmusic.wat), activated only for the
+      ;; DirectX 8 interfaces that file implements; a DirectX 6/7 caller keeps
+      ;; REGDB_E_CLASSNOTREG and its own no-music path.
+      (if (i32.ne (local.get $iid_wa) (i32.const 0))
+        (then
+          (if (i32.and (call $dm_is_d2ac (local.get $clsid_wa) (i32.const 0xD2AC2881))
+                (call $dm_is_perf8_iid (local.get $iid_wa)))
+            (then (local.set $local_class (i32.const 13))))
+          (if (i32.and (call $dm_is_d2ac (local.get $clsid_wa) (i32.const 0xD2AC2892))
+                (call $dm_is_loader8_iid (local.get $iid_wa)))
+            (then (local.set $local_class (i32.const 14))))))))
 
     (if (local.get $local_class) (then
       (if (i32.eqz (local.get $arg4))
@@ -3396,6 +3433,12 @@
       (if (i32.eq (local.get $local_class) (i32.const 11))
         (then (local.set $obj_guest (call $dx_create_com_obj
           (i32.const 6) (global.get $DX_VTBL_DINPUT)))))
+      (if (i32.eq (local.get $local_class) (i32.const 12))
+        (then (local.set $obj_guest (call $webbrowser_create))))
+      (if (i32.eq (local.get $local_class) (i32.const 13))
+        (then (local.set $obj_guest (call $dmusic_perf_create))))
+      (if (i32.eq (local.get $local_class) (i32.const 14))
+        (then (local.set $obj_guest (call $dmusic_loader_create))))
       (if (i32.eqz (local.get $obj_guest))
         (then
           (i32.store offset=0 (global.get $reg_base) (i32.const 0x8007000E)) ;; E_OUTOFMEMORY
@@ -3452,7 +3495,18 @@
       (if (i32.eq (local.get $local_class) (i32.const 11))
         (then (local.set $hr (call $dinput_cocreate_query_wa
           (local.get $obj_guest) (local.get $iid_wa) (local.get $arg4)))))
-      (drop (call $dx_com_release_basic (local.get $obj_guest)))
+      (if (i32.eq (local.get $local_class) (i32.const 12))
+        (then (local.set $hr (call $webbrowser_query_interface_wa
+          (local.get $obj_guest) (local.get $iid_wa) (local.get $arg4)))))
+      (if (i32.eq (local.get $local_class) (i32.const 13))
+        (then (local.set $hr (call $dm_perf_qi_wa
+          (local.get $obj_guest) (local.get $iid_wa) (local.get $arg4)))))
+      (if (i32.eq (local.get $local_class) (i32.const 14))
+        (then (local.set $hr (call $dm_loader_qi_wa
+          (local.get $obj_guest) (local.get $iid_wa) (local.get $arg4)))))
+      (if (i32.ge_u (local.get $local_class) (i32.const 13))
+        (then (drop (call $dmusic_release (local.get $obj_guest))))
+        (else (drop (call $dx_com_release_basic (local.get $obj_guest)))))
       (i32.store offset=0 (global.get $reg_base) (local.get $hr))
       (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24)))
       (return)))
@@ -3532,6 +3586,8 @@
   ;; to return the requested class-factory interface directly.
   (func $handle_CoGetClassObject (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $hr i32) (local $host_ctx i32) (local $factory i32)
+    (if (call $tl_proxy_class (local.get $arg0))
+      (then (call $com_interface_bridge (i32.const 19) (i32.const 5)) (return)))
     ;; CLSID_CommonDialog {F9043C85-F6F2-101A-A3C9-08002B2F49FB}.
     (if (i32.eq (call $gl32 (local.get $arg0)) (i32.const 0xF9043C85))
       (then
@@ -3715,22 +3771,183 @@
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
   )
 
-  ;; VariantClear(pvarg: VARIANTARG*) → HRESULT. Full impl would free BSTR/dispatch
-  ;; fields based on vt, but Spider stores only simple VT_I4/VT_BOOL variants, and
-  ;; any cached BSTR leaks are bounded. A by-value VT_ARRAY owns its SAFEARRAY
-  ;; (devenum's FilterData is VT_UI1|VT_ARRAY), so that one is destroyed. Zero
-  ;; the whole 16-byte VARIANT so callers don't re-read stale tagged pointers.
-  (func $handle_VariantClear (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $vt i32)
-    (if (local.get $arg0)
+  ;; VARIANT ownership is shared by Copy, CopyInd and Clear. -1 requests the
+  ;; existing owner-thread COM continuation for actual IUnknown callbacks.
+  ;; No source tag is inferred from the caller or application.
+  (func $variant_span (param $p i32) (param $n i32) (result i32)
+    (local $end i32) (local $w i32)
+    (if (i32.eqz (local.get $p)) (then (return (i32.const 0))))
+    (local.set $end (i32.add (local.get $p) (i32.sub (local.get $n) (i32.const 1))))
+    (if (i32.lt_u (local.get $end) (local.get $p)) (then (return (i32.const 0))))
+    (local.set $w (call $g2w (local.get $p)))
+    (i32.and (i32.gt_u (local.get $w) (i32.const 255))
+      (i32.eq (call $g2w (local.get $end)) (i32.add (local.get $w) (i32.sub (local.get $n) (i32.const 1))))))
+
+  (func $variant_type_check (param $vt i32) (result i32)
+    (local $base i32)
+    (if (i32.and (local.get $vt) (i32.const 0x9000)) (then (return (i32.const 0x80020008))))
+    (local.set $base (i32.and (local.get $vt) (i32.const 0xfff)))
+    (if (i32.eq (local.get $base) (i32.const 36)) (then (return (i32.const 0x80004001)))) ;; RECORD needs IRecordInfo
+    (if (i32.and (local.get $vt) (i32.const 0x2000))
       (then
-        (local.set $vt (call $gl16 (local.get $arg0)))
-        (if (i32.eq (i32.and (local.get $vt) (i32.const 0x6000)) (i32.const 0x2000)) ;; VT_ARRAY, not VT_BYREF
-          (then (drop (call $safearray_destroy (call $gl32 (i32.add (local.get $arg0) (i32.const 8)))))))
-        (call $zero_memory (call $g2w (local.get $arg0)) (i32.const 16))))
-    (i32.store offset=0 (global.get $reg_base) (i32.const 0))  ;; S_OK
-    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
-  )
+        (if (i32.or (i32.eq (local.get $base) (i32.const 9))
+              (i32.eq (local.get $base) (i32.const 13)))
+          (then (return (i32.const 0x80004001))))
+        (if (i32.eqz (call $safearray_elem_size (local.get $base))) (then (return (i32.const 0x80020008))))
+        (return (i32.const 0))))
+    (if (i32.or (i32.lt_s (call $variant_value_size (local.get $base)) (i32.const 0))
+          (i32.eq (local.get $base) (i32.const 15))) (then (return (i32.const 0x80020008))))
+    (if (i32.and (local.get $vt) (i32.const 0x4000))
+      (then (if (i32.le_u (local.get $base) (i32.const 1)) (then (return (i32.const 0x80070057)))))
+      (else (if (i32.eq (local.get $base) (i32.const 12)) (then (return (i32.const 0x80020008))))))
+    (i32.const 0))
+
+  (func $variant_owned_check (param $p i32) (param $depth i32) (param $clearing i32) (result i32)
+    (local $vt i32) (local $hr i32) (local $array i32)
+    (if (i32.eqz (call $variant_span (local.get $p) (i32.const 16))) (then (return (i32.const 0x80070057))))
+    (local.set $vt (call $gl16 (local.get $p)))
+    (local.set $hr (call $variant_type_check (local.get $vt)))
+    (if (local.get $hr) (then (return (local.get $hr))))
+    (if (i32.eq (i32.and (local.get $vt) (i32.const 0x6000)) (i32.const 0x2000))
+      (then
+        (local.set $array (call $gl32 (i32.add (local.get $p) (i32.const 8))))
+        (if (local.get $array) (then
+          (return (call $safearray_validate (local.get $array) (local.get $depth) (local.get $clearing)))))))
+    (i32.const 0))
+
+  (func $variant_clear_check (export "variant_clear_check") (param $p i32) (result i32)
+    (call $variant_owned_check (local.get $p) (i32.const 0) (i32.const 1)))
+
+  (func $variant_clear_value (export "variant_clear_native") (param $p i32) (param $refs i32) (result i32)
+    (local $vt i32) (local $value i32) (local $hr i32)
+    (local.set $hr (call $variant_clear_check (local.get $p)))
+    (if (local.get $hr) (then (return (local.get $hr))))
+    (local.set $vt (call $gl16 (local.get $p)))
+    (if (i32.and (i32.eqz (local.get $refs)) (i32.eq (local.get $vt) (i32.const 0x200c)))
+      (then (return (i32.const -1))))
+    (if (i32.eqz (i32.and (local.get $vt) (i32.const 0x4000)))
+      (then
+        (local.set $value (call $gl32 (i32.add (local.get $p) (i32.const 8))))
+        (if (i32.and (i32.eqz (local.get $refs))
+              (i32.and (i32.ne (local.get $value) (i32.const 0))
+                (i32.or (i32.eq (local.get $vt) (i32.const 9)) (i32.eq (local.get $vt) (i32.const 13)))))
+          (then (return (i32.const -1))))
+        (if (i32.and (local.get $vt) (i32.const 0x2000))
+          (then (local.set $hr (call $safearray_destroy (local.get $value)))
+            (if (local.get $hr) (then (return (local.get $hr))))))
+        (if (i32.and (i32.eq (local.get $vt) (i32.const 8)) (i32.ne (local.get $value) (i32.const 0)))
+          (then (call $heap_free (i32.sub (local.get $value) (i32.const 4)))))))
+    (call $zero_memory (call $g2w (local.get $p)) (i32.const 16))
+    (i32.const 0))
+
+  (func $variant_copy_value (export "variant_copy_native") (param $dst i32) (param $src i32) (param $ind i32) (param $refs i32) (result i32)
+    (local $vt i32) (local $data i32) (local $size i32) (local $depth i32) (local $tmp i32)
+    (local $hr i32) (local $value i32) (local $copy i32) (local $esp i32) (local $old i32) (local $ignored i32) (local $len i32)
+    (if (i32.or (i32.eqz (local.get $dst)) (i32.eqz (local.get $src))) (then (return (i32.const 0x80070057))))
+    (block $resolved (loop $resolve
+      (if (i32.eqz (call $variant_span (local.get $src) (i32.const 16))) (then (return (i32.const 0x80070057))))
+      (local.set $vt (call $gl16 (local.get $src)))
+      (local.set $hr (call $variant_type_check (local.get $vt)))
+      (if (local.get $hr) (then (return (local.get $hr))))
+      (br_if $resolved (i32.or (i32.eqz (local.get $ind)) (i32.ne (local.get $vt) (i32.const 0x400c))))
+      (local.set $src (call $gl32 (i32.add (local.get $src) (i32.const 8))))
+      (local.set $depth (i32.add (local.get $depth) (i32.const 1)))
+      (if (i32.or (i32.eqz (local.get $src)) (i32.gt_u (local.get $depth) (i32.const 32))) (then (return (i32.const 0x80070057))))
+      (br $resolve)))
+    ;; Direct self-copy is a no-op; indirect self-copy must still dereference.
+    (if (i32.and (i32.eq (local.get $dst) (local.get $src))
+          (i32.or (i32.eqz (local.get $ind)) (i32.eqz (i32.and (local.get $vt) (i32.const 0x4000)))))
+      (then (return (i32.const 0))))
+    ;; A valid self-copy has no release operation, even when its array is
+    ;; locked. Check destination ownership only for actual replacement.
+    (local.set $hr (call $variant_clear_check (local.get $dst)))
+    (if (local.get $hr) (then (return (local.get $hr))))
+    (local.set $data (i32.add (local.get $src) (i32.const 8)))
+    (local.set $size (i32.const 8))
+    (if (i32.and (i32.ne (local.get $ind) (i32.const 0)) (i32.ne (i32.and (local.get $vt) (i32.const 0x4000)) (i32.const 0)))
+      (then
+        (local.set $data (call $gl32 (local.get $data)))
+        (if (i32.eqz (local.get $data)) (then (return (i32.const 0x80070057))))
+        (local.set $vt (i32.xor (local.get $vt) (i32.const 0x4000)))
+        (local.set $size (if (result i32) (i32.and (local.get $vt) (i32.const 0x2000))
+          (then (i32.const 4)) (else (call $variant_value_size (local.get $vt))))))
+      (else (if (i32.eq (local.get $vt) (i32.const 14)) (then (local.set $data (local.get $src)) (local.set $size (i32.const 16))))))
+    (if (i32.ne (local.get $size) (i32.const 0))
+      (then (if (i32.eqz (call $variant_span (local.get $data) (local.get $size))) (then (return (i32.const 0x80070057))))))
+    (if (i32.or (i32.eq (local.get $vt) (i32.const 8))
+          (i32.or (i32.eq (local.get $vt) (i32.const 9)) (i32.or (i32.eq (local.get $vt) (i32.const 13)) (i32.ne (i32.and (local.get $vt) (i32.const 0x2000)) (i32.const 0)))))
+      (then (local.set $value (call $gl32 (local.get $data)))))
+    ;; Counted byte BSTRs may be odd-length and contain embedded NULs.
+    ;; Reject overflowing allocation sizes before the shared clone helper.
+    (if (i32.and (i32.eq (local.get $vt) (i32.const 8)) (i32.ne (local.get $value) (i32.const 0)))
+      (then
+        (if (i32.or (i32.lt_u (local.get $value) (i32.const 4))
+              (i32.eqz (call $variant_span (i32.sub (local.get $value) (i32.const 4)) (i32.const 4)))) (then (return (i32.const 0x80070057))))
+        (local.set $len (call $gl32 (i32.sub (local.get $value) (i32.const 4))))
+        (if (i32.gt_u (local.get $len) (i32.const 0x7fffffea)) (then (return (i32.const 0x8007000e))))
+        (if (i32.eqz (call $variant_span (local.get $value) (i32.add (local.get $len) (i32.const 2)))) (then (return (i32.const 0x80070057))))))
+    (local.set $old (call $gl16 (local.get $dst)))
+    (if (i32.and (i32.eqz (local.get $refs))
+          (i32.or (i32.eq (local.get $vt) (i32.const 0x200c)) (i32.eq (local.get $old) (i32.const 0x200c))))
+      (then (return (i32.const -1))))
+    (if (i32.and (i32.eqz (local.get $refs))
+          (i32.or
+            (i32.and (i32.ne (local.get $value) (i32.const 0)) (i32.or (i32.eq (local.get $vt) (i32.const 9)) (i32.eq (local.get $vt) (i32.const 13))))
+            (i32.and (i32.ne (call $gl32 (i32.add (local.get $dst) (i32.const 8))) (i32.const 0)) (i32.or (i32.eq (local.get $old) (i32.const 9)) (i32.eq (local.get $old) (i32.const 13))))))
+      (then (return (i32.const -1))))
+    (local.set $tmp (call $heap_alloc (i32.const 16)))
+    (if (i32.eqz (local.get $tmp)) (then (return (i32.const 0x8007000e))))
+    (call $zero_memory (call $g2w (local.get $tmp)) (i32.const 16))
+    (memory.copy (call $g2w (i32.add (local.get $tmp) (if (result i32) (i32.eq (local.get $vt) (i32.const 14)) (then (i32.const 0)) (else (i32.const 8)))))
+      (call $g2w (local.get $data)) (local.get $size))
+    (call $gs16 (local.get $tmp) (local.get $vt))
+    (block $staged
+      (if (i32.eq (local.get $vt) (i32.const 8))
+        (then
+          (local.set $copy (call $tl_clone_bstr (local.get $value)))
+          (if (i32.and (i32.ne (local.get $value) (i32.const 0)) (i32.eqz (local.get $copy)))
+            (then (local.set $hr (i32.const 0x8007000e)) (br $staged)))
+          (call $gs32 (i32.add (local.get $tmp) (i32.const 8)) (local.get $copy))))
+      (if (i32.eq (i32.and (local.get $vt) (i32.const 0x6000)) (i32.const 0x2000))
+        (then
+          (local.set $esp (i32.load offset=16 (global.get $reg_base)))
+          (call $safearray_copy_native (local.get $value) (i32.add (local.get $tmp) (i32.const 8)) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))
+          (local.set $hr (i32.load offset=0 (global.get $reg_base)))
+          (i32.store offset=16 (global.get $reg_base) (local.get $esp))
+          (br_if $staged (local.get $hr))))
+      (local.set $hr (call $variant_clear_value (local.get $dst) (local.get $refs)))
+      (if (local.get $hr) (then (local.set $ignored (call $variant_clear_value (local.get $tmp) (i32.const 1))) (br $staged)))
+      (memory.copy (call $g2w (local.get $dst)) (call $g2w (local.get $tmp)) (i32.const 16)))
+    (call $heap_free (local.get $tmp))
+    (local.get $hr))
+
+  (func $handle_VariantClear (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $hr i32)
+    (if (call $host_com_interface_operation (i32.const 277) (i32.load offset=16 (global.get $reg_base)) (global.get $current_thread_id))
+      (then (call $com_interface_bridge (i32.const 21) (i32.const 1)) (return)))
+    (local.set $hr (call $variant_clear_value (local.get $arg0) (i32.const 0)))
+    (if (i32.eq (local.get $hr) (i32.const -1)) (then (call $com_interface_bridge (i32.const 21) (i32.const 1)) (return)))
+    (i32.store offset=0 (global.get $reg_base) (local.get $hr))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8))))
+
+  (func $handle_VariantCopy (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $hr i32)
+    (if (call $host_com_interface_operation (i32.const 278) (i32.load offset=16 (global.get $reg_base)) (global.get $current_thread_id))
+      (then (call $com_interface_bridge (i32.const 22) (i32.const 2)) (return)))
+    (local.set $hr (call $variant_copy_value (local.get $arg0) (local.get $arg1) (i32.const 0) (i32.const 0)))
+    (if (i32.eq (local.get $hr) (i32.const -1)) (then (call $com_interface_bridge (i32.const 22) (i32.const 2)) (return)))
+    (i32.store offset=0 (global.get $reg_base) (local.get $hr))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12))))
+
+  ;; OLEAUT32 #11: HRESULT WINAPI VariantCopyInd(VARIANT*, const VARIANTARG*).
+  (func $handle_VariantCopyInd (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $hr i32)
+    (if (call $host_com_interface_operation (i32.const 279) (i32.load offset=16 (global.get $reg_base)) (global.get $current_thread_id))
+      (then (call $com_interface_bridge (i32.const 23) (i32.const 2)) (return)))
+    (local.set $hr (call $variant_copy_value (local.get $arg0) (local.get $arg1) (i32.const 1) (i32.const 0)))
+    (if (i32.eq (local.get $hr) (i32.const -1)) (then (call $com_interface_bridge (i32.const 23) (i32.const 2)) (return)))
+    (i32.store offset=0 (global.get $reg_base) (local.get $hr))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12))))
 
   ;; VariantInit(pvarg) — mark the VARIANT as VT_EMPTY. Unlike VariantClear
   ;; this must NOT release anything: the struct is assumed to hold garbage.
@@ -3741,57 +3958,24 @@
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
   )
 
-  ;; VariantCopy(pvargDest, pvargSrc) → HRESULT. Release the destination, then
-  ;; take a copy of the source. A BSTR has to be duplicated rather than
-  ;; aliased, since both variants are independently owned and either may be
-  ;; cleared first; every other type in a VARIANT is inline.
-  (func $handle_VariantCopy (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $vt i32) (local $src_bstr i32) (local $len i32) (local $copy i32) (local $dst_wa i32)
-    (if (i32.or (i32.eqz (local.get $arg0)) (i32.eqz (local.get $arg1)))
-      (then
-        (i32.store offset=0 (global.get $reg_base) (i32.const 0x80070057))  ;; E_INVALIDARG
-        (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
-        (return)))
-    (local.set $dst_wa (call $g2w (local.get $arg0)))
-    (call $zero_memory (local.get $dst_wa) (i32.const 16))
-    (memory.copy (local.get $dst_wa) (call $g2w (local.get $arg1)) (i32.const 16))
-    (local.set $vt (call $gl16 (local.get $arg1)))
-    (if (i32.eq (local.get $vt) (i32.const 8))    ;; VT_BSTR
-      (then
-        (local.set $src_bstr (call $gl32 (i32.add (local.get $arg1) (i32.const 8))))
-        (if (local.get $src_bstr)
-          (then
-            ;; A BSTR stores its byte length in the dword before the data.
-            (local.set $len (call $gl32 (i32.sub (local.get $src_bstr) (i32.const 4))))
-            (local.set $copy (call $heap_alloc (i32.add (local.get $len) (i32.const 6))))
-            (if (local.get $copy)
-              (then
-                (local.set $copy (i32.add (local.get $copy) (i32.const 4)))
-                (call $gs32 (i32.sub (local.get $copy) (i32.const 4)) (local.get $len))
-                (memory.copy (call $g2w (local.get $copy)) (call $g2w (local.get $src_bstr))
-                  (i32.add (local.get $len) (i32.const 2)))))
-            (call $gs32 (i32.add (local.get $arg0) (i32.const 8)) (local.get $copy))))))
-    (i32.store offset=0 (global.get $reg_base) (i32.const 0))  ;; S_OK
-    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
-  )
-
-  ;; LoadTypeLib(szFile: LPCOLESTR, pptlib: ITypeLib**) → HRESULT. We don't
-  ;; implement type libraries; return TYPE_E_CANTLOADLIBRARY (0x80029C4A) so the
-  ;; caller can take its "no typelib" fallback path. Zero out *pptlib.
+  ;; Native Automation loading, including builtin stdole and bounded MSFT/SLTG.
   (func $handle_LoadTypeLib (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (if (local.get $arg1)
-      (then (call $gs32 (local.get $arg1) (i32.const 0))))
-    (i32.store offset=0 (global.get $reg_base) (i32.const 0x80029C4A))
+    (local $hr i32)
+    (local.set $hr (call $tl_load (local.get $arg0) (local.get $arg1)))
+    (i32.store offset=0 (global.get $reg_base) (local.get $hr))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
+    (if (i32.eq (local.get $hr) (i32.const -2)) (then (call $io_block (i32.const 12))))
   )
 
   ;; SAFEARRAY: USHORT cDims +0, USHORT fFeatures +2, ULONG cbElements +4,
   ;; ULONG cLocks +8, PVOID pvData +12, SAFEARRAYBOUND[cDims] +16 as
   ;; {cElements, lLbound}. OLEAUT32 keeps the VARTYPE in the dword before the
   ;; descriptor and flags that with FADF_HAVEVARTYPE; this layout matches.
-  ;; Only element types that own nothing are supported: an array of BSTRs,
-  ;; VARIANTs or interfaces would need its elements released on destroy.
+  ;; BSTR/VARIANT elements own their values. Native COM continuations perform
+  ;; interface callbacks for VARIANT trees; no Automation wire codec is used.
   (func $safearray_elem_size (param $vt i32) (result i32)
+    (if (i32.eq (local.get $vt) (i32.const 12)) (then (return (i32.const 16))))
+    (if (i32.eq (local.get $vt) (i32.const 8)) (then (return (i32.const 4)))) ;; BSTR
     (if (i32.or (i32.eq (local.get $vt) (i32.const 16)) (i32.eq (local.get $vt) (i32.const 17))) ;; I1 UI1
       (then (return (i32.const 1))))
     (if (i32.or (i32.eq (local.get $vt) (i32.const 2))
@@ -3810,20 +3994,22 @@
   ;; SafeArrayCreate(vt, cDims, rgsabound) → SAFEARRAY*, NULL on failure.
   (func $handle_SafeArrayCreate (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $cb i32) (local $i i32) (local $count i64) (local $block i32) (local $sa i32) (local $data i32)
+    (local.set $arg0 (i32.and (local.get $arg0) (i32.const 0xffff))) ;; VARTYPE is USHORT in the native ABI
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))
     (i32.store offset=0 (global.get $reg_base) (i32.const 0))
     (local.set $cb (call $safearray_elem_size (i32.and (local.get $arg0) (i32.const 0xFFFF))))
     (if (i32.eqz (local.get $cb))
-      (then (call $crash_unimplemented (local.get $name_ptr))))
+      (then (return)))
     (if (i32.or (i32.eqz (local.get $arg2))
           (i32.or (i32.eqz (local.get $arg1)) (i32.gt_u (local.get $arg1) (i32.const 64))))
       (then (return)))
+    (if (i32.eqz (call $variant_span (local.get $arg2) (i32.shl (local.get $arg1) (i32.const 3)))) (then (return)))
     (local.set $count (i64.const 1))
     (block $done (loop $dims
       (br_if $done (i32.ge_u (local.get $i) (local.get $arg1)))
       (local.set $count (i64.mul (local.get $count)
         (i64.extend_i32_u (call $gl32 (i32.add (local.get $arg2) (i32.shl (local.get $i) (i32.const 3)))))))
-      (if (i64.gt_u (local.get $count) (i64.const 0x10000000)) (then (return)))
+      (if (i64.gt_u (local.get $count) (i64.div_u (i64.const 0x7fffffea) (i64.extend_i32_u (local.get $cb)))) (then (return)))
       (local.set $i (i32.add (local.get $i) (i32.const 1)))
       (br $dims)))
     (local.set $block (call $heap_alloc (i32.add (i32.const 20) (i32.shl (local.get $arg1) (i32.const 3)))))
@@ -3831,7 +4017,10 @@
     (local.set $sa (i32.add (local.get $block) (i32.const 4)))
     (call $gs32 (local.get $block) (i32.and (local.get $arg0) (i32.const 0xFFFF)))
     (call $gs16 (local.get $sa) (local.get $arg1))
-    (call $gs16 (i32.add (local.get $sa) (i32.const 2)) (i32.const 0x80)) ;; FADF_HAVEVARTYPE
+    (call $gs16 (i32.add (local.get $sa) (i32.const 2))
+      (i32.or (i32.const 0x80)
+        (if (result i32) (i32.eq (local.get $arg0) (i32.const 12)) (then (i32.const 0x800))
+          (else (select (i32.const 0x100) (i32.const 0) (i32.eq (local.get $arg0) (i32.const 8)))))))
     (call $gs32 (i32.add (local.get $sa) (i32.const 4)) (local.get $cb))
     (call $gs32 (i32.add (local.get $sa) (i32.const 8)) (i32.const 0))
     ;; OLEAUT32 stores the bounds in reverse order of the caller's array.
@@ -3857,26 +4046,379 @@
     (call $gs32 (i32.add (local.get $sa) (i32.const 12)) (local.get $data))
     (i32.store offset=0 (global.get $reg_base) (local.get $sa)))
 
+  ;; Dimension metadata is a UINT return, with a one-argument stdcall ABI.
+  (func $handle_SafeArrayGetDim (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
+    (i32.store offset=0 (global.get $reg_base)
+      (if (result i32) (local.get $arg0) (then (call $gl16 (local.get $arg0))) (else (i32.const 0)))))
+
+  ;; Dimension numbers are one-based, opposite the descriptor bounds order.
+  ;; Metadata queries neither acquire a lock nor transfer element ownership.
+  (func $safearray_bound (param $sa i32) (param $dim i32) (param $out i32) (param $upper i32) (result i32)
+    (local $dims i32) (local $bound i32) (local $value i64)
+    (if (i32.or (i32.eqz (local.get $sa)) (i32.eqz (local.get $out))) (then (return (i32.const 0x80070057))))
+    (local.set $dims (call $gl16 (local.get $sa)))
+    (if (i32.or (i32.eqz (local.get $dim)) (i32.gt_u (local.get $dim) (local.get $dims)))
+      (then (return (i32.const 0x8002000B))))
+    (local.set $bound (i32.add (local.get $sa) (i32.add (i32.const 16)
+      (i32.shl (i32.sub (local.get $dims) (local.get $dim)) (i32.const 3)))))
+    (local.set $value (i64.extend_i32_s (call $gl32 (i32.add (local.get $bound) (i32.const 4)))))
+    (if (local.get $upper)
+      (then
+        (local.set $value (i64.sub (i64.add (local.get $value) (i64.extend_i32_u (call $gl32 (local.get $bound)))) (i64.const 1)))
+        (if (i32.or (i64.lt_s (local.get $value) (i64.const -2147483648)) (i64.gt_s (local.get $value) (i64.const 2147483647)))
+          (then (return (i32.const 0x8002000A))))))
+    (call $gs32 (local.get $out) (i32.wrap_i64 (local.get $value)))
+    (i32.const 0))
+
+  (func $handle_SafeArrayGetLBound (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))
+    (i32.store offset=0 (global.get $reg_base) (call $safearray_bound (local.get $arg0) (local.get $arg1) (local.get $arg2) (i32.const 0))))
+
+  (func $handle_SafeArrayGetUBound (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))
+    (i32.store offset=0 (global.get $reg_base) (call $safearray_bound (local.get $arg0) (local.get $arg1) (local.get $arg2) (i32.const 1))))
+
+  ;; Validate the complete owned tree before releasing any member. Depth also
+  ;; rejects cyclic/malformed ownership; BYREF wrappers never own their target.
+  (func $safearray_validate (export "safearray_validate") (param $sa i32) (param $depth i32) (param $clearing i32) (result i32)
+    (local $dims i32) (local $vt i32) (local $cb i32) (local $count i64) (local $i i32) (local $data i32) (local $hr i32)
+    (if (i32.eqz (local.get $sa)) (then (return (i32.const 0))))
+    (if (i32.gt_u (local.get $depth) (i32.const 32)) (then (return (i32.const 0x80070057))))
+    (if (i32.eqz (call $variant_span (i32.sub (local.get $sa) (i32.const 4)) (i32.const 20))) (then (return (i32.const 0x80070057))))
+    (local.set $dims (call $gl16 (local.get $sa)))
+    (if (i32.or (i32.eqz (local.get $dims)) (i32.gt_u (local.get $dims) (i32.const 64))) (then (return (i32.const 0x80070057))))
+    (if (i32.eqz (call $variant_span (local.get $sa) (i32.add (i32.const 16) (i32.shl (local.get $dims) (i32.const 3))))) (then (return (i32.const 0x80070057))))
+    ;; Only the native separately allocated descriptor kinds are supported.
+    (local.set $vt (call $gl32 (i32.sub (local.get $sa) (i32.const 4))))
+    (local.set $cb (call $safearray_elem_size (local.get $vt)))
+    (if (i32.eqz (local.get $cb)) (then (return (i32.const 0x80004001))))
+    (if (i32.ne (call $gl16 (i32.add (local.get $sa) (i32.const 2)))
+          (i32.or (i32.const 0x80) (if (result i32) (i32.eq (local.get $vt) (i32.const 12))
+            (then (i32.const 0x800)) (else (select (i32.const 0x100) (i32.const 0) (i32.eq (local.get $vt) (i32.const 8)))))))
+      (then (return (i32.const 0x80004001))))
+    (if (i32.ne (local.get $cb) (call $gl32 (i32.add (local.get $sa) (i32.const 4)))) (then (return (i32.const 0x80070057))))
+    (if (i32.and (i32.ne (local.get $clearing) (i32.const 0)) (i32.ne (call $gl32 (i32.add (local.get $sa) (i32.const 8))) (i32.const 0)))
+      (then (return (i32.const 0x8002000d))))
+    (local.set $count (i64.const 1))
+    (block $done (loop $dims_loop
+      (br_if $done (i32.ge_u (local.get $i) (local.get $dims)))
+      (local.set $count (i64.mul (local.get $count) (i64.extend_i32_u (call $gl32 (i32.add (local.get $sa) (i32.add (i32.const 16) (i32.shl (local.get $i) (i32.const 3))))))))
+      (if (i64.gt_u (local.get $count) (i64.div_u (i64.const 0x7fffffea) (i64.extend_i32_u (local.get $cb)))) (then (return (i32.const 0x8007000e))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $dims_loop)))
+    (local.set $data (call $gl32 (i32.add (local.get $sa) (i32.const 12))))
+    (if (i64.ne (local.get $count) (i64.const 0)) (then
+      (if (i32.eqz (call $variant_span (local.get $data) (i32.mul (i32.wrap_i64 (local.get $count)) (local.get $cb)))) (then (return (i32.const 0x80070057))))))
+    (if (i32.eq (local.get $vt) (i32.const 12)) (then
+      (local.set $i (i32.const 0))
+      (block $values_done (loop $values
+        (br_if $values_done (i32.ge_u (local.get $i) (i32.wrap_i64 (local.get $count))))
+        (local.set $hr (call $variant_owned_check (i32.add (local.get $data) (i32.shl (local.get $i) (i32.const 4))) (i32.add (local.get $depth) (i32.const 1)) (local.get $clearing)))
+        (if (local.get $hr) (then (return (local.get $hr))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $values)))))
+    (i32.const 0))
+
   ;; Shared by SafeArrayDestroy and VariantClear. A locked array is not freed.
   (func $safearray_destroy (param $sa i32) (result i32)
-    (local $data i32)
+    (local $data i32) (local $count i32) (local $i i32) (local $bstr i32) (local $hr i32)
     (if (i32.eqz (local.get $sa)) (then (return (i32.const 0))))
+    (local.set $hr (call $safearray_validate (local.get $sa) (i32.const 0) (i32.const 1)))
+    (if (local.get $hr) (then (return (local.get $hr))))
     (if (call $gl32 (i32.add (local.get $sa) (i32.const 8)))
       (then (return (i32.const 0x8002000D)))) ;; DISP_E_ARRAYISLOCKED
     (local.set $data (call $gl32 (i32.add (local.get $sa) (i32.const 12))))
+    (if (i32.and (i32.ne (local.get $data) (i32.const 0))
+          (i32.ne (i32.and (call $gl16 (i32.add (local.get $sa) (i32.const 2))) (i32.const 0x900)) (i32.const 0)))
+      (then
+        (local.set $count (i32.const 1))
+        (block $dimensions_done (loop $dimensions
+          (br_if $dimensions_done (i32.ge_u (local.get $i) (call $gl16 (local.get $sa))))
+          (local.set $count (i32.mul (local.get $count)
+            (call $gl32 (i32.add (local.get $sa) (i32.add (i32.const 16) (i32.shl (local.get $i) (i32.const 3)))))))
+          (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $dimensions)))
+        (local.set $i (i32.const 0))
+        (block $strings_done (loop $strings
+          (br_if $strings_done (i32.ge_u (local.get $i) (local.get $count)))
+          (if (i32.eq (call $gl32 (i32.sub (local.get $sa) (i32.const 4))) (i32.const 12))
+            (then (local.set $hr (call $variant_clear_value (i32.add (local.get $data) (i32.shl (local.get $i) (i32.const 4))) (i32.const 1))))
+            (else
+              (local.set $bstr (call $gl32 (i32.add (local.get $data) (i32.shl (local.get $i) (i32.const 2)))))
+              (if (local.get $bstr) (then (call $heap_free (i32.sub (local.get $bstr) (i32.const 4)))))))
+          (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $strings)))))
     (if (local.get $data) (then (call $heap_free (local.get $data))))
     (call $heap_free (i32.sub (local.get $sa) (i32.const 4)))
     (i32.const 0))
 
   (func $handle_SafeArrayDestroy (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (if (call $safearray_bridge_needed (local.get $arg0) (i32.const 24))
+      (then (call $com_interface_bridge (i32.const 24) (i32.const 1)) (return)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
     (i32.store offset=0 (global.get $reg_base) (call $safearray_destroy (local.get $arg0))))
+
+  (func $safearray_destroy_native (export "safearray_destroy_native") (param $sa i32) (result i32)
+    (call $safearray_destroy (local.get $sa)))
+
+  (func $safearray_bridge_needed (param $sa i32) (param $op i32) (result i32)
+    (if (call $host_com_interface_operation (i32.add (local.get $op) (i32.const 256)) (i32.load offset=16 (global.get $reg_base)) (global.get $current_thread_id))
+      (then (return (i32.const 1))))
+    (if (i32.eqz (local.get $sa)) (then (return (i32.const 0))))
+    (i32.ne (i32.and (call $gl16 (i32.add (local.get $sa) (i32.const 2))) (i32.const 0x800)) (i32.const 0)))
+
+  (func $handle_SafeArrayGetElement (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (if (call $safearray_bridge_needed (local.get $arg0) (i32.const 26))
+      (then (call $com_interface_bridge (i32.const 26) (i32.const 3)) (return)))
+    (call $safearray_get_native (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $arg3) (local.get $arg4) (local.get $name_ptr))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))))
+
+  (func $handle_SafeArrayPutElement (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (if (call $safearray_bridge_needed (local.get $arg0) (i32.const 27))
+      (then (call $com_interface_bridge (i32.const 27) (i32.const 3)) (return)))
+    (call $safearray_put_native (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $arg3) (local.get $arg4) (local.get $name_ptr))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))))
+
+  (func $handle_SafeArrayCopy (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (if (call $safearray_bridge_needed (local.get $arg0) (i32.const 25))
+      (then (call $com_interface_bridge (i32.const 25) (i32.const 2)) (return)))
+    (call $safearray_copy_native (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $arg3) (local.get $arg4) (local.get $name_ptr))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12))))
+
+  ;; Public Automation retrieval: index vector starts with the rightmost
+  ;; dimension, which is the last stored bound and the fastest varying index.
+  ;; Strings are returned as independent counted owners, never borrowed data.
+  (func $safearray_get_native (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $dims i32) (local $i i32) (local $bound i32) (local $n i32) (local $vt i32) (local $cb i32)
+    (local $data i32) (local $source i32) (local $copy i32) (local $locks i32) (local $hr i32)
+    (local $delta i64) (local $offset i64) (local $stride i64)
+    (i32.store offset=0 (global.get $reg_base) (i32.const 0x80070057))
+    (if (i32.or (i32.eqz (local.get $arg0)) (i32.or (i32.eqz (local.get $arg1)) (i32.eqz (local.get $arg2)))) (then (return)))
+    (local.set $dims (call $gl16 (local.get $arg0)))
+    (if (i32.or (i32.eqz (local.get $dims)) (i32.gt_u (local.get $dims) (i32.const 64))) (then (return)))
+    (if (i32.eqz (i32.and (call $gl16 (i32.add (local.get $arg0) (i32.const 2))) (i32.const 0x80))) (then (return)))
+    (local.set $vt (call $gl32 (i32.sub (local.get $arg0) (i32.const 4))))
+    (local.set $cb (call $safearray_elem_size (local.get $vt)))
+    (if (i32.eqz (local.get $cb))
+      (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x80004001)) (return)))
+    (if (i32.ne (local.get $cb) (call $gl32 (i32.add (local.get $arg0) (i32.const 4)))) (then (return)))
+    (local.set $stride (i64.const 1))
+    (block $indexed (loop $indices
+      (br_if $indexed (i32.ge_u (local.get $i) (local.get $dims)))
+      (local.set $bound (i32.add (local.get $arg0) (i32.add (i32.const 16)
+        (i32.shl (i32.sub (i32.sub (local.get $dims) (i32.const 1)) (local.get $i)) (i32.const 3)))))
+      (local.set $n (call $gl32 (local.get $bound)))
+      (local.set $delta (i64.sub
+        (i64.extend_i32_s (call $gl32 (i32.add (local.get $arg1) (i32.shl (local.get $i) (i32.const 2)))))
+        (i64.extend_i32_s (call $gl32 (i32.add (local.get $bound) (i32.const 4))))))
+      (if (i64.ge_u (local.get $delta) (i64.extend_i32_u (local.get $n)))
+        (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x8002000B)) (return)))
+      (local.set $offset (i64.add (local.get $offset) (i64.mul (local.get $delta) (local.get $stride))))
+      (local.set $stride (i64.mul (local.get $stride) (i64.extend_i32_u (local.get $n))))
+      (if (i64.gt_u (local.get $stride) (i64.const 0x10000000)) (then (return)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $indices)))
+    (local.set $data (call $gl32 (i32.add (local.get $arg0) (i32.const 12))))
+    (if (i32.eqz (local.get $data)) (then (return)))
+    (local.set $source (i32.add (local.get $data) (i32.mul (i32.wrap_i64 (local.get $offset)) (local.get $cb))))
+    (if (i32.eq (local.get $vt) (i32.const 12)) (then
+      (local.set $hr (call $variant_copy_value (local.get $arg2) (local.get $source) (i32.const 0) (i32.const 1)))
+      (i32.store offset=0 (global.get $reg_base) (local.get $hr)) (return)))
+    (local.set $locks (call $gl32 (i32.add (local.get $arg0) (i32.const 8))))
+    (if (i32.eq (local.get $locks) (i32.const -1))
+      (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x8000FFFF)) (return)))
+    (call $gs32 (i32.add (local.get $arg0) (i32.const 8)) (i32.add (local.get $locks) (i32.const 1)))
+    (if (i32.eq (local.get $vt) (i32.const 8))
+      (then
+        (local.set $data (call $gl32 (local.get $source)))
+        (local.set $copy (call $tl_clone_bstr (local.get $data)))
+        (if (i32.and (i32.ne (local.get $data) (i32.const 0)) (i32.eqz (local.get $copy)))
+          (then
+            (call $gs32 (i32.add (local.get $arg0) (i32.const 8)) (local.get $locks))
+            (i32.store offset=0 (global.get $reg_base) (i32.const 0x8007000E)) (return)))
+        (call $gs32 (local.get $arg2) (local.get $copy)))
+      (else (memory.copy (call $g2w (local.get $arg2)) (call $g2w (local.get $source)) (local.get $cb))))
+    (call $gs32 (i32.add (local.get $arg0) (i32.const 8)) (local.get $locks))
+    (i32.store offset=0 (global.get $reg_base) (i32.const 0)))
+
+  ;; PutElement takes a BSTR value directly (no extra indirection). Stage its
+  ;; independent copy before replacing an aliased array element owner.
+  (func $safearray_put_native (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $dims i32) (local $i i32) (local $bound i32) (local $n i32) (local $vt i32) (local $cb i32)
+    (local $data i32) (local $source i32) (local $copy i32) (local $locks i32) (local $old i32) (local $hr i32)
+    (local $delta i64) (local $offset i64) (local $stride i64)
+    (i32.store offset=0 (global.get $reg_base) (i32.const 0x80070057))
+    (if (i32.or (i32.eqz (local.get $arg0)) (i32.eqz (local.get $arg1))) (then (return)))
+    (local.set $dims (call $gl16 (local.get $arg0)))
+    (if (i32.or (i32.eqz (local.get $dims)) (i32.gt_u (local.get $dims) (i32.const 64))) (then (return)))
+    (if (i32.eqz (i32.and (call $gl16 (i32.add (local.get $arg0) (i32.const 2))) (i32.const 0x80))) (then (return)))
+    (local.set $vt (call $gl32 (i32.sub (local.get $arg0) (i32.const 4))))
+    (local.set $cb (call $safearray_elem_size (local.get $vt)))
+    (if (i32.eqz (local.get $cb))
+      (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x80004001)) (return)))
+    (if (i32.ne (local.get $cb) (call $gl32 (i32.add (local.get $arg0) (i32.const 4)))) (then (return)))
+    (if (i32.and (i32.ne (local.get $vt) (i32.const 8)) (i32.eqz (local.get $arg2))) (then (return)))
+    (local.set $stride (i64.const 1))
+    (block $indexed (loop $indices
+      (br_if $indexed (i32.ge_u (local.get $i) (local.get $dims)))
+      (local.set $bound (i32.add (local.get $arg0) (i32.add (i32.const 16)
+        (i32.shl (i32.sub (i32.sub (local.get $dims) (i32.const 1)) (local.get $i)) (i32.const 3)))))
+      (local.set $n (call $gl32 (local.get $bound)))
+      (local.set $delta (i64.sub
+        (i64.extend_i32_s (call $gl32 (i32.add (local.get $arg1) (i32.shl (local.get $i) (i32.const 2)))))
+        (i64.extend_i32_s (call $gl32 (i32.add (local.get $bound) (i32.const 4))))))
+      (if (i64.ge_u (local.get $delta) (i64.extend_i32_u (local.get $n)))
+        (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x8002000B)) (return)))
+      (local.set $offset (i64.add (local.get $offset) (i64.mul (local.get $delta) (local.get $stride))))
+      (local.set $stride (i64.mul (local.get $stride) (i64.extend_i32_u (local.get $n))))
+      (if (i64.gt_u (local.get $stride) (i64.const 0x10000000)) (then (return)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $indices)))
+    (local.set $data (call $gl32 (i32.add (local.get $arg0) (i32.const 12))))
+    (if (i32.eqz (local.get $data)) (then (return)))
+    (local.set $source (i32.add (local.get $data) (i32.mul (i32.wrap_i64 (local.get $offset)) (local.get $cb))))
+    (if (i32.eq (local.get $vt) (i32.const 12)) (then
+      (local.set $hr (call $variant_copy_value (local.get $source) (local.get $arg2) (i32.const 0) (i32.const 1)))
+      (i32.store offset=0 (global.get $reg_base) (local.get $hr)) (return)))
+    (local.set $locks (call $gl32 (i32.add (local.get $arg0) (i32.const 8))))
+    (if (i32.eq (local.get $locks) (i32.const -1))
+      (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x8000FFFF)) (return)))
+    (call $gs32 (i32.add (local.get $arg0) (i32.const 8)) (i32.add (local.get $locks) (i32.const 1)))
+    (if (i32.eq (local.get $vt) (i32.const 8))
+      (then
+        (local.set $data (local.get $arg2))
+        (local.set $copy (call $tl_clone_bstr (local.get $data)))
+        (if (i32.and (i32.ne (local.get $data) (i32.const 0)) (i32.eqz (local.get $copy)))
+          (then
+            (call $gs32 (i32.add (local.get $arg0) (i32.const 8)) (local.get $locks))
+            (i32.store offset=0 (global.get $reg_base) (i32.const 0x8007000E)) (return)))
+        (local.set $old (call $gl32 (local.get $source)))
+        (call $gs32 (local.get $source) (local.get $copy))
+        (if (local.get $old) (then (call $heap_free (i32.sub (local.get $old) (i32.const 4))))))
+      (else (memory.copy (call $g2w (local.get $source)) (call $g2w (local.get $arg2)) (local.get $cb))))
+    (call $gs32 (i32.add (local.get $arg0) (i32.const 8)) (local.get $locks))
+    (i32.store offset=0 (global.get $reg_base) (i32.const 0)))
+
+  ;; Copy owns its descriptor, data and every counted string independently.
+  ;; No callbacks or borrowed element owners escape this synchronous API.
+  (func $safearray_copy_native (export "safearray_copy_native") (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $dims i32) (local $vt i32) (local $cb i32) (local $i i32) (local $count i64)
+    (local $size i32) (local $block i32) (local $sa i32) (local $data i32) (local $source i32)
+    (local $string i32) (local $copy i32) (local $locks i32) (local $ignored i32) (local $hr i32)
+    (i32.store offset=0 (global.get $reg_base) (i32.const 0x80070057))
+    (if (i32.eqz (local.get $arg1)) (then (return)))
+    (call $gs32 (local.get $arg1) (i32.const 0))
+    (if (i32.eqz (local.get $arg0))
+      (then (i32.store offset=0 (global.get $reg_base) (i32.const 0)) (return)))
+    (local.set $hr (call $safearray_validate (local.get $arg0) (i32.const 0) (i32.const 0)))
+    (if (local.get $hr) (then (i32.store offset=0 (global.get $reg_base) (local.get $hr)) (return)))
+    (local.set $dims (call $gl16 (local.get $arg0)))
+    (if (i32.or (i32.eqz (local.get $dims)) (i32.gt_u (local.get $dims) (i32.const 64))) (then (return)))
+    (if (i32.eqz (i32.and (call $gl16 (i32.add (local.get $arg0) (i32.const 2))) (i32.const 0x80))) (then (return)))
+    (local.set $vt (call $gl32 (i32.sub (local.get $arg0) (i32.const 4))))
+    (local.set $cb (call $safearray_elem_size (local.get $vt)))
+    (if (i32.eqz (local.get $cb))
+      (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x80004001)) (return)))
+    (if (i32.ne (local.get $cb) (call $gl32 (i32.add (local.get $arg0) (i32.const 4)))) (then (return)))
+    (local.set $count (i64.const 1))
+    (block $dimensions_done (loop $dimensions
+      (br_if $dimensions_done (i32.ge_u (local.get $i) (local.get $dims)))
+      (local.set $count (i64.mul (local.get $count) (i64.extend_i32_u
+        (call $gl32 (i32.add (local.get $arg0) (i32.add (i32.const 16) (i32.shl (local.get $i) (i32.const 3))))))))
+      (if (i64.gt_u (local.get $count) (i64.const 0x10000000)) (then (return)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $dimensions)))
+    (local.set $size (i32.wrap_i64 (i64.mul (local.get $count) (i64.extend_i32_u (local.get $cb)))))
+    (local.set $source (call $gl32 (i32.add (local.get $arg0) (i32.const 12))))
+    (if (i32.and (i32.ne (local.get $size) (i32.const 0)) (i32.eqz (local.get $source))) (then (return)))
+    (local.set $locks (call $gl32 (i32.add (local.get $arg0) (i32.const 8))))
+    (if (i32.eq (local.get $locks) (i32.const -1))
+      (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x8000FFFF)) (return)))
+    (i32.store offset=0 (global.get $reg_base) (i32.const 0x8007000E))
+    (local.set $block (call $heap_alloc (i32.add (i32.const 20) (i32.shl (local.get $dims) (i32.const 3)))))
+    (if (i32.eqz (local.get $block)) (then (return)))
+    (local.set $sa (i32.add (local.get $block) (i32.const 4)))
+    (memory.copy (call $g2w (local.get $block)) (call $g2w (i32.sub (local.get $arg0) (i32.const 4)))
+      (i32.add (i32.const 20) (i32.shl (local.get $dims) (i32.const 3))))
+    (call $gs16 (i32.add (local.get $sa) (i32.const 2))
+      (call $gl16 (i32.add (local.get $arg0) (i32.const 2))))
+    (call $gs32 (i32.add (local.get $sa) (i32.const 8)) (i32.const 0))
+    (call $gs32 (i32.add (local.get $sa) (i32.const 12)) (i32.const 0))
+    (if (local.get $size)
+      (then
+        (local.set $data (call $heap_alloc (local.get $size)))
+        (if (i32.eqz (local.get $data)) (then (call $heap_free (local.get $block)) (return)))
+        (call $gs32 (i32.add (local.get $sa) (i32.const 12)) (local.get $data))
+        (if (i32.eq (local.get $vt) (i32.const 12)) (then
+          (call $zero_memory (call $g2w (local.get $data)) (local.get $size))
+          (local.set $i (i32.const 0))
+          (block $variants_done (loop $variants
+            (br_if $variants_done (i32.ge_u (local.get $i) (i32.wrap_i64 (local.get $count))))
+            (local.set $hr (call $variant_copy_value
+              (i32.add (local.get $data) (i32.shl (local.get $i) (i32.const 4)))
+              (i32.add (local.get $source) (i32.shl (local.get $i) (i32.const 4))) (i32.const 0) (i32.const 1)))
+            (if (local.get $hr) (then
+              (local.set $ignored (call $safearray_destroy (local.get $sa)))
+              (i32.store offset=0 (global.get $reg_base) (local.get $hr)) (return)))
+            (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $variants)))
+          (call $gs32 (local.get $arg1) (local.get $sa))
+          (i32.store offset=0 (global.get $reg_base) (i32.const 0)) (return)))
+        (call $gs32 (i32.add (local.get $arg0) (i32.const 8)) (i32.add (local.get $locks) (i32.const 1)))
+        (if (i32.eq (local.get $vt) (i32.const 8))
+          (then
+            (call $zero_memory (call $g2w (local.get $data)) (local.get $size))
+            (local.set $i (i32.const 0))
+            (block $strings_done (loop $strings
+              (br_if $strings_done (i32.ge_u (local.get $i) (i32.wrap_i64 (local.get $count))))
+              (local.set $string (call $gl32 (i32.add (local.get $source) (i32.shl (local.get $i) (i32.const 2)))))
+              (local.set $copy (call $tl_clone_bstr (local.get $string)))
+              (if (i32.and (i32.ne (local.get $string) (i32.const 0)) (i32.eqz (local.get $copy)))
+                (then
+                  (call $gs32 (i32.add (local.get $arg0) (i32.const 8)) (local.get $locks))
+                  (local.set $ignored (call $safearray_destroy (local.get $sa))) (return)))
+              (call $gs32 (i32.add (local.get $data) (i32.shl (local.get $i) (i32.const 2))) (local.get $copy))
+              (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $strings))))
+          (else (memory.copy (call $g2w (local.get $data)) (call $g2w (local.get $source)) (local.get $size))))
+        (call $gs32 (i32.add (local.get $arg0) (i32.const 8)) (local.get $locks))))
+    (call $gs32 (local.get $arg1) (local.get $sa))
+    (i32.store offset=0 (global.get $reg_base) (i32.const 0)))
+
+  ;; Return a borrowed element address under the caller's existing lock.
+  ;; This API performs no element copy, refcount change or implicit lock.
+  (func $handle_SafeArrayPtrOfIndex (export "safearray_index_native") (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $dims i32) (local $i i32) (local $bound i32) (local $n i32) (local $cb i32)
+    (local $data i32) (local $source i32) (local $delta i64) (local $offset i64) (local $stride i64)
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))
+    (i32.store offset=0 (global.get $reg_base) (i32.const 0x80070057))
+    (if (i32.or (i32.eqz (local.get $arg0)) (i32.or (i32.eqz (local.get $arg1)) (i32.eqz (local.get $arg2)))) (then (return)))
+    (local.set $dims (call $gl16 (local.get $arg0)))
+    (if (i32.or (i32.eqz (local.get $dims)) (i32.gt_u (local.get $dims) (i32.const 64))) (then (return)))
+    (local.set $cb (call $gl32 (i32.add (local.get $arg0) (i32.const 4))))
+    (if (i32.eqz (local.get $cb)) (then (return)))
+    (local.set $stride (i64.const 1))
+    (block $indexed (loop $indices
+      (br_if $indexed (i32.ge_u (local.get $i) (local.get $dims)))
+      (local.set $bound (i32.add (local.get $arg0) (i32.add (i32.const 16)
+        (i32.shl (i32.sub (i32.sub (local.get $dims) (i32.const 1)) (local.get $i)) (i32.const 3)))))
+      (local.set $n (call $gl32 (local.get $bound)))
+      (local.set $delta (i64.sub
+        (i64.extend_i32_s (call $gl32 (i32.add (local.get $arg1) (i32.shl (local.get $i) (i32.const 2)))))
+        (i64.extend_i32_s (call $gl32 (i32.add (local.get $bound) (i32.const 4))))))
+      (if (i64.ge_u (local.get $delta) (i64.extend_i32_u (local.get $n)))
+        (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x8002000B)) (return)))
+      (local.set $offset (i64.add (local.get $offset) (i64.mul (local.get $delta) (local.get $stride))))
+      (local.set $stride (i64.mul (local.get $stride) (i64.extend_i32_u (local.get $n))))
+      (if (i64.gt_u (local.get $stride) (i64.const 0x10000000)) (then (return)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $indices)))
+    (local.set $data (call $gl32 (i32.add (local.get $arg0) (i32.const 12))))
+    (if (i32.eqz (local.get $data)) (then (return)))
+    (local.set $offset (i64.mul (local.get $offset) (i64.extend_i32_u (local.get $cb))))
+    (if (i64.gt_u (i64.add (i64.extend_i32_u (local.get $data)) (local.get $offset)) (i64.const 0xFFFFFFFF)) (then (return)))
+    (local.set $source (i32.add (local.get $data) (i32.wrap_i64 (local.get $offset))))
+    (call $gs32 (local.get $arg2) (local.get $source))
+    (i32.store offset=0 (global.get $reg_base) (i32.const 0)))
 
   ;; SafeArrayAccessData(psa, ppvData) takes a lock and hands out pvData.
   (func $handle_SafeArrayAccessData (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
     (if (i32.or (i32.eqz (local.get $arg0)) (i32.eqz (local.get $arg1)))
       (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x80070057)) (return))) ;; E_INVALIDARG
+    (if (i32.eq (call $gl32 (i32.add (local.get $arg0) (i32.const 8))) (i32.const -1))
+      (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x8000ffff)) (return)))
     (call $gs32 (i32.add (local.get $arg0) (i32.const 8))
       (i32.add (call $gl32 (i32.add (local.get $arg0) (i32.const 8))) (i32.const 1)))
     (call $gs32 (local.get $arg1) (call $gl32 (i32.add (local.get $arg0) (i32.const 12))))
@@ -3955,10 +4497,18 @@
     (call $gs32 (local.get $arg3) (i32.wrap_i64 (local.get $v)))
     (i32.store offset=0 (global.get $reg_base) (i32.const 0)))
 
-  ;; Real OLEAUT32 provides these automation helpers. Without that DLL, keep
-  ;; unsupported behavior explicit rather than forging registration/results.
+  ;; Native registry loading and registration use the ordinary registry owner.
   (func $handle_LoadRegTypeLib (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (call $crash_unimplemented (local.get $name_ptr))
+    (local $hr i32)
+    ;; Versions are WORD parameters in four-byte x86 stack slots. Native
+    ;; callers may leave the upper halves untouched (Sims does).
+    (local.set $hr (call $tl_load_reg (local.get $arg0)
+      (i32.and (local.get $arg1) (i32.const 65535))
+      (i32.and (local.get $arg2) (i32.const 65535))
+      (local.get $arg3) (local.get $arg4)))
+    (i32.store offset=0 (global.get $reg_base) (local.get $hr))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24)))
+    (if (i32.eq (local.get $hr) (i32.const -2)) (then (call $io_block (i32.const 24))))
   )
 
   (func $handle_QueryPathOfRegTypeLib (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
@@ -3966,11 +4516,13 @@
   )
 
   (func $handle_RegisterTypeLib (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (call $crash_unimplemented (local.get $name_ptr))
+    (i32.store offset=0 (global.get $reg_base) (call $tl_register (local.get $arg0) (local.get $arg1)))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))
   )
 
   (func $handle_DispGetIDsOfNames (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (call $crash_unimplemented (local.get $name_ptr))
+    (i32.store offset=0 (global.get $reg_base) (call $tl_method (i32.const 1) (i32.const 10) (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $arg3) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 20)))
   )
 
   ;; 770: CoTaskMemAlloc(cb) — 1 arg stdcall, allocate from heap
@@ -4347,10 +4899,9 @@
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))
   )
 
-  ;; 784: ThunkConnect32 — Win9x 16/32-bit thunking, no-op in pure 32-bit
+  ;; LS32 native pairing owns a parked six-argument connection request.
   (func $handle_ThunkConnect32 (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (i32.store offset=0 (global.get $reg_base) (i32.const 1))
-    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28)))
+    (call $handle_ne_guest_request (i32.const 5) (local.get $arg0) (i32.load offset=16 (global.get $reg_base)))
   )
 
   ;; IsTextUnicode(lpv, iSize, lpiResult) — SetupAPI sniffs every INF with it.
@@ -4395,6 +4946,11 @@
     (i32.store offset=0 (global.get $reg_base) (call $vk_key_scan (i32.and (local.get $arg0) (i32.const 0xFFFF))))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8))))  ;; stdcall, 1 arg
 
+  ;; VkKeyScanExW(WCHAR ch, HKL dwhkl) uses the supported US layout.
+  (func $handle_VkKeyScanExW (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (i32.store offset=0 (global.get $reg_base) (call $vk_key_scan (i32.and (local.get $arg0) (i32.const 0xFFFF))))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12))))  ;; stdcall, 2 args
+
   ;; VK->scancode lookup table for letters A..Z (vk 0x41..0x5A → table[vk-0x41]).
   ;; Real PS/2 set-1 scancodes; the previous (uCode-0x20) approximation produced
   ;; bogus values (e.g. Z=0x3A) that GetKeyNameTextA couldn't decode, so the
@@ -4423,14 +4979,46 @@
     "\4d\bc\be\bf\10\6a\12\20\14\70"   ;; 0x32..0x3b
     "\71\72\73\74\75\76\77\78\79\90"   ;; 0x3c..0x45
     "\91\67\26\69\6d\25\65\27\6b\61"   ;; 0x46..0x4f (4B/4D/48 favor arrow VKs)
-    "\28\63\60\6e\00\00\00\7a\7b")     ;; 0x50..0x58 (50 favors VK_DOWN over NP2)
+    "\28\63\60\6e\00\00\e2\7a\7b")     ;; 0x50..0x58 (50 favors VK_DOWN over NP2)
 
   ;; Shared MAPVK_VK_TO_VSC mapping for MapVirtualKey and OemKeyScan.
   (func $vk_to_scan (param $uCode i32) (result i32)
     (local $result i32)
+    ;; Sided modifiers use the scan byte; type 4 adds E0 separately.
+    (if (i32.eq (local.get $uCode) (i32.const 0xA0)) (then (return (i32.const 0x2A)))) ;; LShift
+    (if (i32.eq (local.get $uCode) (i32.const 0xA1)) (then (return (i32.const 0x36)))) ;; RShift
+    (if (i32.eq (local.get $uCode) (i32.const 0xA2)) (then (return (i32.const 0x1D)))) ;; LCtrl
+    (if (i32.eq (local.get $uCode) (i32.const 0xA3)) (then (return (i32.const 0x1D)))) ;; RCtrl
+    (if (i32.eq (local.get $uCode) (i32.const 0xA4)) (then (return (i32.const 0x38)))) ;; LAlt
+    (if (i32.eq (local.get $uCode) (i32.const 0xA5)) (then (return (i32.const 0x38)))) ;; RAlt
+    (if (i32.eq (local.get $uCode) (i32.const 0x21)) (then (return (i32.const 0x49)))) ;; PageUp
+    (if (i32.eq (local.get $uCode) (i32.const 0x22)) (then (return (i32.const 0x51)))) ;; PageDown
+    (if (i32.eq (local.get $uCode) (i32.const 0x23)) (then (return (i32.const 0x4F)))) ;; End
+    (if (i32.eq (local.get $uCode) (i32.const 0x24)) (then (return (i32.const 0x47)))) ;; Home
+    (if (i32.eq (local.get $uCode) (i32.const 0x2D)) (then (return (i32.const 0x52)))) ;; Insert
+    (if (i32.eq (local.get $uCode) (i32.const 0x2E)) (then (return (i32.const 0x53)))) ;; Delete
+    (if (i32.eq (local.get $uCode) (i32.const 0x90)) (then (return (i32.const 0x45)))) ;; NumLock
+    (if (i32.eq (local.get $uCode) (i32.const 0x91)) (then (return (i32.const 0x46)))) ;; ScrollLock
+    (if (i32.eq (local.get $uCode) (i32.const 0x14)) (then (return (i32.const 0x3A)))) ;; CapsLock
     (if (i32.eq (local.get $uCode) (i32.const 0x08)) (then (return (i32.const 0x0E)))) ;; Backspace
     (if (i32.eq (local.get $uCode) (i32.const 0x03)) (then (return (i32.const 0x46)))) ;; Cancel
     (block $vk0_done
+      ;; Nonextended US keypad keys: literal Scan 1 Make.
+      (if (i32.eq (local.get $uCode) (i32.const 0x60)) (then (local.set $result (i32.const 0x52)) (br $vk0_done))) ;; VK_NUMPAD0
+      (if (i32.eq (local.get $uCode) (i32.const 0x61)) (then (local.set $result (i32.const 0x4F)) (br $vk0_done))) ;; VK_NUMPAD1
+      (if (i32.eq (local.get $uCode) (i32.const 0x62)) (then (local.set $result (i32.const 0x50)) (br $vk0_done))) ;; VK_NUMPAD2
+      (if (i32.eq (local.get $uCode) (i32.const 0x63)) (then (local.set $result (i32.const 0x51)) (br $vk0_done))) ;; VK_NUMPAD3
+      (if (i32.eq (local.get $uCode) (i32.const 0x64)) (then (local.set $result (i32.const 0x4B)) (br $vk0_done))) ;; VK_NUMPAD4
+      (if (i32.eq (local.get $uCode) (i32.const 0x65)) (then (local.set $result (i32.const 0x4C)) (br $vk0_done))) ;; VK_NUMPAD5
+      (if (i32.eq (local.get $uCode) (i32.const 0x66)) (then (local.set $result (i32.const 0x4D)) (br $vk0_done))) ;; VK_NUMPAD6
+      (if (i32.eq (local.get $uCode) (i32.const 0x67)) (then (local.set $result (i32.const 0x47)) (br $vk0_done))) ;; VK_NUMPAD7
+      (if (i32.eq (local.get $uCode) (i32.const 0x68)) (then (local.set $result (i32.const 0x48)) (br $vk0_done))) ;; VK_NUMPAD8
+      (if (i32.eq (local.get $uCode) (i32.const 0x69)) (then (local.set $result (i32.const 0x49)) (br $vk0_done))) ;; VK_NUMPAD9
+      (if (i32.eq (local.get $uCode) (i32.const 0x6A)) (then (local.set $result (i32.const 0x37)) (br $vk0_done))) ;; VK_MULTIPLY
+      (if (i32.eq (local.get $uCode) (i32.const 0x6B)) (then (local.set $result (i32.const 0x4E)) (br $vk0_done))) ;; VK_ADD
+      (if (i32.eq (local.get $uCode) (i32.const 0x6D)) (then (local.set $result (i32.const 0x4A)) (br $vk0_done))) ;; VK_SUBTRACT
+      (if (i32.eq (local.get $uCode) (i32.const 0x6E)) (then (local.set $result (i32.const 0x53)) (br $vk0_done))) ;; VK_DECIMAL
+      ;; End nonextended US keypad keys.
       ;; Letters A-Z: vkeys 0x41-0x5A -> real PS/2 set-1 scancodes via table
       (if (i32.and (i32.ge_u (local.get $uCode) (i32.const 0x41)) (i32.le_u (local.get $uCode) (i32.const 0x5A)))
         (then
@@ -4439,6 +5027,7 @@
         )
       )
       ;; OEM punctuation
+      (if (i32.eq (local.get $uCode) (i32.const 0xE2)) (then (local.set $result (i32.const 0x56)) (br $vk0_done))) ;; VK_OEM_102
       (if (i32.eq (local.get $uCode) (i32.const 0xBA)) (then (local.set $result (i32.const 0x27)) (br $vk0_done))) ;; ;:
       (if (i32.eq (local.get $uCode) (i32.const 0xBB)) (then (local.set $result (i32.const 0x0D)) (br $vk0_done))) ;; =+
       (if (i32.eq (local.get $uCode) (i32.const 0xBC)) (then (local.set $result (i32.const 0x33)) (br $vk0_done))) ;; ,<
@@ -4524,6 +5113,36 @@
         (then
           (local.set $result (call $vk_to_scan (local.get $uCode)))
           (br $done)))
+      ;; Type 4: US vkey -> scan code, preserving modifier sides and E0 navigation.
+      ;; Dedicated navigation keys return the documented Scan 1 Make prefix.
+      (if (i32.eq (local.get $uMapType) (i32.const 4))
+        (then
+          ;; Special US keys retain their documented E0 Scan 1 Make prefix.
+          (if (i32.eq (local.get $uCode) (i32.const 0x90)) (then (local.set $result (i32.const 0xE045)) (br $done))) ;; NumLock
+          (if (i32.eq (local.get $uCode) (i32.const 0x2C)) (then (local.set $result (i32.const 0xE037)) (br $done))) ;; Snapshot
+          (if (i32.eq (local.get $uCode) (i32.const 0x5B)) (then (local.set $result (i32.const 0xE05B)) (br $done))) ;; Left Windows
+          (if (i32.eq (local.get $uCode) (i32.const 0x5C)) (then (local.set $result (i32.const 0xE05C)) (br $done))) ;; Right Windows
+          (if (i32.eq (local.get $uCode) (i32.const 0x5D)) (then (local.set $result (i32.const 0xE05D)) (br $done))) ;; Applications
+          (if (i32.eq (local.get $uCode) (i32.const 0x6F)) (then (local.set $result (i32.const 0xE035)) (br $done))) ;; Keypad Divide
+          (if (i32.eq (local.get $uCode) (i32.const 0x24)) (then (local.set $result (i32.const 0xE047)) (br $done))) ;; Home
+          (if (i32.eq (local.get $uCode) (i32.const 0x26)) (then (local.set $result (i32.const 0xE048)) (br $done))) ;; Up
+          (if (i32.eq (local.get $uCode) (i32.const 0x21)) (then (local.set $result (i32.const 0xE049)) (br $done))) ;; PageUp
+          (if (i32.eq (local.get $uCode) (i32.const 0x25)) (then (local.set $result (i32.const 0xE04B)) (br $done))) ;; Left
+          (if (i32.eq (local.get $uCode) (i32.const 0x27)) (then (local.set $result (i32.const 0xE04D)) (br $done))) ;; Right
+          (if (i32.eq (local.get $uCode) (i32.const 0x23)) (then (local.set $result (i32.const 0xE04F)) (br $done))) ;; End
+          (if (i32.eq (local.get $uCode) (i32.const 0x28)) (then (local.set $result (i32.const 0xE050)) (br $done))) ;; Down
+          (if (i32.eq (local.get $uCode) (i32.const 0x22)) (then (local.set $result (i32.const 0xE051)) (br $done))) ;; PageDown
+          (if (i32.eq (local.get $uCode) (i32.const 0x2D)) (then (local.set $result (i32.const 0xE052)) (br $done))) ;; Insert
+          (if (i32.eq (local.get $uCode) (i32.const 0x2E)) (then (local.set $result (i32.const 0xE053)) (br $done))) ;; Delete
+          (if (i32.eq (local.get $uCode) (i32.const 0x03)) (then (br $done)))
+          (local.set $result (call $vk_to_scan (local.get $uCode)))
+          (if (i32.eq (local.get $uCode) (i32.const 0xA0)) (then (local.set $result (i32.const 0x002A)))) ;; VK_LSHIFT
+          (if (i32.eq (local.get $uCode) (i32.const 0xA1)) (then (local.set $result (i32.const 0x0036)))) ;; VK_RSHIFT
+          (if (i32.eq (local.get $uCode) (i32.const 0xA2)) (then (local.set $result (i32.const 0x001D)))) ;; VK_LCONTROL
+          (if (i32.eq (local.get $uCode) (i32.const 0xA3)) (then (local.set $result (i32.const 0xE01D)))) ;; VK_RCONTROL
+          (if (i32.eq (local.get $uCode) (i32.const 0xA4)) (then (local.set $result (i32.const 0x0038)))) ;; VK_LMENU
+          (if (i32.eq (local.get $uCode) (i32.const 0xA5)) (then (local.set $result (i32.const 0xE038)))) ;; VK_RMENU
+          (br $done)))
       ;; Type 1: scan code -> vkey (reverse table at VK_SCAN_TABLES+0x20, scan 0x00..0x58).
       ;; Pinball walks scan 0..0xFF at dialog init and pairs each with
       ;; GetKeyNameTextA to build the Player Controls combobox.
@@ -4541,6 +5160,12 @@
       ;; punctuation slot in the dialog would silently skip.
       (if (i32.eq (local.get $uMapType) (i32.const 2))
         (then
+          ;; US keyboard driver's unshifted control characters.
+          (if (i32.eq (local.get $uCode) (i32.const 0x03)) (then (local.set $result (i32.const 0x03)))) ;; VK_CANCEL
+          (if (i32.eq (local.get $uCode) (i32.const 0x08)) (then (local.set $result (i32.const 0x08)))) ;; VK_BACK
+          (if (i32.eq (local.get $uCode) (i32.const 0x09)) (then (local.set $result (i32.const 0x09)))) ;; VK_TAB
+          (if (i32.eq (local.get $uCode) (i32.const 0x0D)) (then (local.set $result (i32.const 0x0D)))) ;; VK_RETURN
+          (if (i32.eq (local.get $uCode) (i32.const 0x1B)) (then (local.set $result (i32.const 0x1B)))) ;; VK_ESCAPE
           ;; Letters: return uppercase ASCII (real Windows returns uppercase
           ;; for type 2; Pinball's compare uses the low byte either way).
           (if (i32.and (i32.ge_u (local.get $uCode) (i32.const 0x41)) (i32.le_u (local.get $uCode) (i32.const 0x5A)))
@@ -4551,7 +5176,16 @@
             (then (local.set $result (local.get $uCode)))
           )
           (if (i32.eq (local.get $uCode) (i32.const 0x20)) (then (local.set $result (i32.const 0x20))))
+          ;; US keyboard driver's unshifted keypad characters (MapVirtualKey type 2).
+          (if (i32.and (i32.ge_u (local.get $uCode) (i32.const 0x60)) (i32.le_u (local.get $uCode) (i32.const 0x69)))
+            (then (local.set $result (i32.sub (local.get $uCode) (i32.const 0x30))))) ;; VK_NUMPAD0..9
+          (if (i32.eq (local.get $uCode) (i32.const 0x6A)) (then (local.set $result (i32.const 0x2A)))) ;; VK_MULTIPLY
+          (if (i32.eq (local.get $uCode) (i32.const 0x6B)) (then (local.set $result (i32.const 0x2B)))) ;; VK_ADD
+          (if (i32.eq (local.get $uCode) (i32.const 0x6D)) (then (local.set $result (i32.const 0x2D)))) ;; VK_SUBTRACT
+          (if (i32.eq (local.get $uCode) (i32.const 0x6E)) (then (local.set $result (i32.const 0x2E)))) ;; VK_DECIMAL
+          (if (i32.eq (local.get $uCode) (i32.const 0x6F)) (then (local.set $result (i32.const 0x2F)))) ;; VK_DIVIDE
           ;; OEM punctuation (US layout, unshifted glyph)
+          (if (i32.eq (local.get $uCode) (i32.const 0xE2)) (then (local.set $result (i32.const 0x5C)))) ;; VK_OEM_102
           (if (i32.eq (local.get $uCode) (i32.const 0xBA)) (then (local.set $result (i32.const 0x3B)))) ;; ;
           (if (i32.eq (local.get $uCode) (i32.const 0xBB)) (then (local.set $result (i32.const 0x3D)))) ;; =
           (if (i32.eq (local.get $uCode) (i32.const 0xBC)) (then (local.set $result (i32.const 0x2C)))) ;; ,
@@ -4566,7 +5200,41 @@
           (br $done)
         )
       )
-      ;; Type 3: scan code -> vkey (with left/right) — return 0
+      ;; Type 3: reuse the ordinary scan-to-VK table, preserving modifier sides.
+      ;; Right Shift has its own scan code; right Ctrl/Alt use an E0 prefix
+      ;; in the high byte. Compare the full code so the prefix is not lost.
+      (if (i32.eq (local.get $uMapType) (i32.const 3))
+        (then
+          (if (i32.le_u (local.get $uCode) (i32.const 0x58))
+            (then (local.set $result (i32.load8_u (i32.add (region.addr $VK_SCAN_TABLES 0x20) (local.get $uCode))))))
+          (if (i32.eq (local.get $uCode) (i32.const 0x002A)) (then (local.set $result (i32.const 0xA0)))) ;; VK_LSHIFT
+          (if (i32.eq (local.get $uCode) (i32.const 0x0036)) (then (local.set $result (i32.const 0xA1)))) ;; VK_RSHIFT
+          (if (i32.eq (local.get $uCode) (i32.const 0x001D)) (then (local.set $result (i32.const 0xA2)))) ;; VK_LCONTROL
+          (if (i32.eq (local.get $uCode) (i32.const 0xE01D)) (then (local.set $result (i32.const 0xA3)))) ;; VK_RCONTROL
+          (if (i32.eq (local.get $uCode) (i32.const 0xE11D)) (then (local.set $result (i32.const 0x13)))) ;; VK_PAUSE
+          (if (i32.eq (local.get $uCode) (i32.const 0x0038)) (then (local.set $result (i32.const 0xA4)))) ;; VK_LMENU
+          (if (i32.eq (local.get $uCode) (i32.const 0xE038)) (then (local.set $result (i32.const 0xA5)))) ;; VK_RMENU
+          ;; Type 3 special keys require the complete documented E0 Scan 1 Make code.
+          (if (i32.eq (local.get $uCode) (i32.const 0xE046)) (then (local.set $result (i32.const 0x03)))) ;; VK_CANCEL (Break)
+          (if (i32.eq (local.get $uCode) (i32.const 0xE01C)) (then (local.set $result (i32.const 0x0D)))) ;; VK_RETURN (Numpad Enter)
+          (if (i32.eq (local.get $uCode) (i32.const 0xE037)) (then (local.set $result (i32.const 0x2C)))) ;; VK_SNAPSHOT
+          (if (i32.eq (local.get $uCode) (i32.const 0xE05B)) (then (local.set $result (i32.const 0x5B)))) ;; VK_LWIN
+          (if (i32.eq (local.get $uCode) (i32.const 0xE05C)) (then (local.set $result (i32.const 0x5C)))) ;; VK_RWIN
+          (if (i32.eq (local.get $uCode) (i32.const 0xE05D)) (then (local.set $result (i32.const 0x5D)))) ;; VK_APPS
+          (if (i32.eq (local.get $uCode) (i32.const 0xE035)) (then (local.set $result (i32.const 0x6F)))) ;; VK_DIVIDE
+          ;; Type 3 E0 navigation keys retain their dedicated VK identities.
+          ;; Keep full-code comparisons distinct from the ordinary keypad twins.
+          (if (i32.eq (local.get $uCode) (i32.const 0xE047)) (then (local.set $result (i32.const 0x24)))) ;; VK_HOME
+          (if (i32.eq (local.get $uCode) (i32.const 0xE048)) (then (local.set $result (i32.const 0x26)))) ;; VK_UP
+          (if (i32.eq (local.get $uCode) (i32.const 0xE049)) (then (local.set $result (i32.const 0x21)))) ;; VK_PRIOR
+          (if (i32.eq (local.get $uCode) (i32.const 0xE04B)) (then (local.set $result (i32.const 0x25)))) ;; VK_LEFT
+          (if (i32.eq (local.get $uCode) (i32.const 0xE04D)) (then (local.set $result (i32.const 0x27)))) ;; VK_RIGHT
+          (if (i32.eq (local.get $uCode) (i32.const 0xE04F)) (then (local.set $result (i32.const 0x23)))) ;; VK_END
+          (if (i32.eq (local.get $uCode) (i32.const 0xE050)) (then (local.set $result (i32.const 0x28)))) ;; VK_DOWN
+          (if (i32.eq (local.get $uCode) (i32.const 0xE051)) (then (local.set $result (i32.const 0x22)))) ;; VK_NEXT
+          (if (i32.eq (local.get $uCode) (i32.const 0xE052)) (then (local.set $result (i32.const 0x2D)))) ;; VK_INSERT
+          (if (i32.eq (local.get $uCode) (i32.const 0xE053)) (then (local.set $result (i32.const 0x2E)))) ;; VK_DELETE
+        ))
     )
     (i32.store offset=0 (global.get $reg_base) (local.get $result))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
@@ -4584,6 +5252,10 @@
   (func $handle_MapVirtualKeyExA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (call $handle_MapVirtualKeyA (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $arg3) (local.get $arg4) (local.get $name_ptr))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4))))
+
+  ;; MapVirtualKeyExW shares ExA's supported US mapping and three-argument ABI.
+  (func $handle_MapVirtualKeyExW (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (call $handle_MapVirtualKeyExA (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $arg3) (local.get $arg4) (local.get $name_ptr)))
 
   ;; 786: DisableThreadLibraryCalls(hModule) — suppress this loaded DLL's
   ;; DLL_THREAD_ATTACH/DETACH notifications. Static-TLS and invalid modules
@@ -4838,72 +5510,109 @@
     (i32.store offset=0 (global.get $reg_base) (local.get $length)))
 
   (func $handle_GetKeyNameTextA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    ;; arg0=lParam (scan code in bits 16-23), arg1=lpString, arg2=cchSize
-    (local $scan i32) (local $buf i32) (local $len i32) (local $ch i32)
+    ;; arg0=lParam (scan code in bits 16-23, extended flag in bit 24), arg1=lpString, arg2=cchSize
+    (local $end i32) (local $scan i32) (local $extended i32) (local $buf i32) (local $len i32) (local $ch i32)
+    ;; cchSize includes NUL; no caller bytes are available at nonpositive sizes.
+    (if (i32.le_s (local.get $arg2) (i32.const 0))
+      (then (i32.store offset=0 (global.get $reg_base) (i32.const 0))
+        (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))) (return)))
     (local.set $scan (i32.and (i32.shr_u (local.get $arg0) (i32.const 16)) (i32.const 0xFF)))
+    (local.set $extended (i32.and (local.get $arg0) (i32.const 0x01000000)))
     (local.set $buf (call $g2w (local.get $arg1)))
+    ;; Reserve one byte for NUL.
+    (local.set $end (i32.add (local.get $buf) (i32.sub (local.get $arg2) (i32.const 1))))
     (local.set $len (i32.const 0))
     (block $done
       ;; Esc (0x01)
       (if (i32.eq (local.get $scan) (i32.const 0x01)) (then
-        (i32.store (local.get $buf) (i32.const 0x00637345)) ;; "Esc\0"
+        (call $keyname_store_prefix (local.get $buf) (i32.const 0x00637345) (i32.const 4) (local.get $end)) ;; "Esc\0"
         (local.set $len (i32.const 3)) (br $done)))
       ;; Backspace (0x0E)
       (if (i32.eq (local.get $scan) (i32.const 0x0E)) (then
-        (i32.store (local.get $buf) (i32.const 0x6B636142)) ;; "Back"
-        (i32.store (i32.add (local.get $buf) (i32.const 4)) (i32.const 0x63617073)) ;; "spac"
-        (i32.store16 (i32.add (local.get $buf) (i32.const 8)) (i32.const 0x0065)) ;; "e\0"
+        (call $keyname_store_prefix (local.get $buf) (i32.const 0x6B636142) (i32.const 4) (local.get $end)) ;; "Back"
+        (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 4)) (i32.const 0x63617073) (i32.const 4) (local.get $end)) ;; "spac"
+        (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 8)) (i32.const 0x0065) (i32.const 2) (local.get $end)) ;; "e\0"
         (local.set $len (i32.const 9)) (br $done)))
       ;; Caps Lock (0x3A)
       (if (i32.eq (local.get $scan) (i32.const 0x3A)) (then
-        (i32.store (local.get $buf) (i32.const 0x73706143)) ;; "Caps"
-        (i32.store (i32.add (local.get $buf) (i32.const 4)) (i32.const 0x636F4C20)) ;; " Loc"
-        (i32.store16 (i32.add (local.get $buf) (i32.const 8)) (i32.const 0x006B)) ;; "k\0"
+        (call $keyname_store_prefix (local.get $buf) (i32.const 0x73706143) (i32.const 4) (local.get $end)) ;; "Caps"
+        (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 4)) (i32.const 0x636F4C20) (i32.const 4) (local.get $end)) ;; " Loc"
+        (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 8)) (i32.const 0x006B) (i32.const 2) (local.get $end)) ;; "k\0"
         (local.set $len (i32.const 9)) (br $done)))
       ;; Num Lock (0x45)
       (if (i32.eq (local.get $scan) (i32.const 0x45)) (then
-        (i32.store (local.get $buf) (i32.const 0x206D754E)) ;; "Num "
-        (i32.store (i32.add (local.get $buf) (i32.const 4)) (i32.const 0x6B636F4C)) ;; "Lock"
-        (i32.store8 (i32.add (local.get $buf) (i32.const 8)) (i32.const 0))
+        (call $keyname_store_prefix (local.get $buf) (i32.const 0x206D754E) (i32.const 4) (local.get $end)) ;; "Num "
+        (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 4)) (i32.const 0x6B636F4C) (i32.const 4) (local.get $end)) ;; "Lock"
+        (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 8)) (i32.const 0) (i32.const 1) (local.get $end))
         (local.set $len (i32.const 8)) (br $done)))
       ;; Scroll Lock (0x46)
       (if (i32.eq (local.get $scan) (i32.const 0x46)) (then
-        (i32.store (local.get $buf) (i32.const 0x6F726353)) ;; "Scro"
-        (i32.store (i32.add (local.get $buf) (i32.const 4)) (i32.const 0x4C206C6C)) ;; "ll L"
-        (i32.store (i32.add (local.get $buf) (i32.const 8)) (i32.const 0x006B636F)) ;; "ock\0"
+        (call $keyname_store_prefix (local.get $buf) (i32.const 0x6F726353) (i32.const 4) (local.get $end)) ;; "Scro"
+        (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 4)) (i32.const 0x4C206C6C) (i32.const 4) (local.get $end)) ;; "ll L"
+        (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 8)) (i32.const 0x006B636F) (i32.const 4) (local.get $end)) ;; "ock\0"
         (local.set $len (i32.const 11)) (br $done)))
+      ;; US extended navigation names; bit 24 separates the numpad scan twins.
+      (if (local.get $extended) (then
+        (if (i32.eq (local.get $scan) (i32.const 0x47)) (then
+          (call $keyname_store_prefix (local.get $buf) (i32.const 0x656D6F48) (i32.const 4) (local.get $end)) ;; "Home"
+          (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 4)) (i32.const 0) (i32.const 1) (local.get $end))
+          (local.set $len (i32.const 4)) (br $done)))
+        (if (i32.eq (local.get $scan) (i32.const 0x49)) (then
+          (call $keyname_store_prefix (local.get $buf) (i32.const 0x65676150) (i32.const 4) (local.get $end)) ;; "Page"
+          (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 4)) (i32.const 0x00705520) (i32.const 4) (local.get $end)) ;; " Up\0"
+          (local.set $len (i32.const 7)) (br $done)))
+        (if (i32.eq (local.get $scan) (i32.const 0x4F)) (then
+          (call $keyname_store_prefix (local.get $buf) (i32.const 0x00646E45) (i32.const 4) (local.get $end)) ;; "End\0"
+          (local.set $len (i32.const 3)) (br $done)))
+        (if (i32.eq (local.get $scan) (i32.const 0x51)) (then
+          (call $keyname_store_prefix (local.get $buf) (i32.const 0x65676150) (i32.const 4) (local.get $end)) ;; "Page"
+          (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 4)) (i32.const 0x776F4420) (i32.const 4) (local.get $end)) ;; " Dow"
+          (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 8)) (i32.const 0x006E) (i32.const 2) (local.get $end)) ;; "n\0"
+          (local.set $len (i32.const 9)) (br $done)))
+        (if (i32.eq (local.get $scan) (i32.const 0x52)) (then
+          (call $keyname_store_prefix (local.get $buf) (i32.const 0x65736E49) (i32.const 4) (local.get $end)) ;; "Inse"
+          (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 4)) (i32.const 0x7472) (i32.const 2) (local.get $end)) ;; "rt"
+          (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 6)) (i32.const 0) (i32.const 1) (local.get $end))
+          (local.set $len (i32.const 6)) (br $done)))
+        (if (i32.eq (local.get $scan) (i32.const 0x53)) (then
+          (call $keyname_store_prefix (local.get $buf) (i32.const 0x656C6544) (i32.const 4) (local.get $end)) ;; "Dele"
+          (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 4)) (i32.const 0x6574) (i32.const 2) (local.get $end)) ;; "te"
+          (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 6)) (i32.const 0) (i32.const 1) (local.get $end))
+          (local.set $len (i32.const 6)) (br $done)))
+      ))
       ;; Numpad scancodes 0x37 (*), 0x47..0x53. Render as "Num <glyph>".
       ;; 0x47-0x49=NP7-9, 0x4A=-, 0x4B-0x4D=NP4-6, 0x4E=+, 0x4F-0x51=NP1-3,
       ;; 0x52=NP0, 0x53=. — match Windows' "Num 7" / "Num *" naming.
       (local.set $ch (i32.const 0))
       (if (i32.eq (local.get $scan) (i32.const 0x37)) (then (local.set $ch (i32.const 0x2A)))) ;; *
       (if (i32.eq (local.get $scan) (i32.const 0x47)) (then (local.set $ch (i32.const 0x37)))) ;; 7
-      (if (i32.eq (local.get $scan) (i32.const 0x48)) (then (local.set $ch (i32.const 0x38)))) ;; 8
+      ;; Extended arrow scans fall through to the existing directional names below.
+      (if (i32.and (i32.eqz (local.get $extended)) (i32.eq (local.get $scan) (i32.const 0x48))) (then (local.set $ch (i32.const 0x38)))) ;; 8
       (if (i32.eq (local.get $scan) (i32.const 0x49)) (then (local.set $ch (i32.const 0x39)))) ;; 9
       (if (i32.eq (local.get $scan) (i32.const 0x4A)) (then (local.set $ch (i32.const 0x2D)))) ;; -
-      (if (i32.eq (local.get $scan) (i32.const 0x4B)) (then (local.set $ch (i32.const 0x34)))) ;; 4
+      (if (i32.and (i32.eqz (local.get $extended)) (i32.eq (local.get $scan) (i32.const 0x4B))) (then (local.set $ch (i32.const 0x34)))) ;; 4
       (if (i32.eq (local.get $scan) (i32.const 0x4C)) (then (local.set $ch (i32.const 0x35)))) ;; 5
-      (if (i32.eq (local.get $scan) (i32.const 0x4D)) (then (local.set $ch (i32.const 0x36)))) ;; 6
+      (if (i32.and (i32.eqz (local.get $extended)) (i32.eq (local.get $scan) (i32.const 0x4D))) (then (local.set $ch (i32.const 0x36)))) ;; 6
       (if (i32.eq (local.get $scan) (i32.const 0x4E)) (then (local.set $ch (i32.const 0x2B)))) ;; +
       (if (i32.eq (local.get $scan) (i32.const 0x4F)) (then (local.set $ch (i32.const 0x31)))) ;; 1
-      (if (i32.eq (local.get $scan) (i32.const 0x50)) (then (local.set $ch (i32.const 0x32)))) ;; 2  (overrides arrow Down)
+      (if (i32.and (i32.eqz (local.get $extended)) (i32.eq (local.get $scan) (i32.const 0x50))) (then (local.set $ch (i32.const 0x32)))) ;; 2
       (if (i32.eq (local.get $scan) (i32.const 0x51)) (then (local.set $ch (i32.const 0x33)))) ;; 3
       (if (i32.eq (local.get $scan) (i32.const 0x52)) (then (local.set $ch (i32.const 0x30)))) ;; 0
       (if (i32.eq (local.get $scan) (i32.const 0x53)) (then (local.set $ch (i32.const 0x2E)))) ;; .
       (if (local.get $ch) (then
-        (i32.store (local.get $buf) (i32.const 0x206D754E)) ;; "Num "
-        (i32.store8 (i32.add (local.get $buf) (i32.const 4)) (local.get $ch))
-        (i32.store8 (i32.add (local.get $buf) (i32.const 5)) (i32.const 0))
+        (call $keyname_store_prefix (local.get $buf) (i32.const 0x206D754E) (i32.const 4) (local.get $end)) ;; "Num "
+        (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 4)) (local.get $ch) (i32.const 1) (local.get $end))
+        (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 5)) (i32.const 0) (i32.const 1) (local.get $end))
         (local.set $len (i32.const 5)) (br $done)))
       ;; Number row: 0x02-0x0A = '1'-'9', 0x0B = '0'
       (if (i32.and (i32.ge_u (local.get $scan) (i32.const 0x02)) (i32.le_u (local.get $scan) (i32.const 0x0A)))
-        (then (i32.store16 (local.get $buf) (i32.add (i32.const 0x30) (i32.sub (local.get $scan) (i32.const 1))))
+        (then (call $keyname_store_prefix (local.get $buf) (i32.add (i32.const 0x30) (i32.sub (local.get $scan) (i32.const 1))) (i32.const 2) (local.get $end))
               (local.set $len (i32.const 1)) (br $done)))
       (if (i32.eq (local.get $scan) (i32.const 0x0B)) (then
-        (i32.store16 (local.get $buf) (i32.const 0x30)) (local.set $len (i32.const 1)) (br $done)))
+        (call $keyname_store_prefix (local.get $buf) (i32.const 0x30) (i32.const 2) (local.get $end)) (local.set $len (i32.const 1)) (br $done)))
       ;; Tab (0x0F)
       (if (i32.eq (local.get $scan) (i32.const 0x0F)) (then
-        (i32.store (local.get $buf) (i32.const 0x00626154)) ;; "Tab\0"
+        (call $keyname_store_prefix (local.get $buf) (i32.const 0x00626154) (i32.const 4) (local.get $end)) ;; "Tab\0"
         (local.set $len (i32.const 3)) (br $done)))
       ;; QWERTYUIOP: scancodes 0x10-0x19
       (local.set $ch (i32.const 0))
@@ -4919,13 +5628,13 @@
       (if (i32.eq (local.get $scan) (i32.const 0x19)) (then (local.set $ch (i32.const 0x50))))
       ;; Enter (0x1C)
       (if (i32.eq (local.get $scan) (i32.const 0x1C)) (then
-        (i32.store (local.get $buf) (i32.const 0x65746E45)) ;; "Ente"
-        (i32.store16 (i32.add (local.get $buf) (i32.const 4)) (i32.const 0x0072)) ;; "r\0"
+        (call $keyname_store_prefix (local.get $buf) (i32.const 0x65746E45) (i32.const 4) (local.get $end)) ;; "Ente"
+        (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 4)) (i32.const 0x0072) (i32.const 2) (local.get $end)) ;; "r\0"
         (local.set $len (i32.const 5)) (br $done)))
       ;; Ctrl (0x1D)
       (if (i32.eq (local.get $scan) (i32.const 0x1D)) (then
-        (i32.store (local.get $buf) (i32.const 0x6C727443)) ;; "Ctrl"
-        (i32.store8 (i32.add (local.get $buf) (i32.const 4)) (i32.const 0))
+        (call $keyname_store_prefix (local.get $buf) (i32.const 0x6C727443) (i32.const 4) (local.get $end)) ;; "Ctrl"
+        (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 4)) (i32.const 0) (i32.const 1) (local.get $end))
         (local.set $len (i32.const 4)) (br $done)))
       ;; ASDFGHJKL: scancodes 0x1E-0x26
       (if (i32.eq (local.get $scan) (i32.const 0x1E)) (then (local.set $ch (i32.const 0x41))))
@@ -4939,8 +5648,8 @@
       (if (i32.eq (local.get $scan) (i32.const 0x26)) (then (local.set $ch (i32.const 0x4C))))
       ;; Shift (0x2A, 0x36)
       (if (i32.or (i32.eq (local.get $scan) (i32.const 0x2A)) (i32.eq (local.get $scan) (i32.const 0x36))) (then
-        (i32.store (local.get $buf) (i32.const 0x66696853)) ;; "Shif"
-        (i32.store16 (i32.add (local.get $buf) (i32.const 4)) (i32.const 0x0074)) ;; "t\0"
+        (call $keyname_store_prefix (local.get $buf) (i32.const 0x66696853) (i32.const 4) (local.get $end)) ;; "Shif"
+        (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 4)) (i32.const 0x0074) (i32.const 2) (local.get $end)) ;; "t\0"
         (local.set $len (i32.const 5)) (br $done)))
       ;; ZXCVBNM: scancodes 0x2C-0x32
       (if (i32.eq (local.get $scan) (i32.const 0x2C)) (then (local.set $ch (i32.const 0x5A))))
@@ -4952,54 +5661,54 @@
       (if (i32.eq (local.get $scan) (i32.const 0x32)) (then (local.set $ch (i32.const 0x4D))))
       ;; If a letter was matched, write it
       (if (local.get $ch) (then
-        (i32.store8 (local.get $buf) (local.get $ch))
-        (i32.store8 (i32.add (local.get $buf) (i32.const 1)) (i32.const 0))
+        (call $keyname_store_prefix (local.get $buf) (local.get $ch) (i32.const 1) (local.get $end))
+        (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 1)) (i32.const 0) (i32.const 1) (local.get $end))
         (local.set $len (i32.const 1)) (br $done)))
       ;; Alt (0x38)
       (if (i32.eq (local.get $scan) (i32.const 0x38)) (then
-        (i32.store (local.get $buf) (i32.const 0x00746C41)) ;; "Alt\0"
+        (call $keyname_store_prefix (local.get $buf) (i32.const 0x00746C41) (i32.const 4) (local.get $end)) ;; "Alt\0"
         (local.set $len (i32.const 3)) (br $done)))
       ;; Space (0x39)
       (if (i32.eq (local.get $scan) (i32.const 0x39)) (then
-        (i32.store (local.get $buf) (i32.const 0x63617053)) ;; "Spac"
-        (i32.store16 (i32.add (local.get $buf) (i32.const 4)) (i32.const 0x0065)) ;; "e\0"
+        (call $keyname_store_prefix (local.get $buf) (i32.const 0x63617053) (i32.const 4) (local.get $end)) ;; "Spac"
+        (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 4)) (i32.const 0x0065) (i32.const 2) (local.get $end)) ;; "e\0"
         (local.set $len (i32.const 5)) (br $done)))
       ;; F1-F10: scan 0x3B-0x44
       (if (i32.and (i32.ge_u (local.get $scan) (i32.const 0x3B)) (i32.le_u (local.get $scan) (i32.const 0x44)))
         (then
-          (i32.store8 (local.get $buf) (i32.const 0x46))  ;; 'F'
+          (call $keyname_store_prefix (local.get $buf) (i32.const 0x46) (i32.const 1) (local.get $end))  ;; 'F'
           (local.set $ch (i32.sub (local.get $scan) (i32.const 0x3A)))
           (if (i32.le_u (local.get $ch) (i32.const 9))
-            (then (i32.store8 (i32.add (local.get $buf) (i32.const 1)) (i32.add (i32.const 0x30) (local.get $ch)))
-                  (i32.store8 (i32.add (local.get $buf) (i32.const 2)) (i32.const 0))
+            (then (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 1)) (i32.add (i32.const 0x30) (local.get $ch)) (i32.const 1) (local.get $end))
+                  (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 2)) (i32.const 0) (i32.const 1) (local.get $end))
                   (local.set $len (i32.const 2)))
-            (else (i32.store8 (i32.add (local.get $buf) (i32.const 1)) (i32.const 0x31))
-                  (i32.store8 (i32.add (local.get $buf) (i32.const 2)) (i32.const 0x30))
-                  (i32.store8 (i32.add (local.get $buf) (i32.const 3)) (i32.const 0))
+            (else (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 1)) (i32.const 0x31) (i32.const 1) (local.get $end))
+                  (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 2)) (i32.const 0x30) (i32.const 1) (local.get $end))
+                  (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 3)) (i32.const 0) (i32.const 1) (local.get $end))
                   (local.set $len (i32.const 3))))
           (br $done)))
       ;; Arrow keys: Up=0x48, Left=0x4B, Right=0x4D, Down=0x50
       (if (i32.eq (local.get $scan) (i32.const 0x48)) (then
-        (i32.store (local.get $buf) (i32.const 0x00007055)) ;; "Up\0"
+        (call $keyname_store_prefix (local.get $buf) (i32.const 0x00007055) (i32.const 4) (local.get $end)) ;; "Up\0"
         (local.set $len (i32.const 2)) (br $done)))
       (if (i32.eq (local.get $scan) (i32.const 0x4B)) (then
-        (i32.store (local.get $buf) (i32.const 0x7466654C)) ;; "Left"
-        (i32.store8 (i32.add (local.get $buf) (i32.const 4)) (i32.const 0))
+        (call $keyname_store_prefix (local.get $buf) (i32.const 0x7466654C) (i32.const 4) (local.get $end)) ;; "Left"
+        (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 4)) (i32.const 0) (i32.const 1) (local.get $end))
         (local.set $len (i32.const 4)) (br $done)))
       (if (i32.eq (local.get $scan) (i32.const 0x4D)) (then
-        (i32.store (local.get $buf) (i32.const 0x68676952)) ;; "Righ"
-        (i32.store16 (i32.add (local.get $buf) (i32.const 4)) (i32.const 0x0074)) ;; "t\0"
+        (call $keyname_store_prefix (local.get $buf) (i32.const 0x68676952) (i32.const 4) (local.get $end)) ;; "Righ"
+        (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 4)) (i32.const 0x0074) (i32.const 2) (local.get $end)) ;; "t\0"
         (local.set $len (i32.const 5)) (br $done)))
       (if (i32.eq (local.get $scan) (i32.const 0x50)) (then
-        (i32.store (local.get $buf) (i32.const 0x6E776F44)) ;; "Down"
-        (i32.store8 (i32.add (local.get $buf) (i32.const 4)) (i32.const 0))
+        (call $keyname_store_prefix (local.get $buf) (i32.const 0x6E776F44) (i32.const 4) (local.get $end)) ;; "Down"
+        (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 4)) (i32.const 0) (i32.const 1) (local.get $end))
         (local.set $len (i32.const 4)) (br $done)))
       ;; F11-F12
       (if (i32.eq (local.get $scan) (i32.const 0x57)) (then
-        (i32.store (local.get $buf) (i32.const 0x00313146)) ;; "F11\0"
+        (call $keyname_store_prefix (local.get $buf) (i32.const 0x00313146) (i32.const 4) (local.get $end)) ;; "F11\0"
         (local.set $len (i32.const 3)) (br $done)))
       (if (i32.eq (local.get $scan) (i32.const 0x58)) (then
-        (i32.store (local.get $buf) (i32.const 0x00323146)) ;; "F12\0"
+        (call $keyname_store_prefix (local.get $buf) (i32.const 0x00323146) (i32.const 4) (local.get $end)) ;; "F12\0"
         (local.set $len (i32.const 3)) (br $done)))
       ;; OEM punctuation — render the unshifted glyph as a 1-char name.
       (local.set $ch (i32.const 0))
@@ -5015,16 +5724,33 @@
       (if (i32.eq (local.get $scan) (i32.const 0x34)) (then (local.set $ch (i32.const 0x2E)))) ;; .
       (if (i32.eq (local.get $scan) (i32.const 0x35)) (then (local.set $ch (i32.const 0x2F)))) ;; /
       (if (local.get $ch) (then
-        (i32.store8 (local.get $buf) (local.get $ch))
-        (i32.store8 (i32.add (local.get $buf) (i32.const 1)) (i32.const 0))
+        (call $keyname_store_prefix (local.get $buf) (local.get $ch) (i32.const 1) (local.get $end))
+        (call $keyname_store_prefix (i32.add (local.get $buf) (i32.const 1)) (i32.const 0) (i32.const 1) (local.get $end))
         (local.set $len (i32.const 1)) (br $done)))
       ;; Unknown: write "?"
-      (i32.store16 (local.get $buf) (i32.const 0x003F))
+      (call $keyname_store_prefix (local.get $buf) (i32.const 0x003F) (i32.const 2) (local.get $end))
       (local.set $len (i32.const 1))
     )
+    (if (i32.gt_s (local.get $arg2) (i32.const 0))
+      (then (if (i32.ge_u (local.get $len) (local.get $arg2))
+        (then (local.set $len (i32.sub (local.get $arg2) (i32.const 1)))))))
+    (i32.store8 (i32.add (local.get $buf) (local.get $len)) (i32.const 0))
     (i32.store offset=0 (global.get $reg_base) (local.get $len))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))
   )
+  ;; Copy only non-NUL bytes from an existing little-endian name chunk.
+  ;; The handler emits exactly one terminator after clamping the final length.
+  (func $keyname_store_prefix (param $dst i32) (param $value i32)
+    (param $width i32) (param $end i32)
+    (block $done (loop $copy
+      (br_if $done (i32.eqz (local.get $width)))
+      (br_if $done (i32.ge_u (local.get $dst) (local.get $end)))
+      (br_if $done (i32.eqz (i32.and (local.get $value) (i32.const 255))))
+      (i32.store8 (local.get $dst) (local.get $value))
+      (local.set $dst (i32.add (local.get $dst) (i32.const 1)))
+      (local.set $value (i32.shr_u (local.get $value) (i32.const 8)))
+      (local.set $width (i32.sub (local.get $width) (i32.const 1)))
+      (br $copy))))
 
   ;; 789: SetObjectOwner — obsolete GDI function, no-op
   (func $handle_SetObjectOwner (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
@@ -5089,13 +5815,11 @@
   ;; timeGetDevCaps(lptc, cbtc) — fills TIMECAPS { wPeriodMin, wPeriodMax }.
   ;; We claim 1 ms min resolution and ~1000 s max, matching what real NT returns.
   (func $handle_timeGetDevCaps (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $ptr i32)
     (if (i32.and (i32.ne (local.get $arg0) (i32.const 0))
                  (i32.ge_u (local.get $arg1) (i32.const 8)))
       (then
-        (local.set $ptr (call $g2w (local.get $arg0)))
-        (i32.store (local.get $ptr) (i32.const 1))
-        (i32.store offset=4 (local.get $ptr) (i32.const 1000000))))
+        (call $gs32 (local.get $arg0) (i32.const 1))
+        (call $gs32 (i32.add (local.get $arg0) (i32.const 4)) (i32.const 1000000))))
     (i32.store offset=0 (global.get $reg_base) (i32.const 0))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12))))
 
@@ -5155,27 +5879,30 @@
   (func $handle_StrStrIA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $hay_base i32) (local $hay i32) (local $ndl i32) (local $hi i32) (local $ni i32)
     (local $hc i32) (local $nc i32) (local $ndl_len i32)
-    ;; Get needle length
-    (local.set $ndl (call $g2w (local.get $arg1)))
-    (local.set $ndl_len (call $strlen (local.get $ndl)))
+    ;; Keep string cursors in guest space across independently backed pages.
+    (local.set $ndl (local.get $arg1))
+    (block $length_done (loop $length
+      (br_if $length_done (i32.eqz (call $gl8 (i32.add (local.get $ndl) (local.get $ndl_len)))))
+      (local.set $ndl_len (i32.add (local.get $ndl_len) (i32.const 1)))
+      (br $length)))
     (if (i32.eqz (local.get $ndl_len))
       (then (i32.store offset=0 (global.get $reg_base) (local.get $arg0))
              (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12))) (return)))
-    (local.set $hay_base (call $g2w (local.get $arg0)))
+    (local.set $hay_base (local.get $arg0))
     (local.set $hay (local.get $hay_base))
     ;; Outer loop: try each position in haystack
     (block $not_found (loop $outer
-      (br_if $not_found (i32.eqz (i32.load8_u (local.get $hay))))
+      (br_if $not_found (i32.eqz (call $gl8 (local.get $hay))))
       ;; Inner loop: compare needle at current position
       (local.set $hi (local.get $hay))
       (local.set $ni (local.get $ndl))
       (block $mismatch (loop $inner
-        (local.set $nc (i32.load8_u (local.get $ni)))
+        (local.set $nc (call $gl8 (local.get $ni)))
         (if (i32.eqz (local.get $nc))
           (then ;; needle exhausted = match found
             (i32.store offset=0 (global.get $reg_base) (i32.add (i32.sub (local.get $hay) (local.get $hay_base)) (local.get $arg0)))
             (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12))) (return)))
-        (local.set $hc (i32.load8_u (local.get $hi)))
+        (local.set $hc (call $gl8 (local.get $hi)))
         (br_if $mismatch (i32.eqz (local.get $hc)))
         ;; Lowercase both chars for comparison (ASCII a-z/A-Z only)
         (if (i32.and (i32.ge_u (local.get $hc) (i32.const 0x41)) (i32.le_u (local.get $hc) (i32.const 0x5A)))
@@ -5719,17 +6446,33 @@
 
   ;; 862: GlobalMemoryStatus(lpBuffer) — fill MEMORYSTATUS struct
   (func $handle_GlobalMemoryStatus (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $wa i32)
-    (local.set $wa (call $g2w (local.get $arg0)))
-    (call $zero_memory (local.get $wa) (i32.const 32))
-    (i32.store (local.get $wa) (i32.const 32))             ;; dwLength
-    (i32.store offset=4 (local.get $wa) (i32.const 50))    ;; dwMemoryLoad = 50%
-    (i32.store offset=8 (local.get $wa) (i32.const 0x04000000))  ;; dwTotalPhys = 64MB
-    (i32.store offset=12 (local.get $wa) (i32.const 0x02000000)) ;; dwAvailPhys = 32MB
-    (i32.store offset=16 (local.get $wa) (i32.const 0x10000000)) ;; dwTotalPageFile = 256MB
-    (i32.store offset=20 (local.get $wa) (i32.const 0x08000000)) ;; dwAvailPageFile = 128MB
-    (i32.store offset=24 (local.get $wa) (i32.const 0x7FFE0000)) ;; dwTotalVirtual
-    (i32.store offset=28 (local.get $wa) (i32.const 0x7FFC0000)) ;; dwAvailVirtual
+    (local $wa i32) (local $avail_page_file i32)
+    (local.set $avail_page_file (i32.const 0x08000000))
+    (if (i32.eqz (local.get $arg0))
+      (then
+        ;; Preserve the existing physical NULL sentinel writes exactly.
+        (local.set $wa (call $g2w (local.get $arg0)))
+        (call $zero_memory (local.get $wa) (i32.const 32))
+        (i32.store (local.get $wa) (i32.const 32))             ;; dwLength
+        (i32.store offset=4 (local.get $wa) (i32.const 50))    ;; dwMemoryLoad = 50%
+        (i32.store offset=8 (local.get $wa) (i32.const 0x04000000))  ;; dwTotalPhys = 64MB
+        (i32.store offset=12 (local.get $wa) (i32.const 0x02000000)) ;; dwAvailPhys = 32MB
+        (i32.store offset=16 (local.get $wa) (i32.const 0x10000000)) ;; dwTotalPageFile = 256MB
+        (i32.store offset=20 (local.get $wa) (local.get $avail_page_file)) ;; dwAvailPageFile = 128MB
+        (i32.store offset=24 (local.get $wa) (i32.const 0x7FFE0000)) ;; dwTotalVirtual
+        (i32.store offset=28 (local.get $wa) (i32.const 0x7FFC0000)) ;; dwAvailVirtual
+      )
+      (else
+        ;; Guest DWORDs may cross pages with nonadjacent physical backing.
+        (call $gs32 (local.get $arg0) (i32.const 32))
+        (call $gs32 (i32.add (local.get $arg0) (i32.const 4)) (i32.const 50))
+        (call $gs32 (i32.add (local.get $arg0) (i32.const 8)) (i32.const 0x04000000))
+        (call $gs32 (i32.add (local.get $arg0) (i32.const 12)) (i32.const 0x02000000))
+        (call $gs32 (i32.add (local.get $arg0) (i32.const 16)) (i32.const 0x10000000))
+        (call $gs32 (i32.add (local.get $arg0) (i32.const 20)) (local.get $avail_page_file))
+        (call $gs32 (i32.add (local.get $arg0) (i32.const 24)) (i32.const 0x7FFE0000))
+        (call $gs32 (i32.add (local.get $arg0) (i32.const 28)) (i32.const 0x7FFC0000))
+      ))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8))))
 
   ;; 852: RemovePropA(hwnd, lpString) → HANDLE (removed value)

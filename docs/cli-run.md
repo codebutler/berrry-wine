@@ -47,7 +47,7 @@ it executes production CLI hook bodies with real clock/trace code and controlled
 queues/MSG memory, without instantiating the guest VM.
 
 - **Browser:** Open `index.html` (at repo root), select an app, click Launch. Live build deployed at https://wine-assembly.berrry.app via `tools/deploy-berrry.js --update`.
-- **CLI:** `node test/run.js --exe=path/to/exe [options]` — headless execution with auto-build. A registered EXE gets that app's explicit file manifest; an arbitrary bare `--exe` mounts only the executable. Add repeatable/comma-separated `--vfs-include='*.dat,plugins/**/*.dll'` patterns (relative to the EXE directory) for ad-hoc companion assets, or prefer `--app=ID`. Key flags: `--verbose`, `--trace`, `--trace-api`, `--trace-gdi`, `--trace-host=fn1,fn2`, `--no-close`, `--break=0xADDR`, `--break-api=Name`, `--watch=0xADDR`, `--dump-gdi=DIR`, `--max-batches=N`, `--batch-size=N`, `--tick-ms-per-batch=N`
+- **CLI:** `node test/run.js --exe=path/to/exe [options]` — headless execution with auto-build. A registered EXE gets that app's explicit file manifest; an arbitrary bare `--exe` mounts only the executable. Add repeatable/comma-separated `--vfs-include='*.dat,plugins/**/*.dll'` patterns (relative to the EXE directory) for ad-hoc companion assets, or prefer `--app=ID`. Repeatable `--vfs-mount=HOSTPATH=GUESTPATH` mounts one host file at an exact guest path, and is applied after the app's manifest, so it replaces a single manifest file for one run without touching disk (e.g. a test INI: `--vfs-mount=scratch/x.ini=c:\System\UnrealTournament.ini`; mount every alias the manifest gives that file). Key flags: `--verbose`, `--trace`, `--trace-api`, `--trace-gdi`, `--trace-host=fn1,fn2`, `--no-close`, `--break=0xADDR`, `--break-api=Name`, `--watch=0xADDR`, `--dump-gdi=DIR`, `--max-batches=N`, `--batch-size=N`, `--tick-ms-per-batch=N`
 
   **`--quiet-api` is close to free speed on any API-heavy app, so pass it unless you are reading the API log.** Every Win32 call prints an `[API]` line by default — Diablo emits 96,787 of them by its main menu and 724,015 by the time it reaches gameplay — and that write is blocking I/O on the thread the guest runs on. Measured back to back on the same 1000-batch Diablo command line: 3:53 wall / 25.1s user CPU by default against **1:17 wall / 25.1s user CPU** with the flag. Identical CPU, three times the wall clock — the whole difference is the process waiting on stdout, and on a loaded box it is the difference between a run finishing and a run being SIGKILLed at its timeout. `--trace-api` and friends are unaffected; this only suppresses the unconditional one-liner.
 
@@ -62,6 +62,8 @@ queues/MSG memory, without instantiating the guest VM.
   **This is also why time-paced content stalls.** The headless clock is `batch * TICK_MS_PER_BATCH`, so guest time advances per batch while *work* per batch varies 41x — and it varies the wrong way: an app sitting in a tight polling loop retires tiny blocks, so it is granted the fewest ops per guest-second exactly when it is waiting for time to pass. At the defaults that intro is being run on a machine doing ~35,000 ops per guest-second against ~100M for a real Pentium. Anything pacing itself off `timeGetTime`/`GetTickCount` — an intro video, an animated menu, a timed fade — then renders a fraction of a frame per guest second and looks *stalled*, which reads convincingly as a broken decoder. Diablo's Blizzard North logo is byte-identical for 23,000 batches for exactly this reason (`--trace-sched` has the main thread inside smackw32 working the whole time, and an API census counts 10,068 `timeGetTime` calls against 62 surface Lock/Unlock pairs) and plays straight through at `--batch-size=200000`. When a timed animation appears frozen, raise `--batch-size` before you go looking for a decoder bug.
 - **CLI, by app id:** `node test/run.js --app=sol` — takes the exe, its DLLs, its data files and its command line from `lib/apps.js`, the same registry the desktop icons read, so the CLI mounts exactly what the browser mounts. `--app=` with an unknown id prints the full id list. An explicit `--exe`/`--args` overrides the registry.
 - **PNG render:** `node test/run.js --exe=path/to/exe --png=output.png`
+- **GPU stream dump:** `--gpu-stream-dump=FILE` tees every GPU stream v2 record (plus the arena bytes it reads) into a `GPSD` dump for `tools/gpu-stream.js list|stats|replay` ([format](gpu-stream-v2.md)).
+- **GPU stream texture-cache diagnostics:** `--gps-tex-diag` hashes every decoded Glide/D3DIM texture and counts evictions, invalidation causes and content repeats (`gps_stat` 16..31); the exit `[gps]` lines print them next to the shared per-API frames/draws/readbacks/uploads ([accounting](gpu-stream-v2.md#ring-directory-entry)).
 - **Remote/headless control:** add `--control-stdin` for newline-delimited JSON
   commands on stdin. Add `--frozen` to park before the first batch and advance
   only through `{"action":"step","n":N}` commands; snapshots and PNG captures
@@ -70,6 +72,62 @@ queues/MSG memory, without instantiating the guest VM.
   needed.
 - **Real threads (CLI):** guest threads use the cooperative scheduler by default; `--no-threads` selects that mode explicitly for reproducible A/B commands. `--threads` instead gives every guest thread its own node `worker_thread` over the one shared memory — the headless twin of the browser's Worker backend. The guest's *main* thread stays in-process, so this is not identical to the browser, but it is the only automated coverage of the shared-memory locks, the per-thread RPC blocks and the wait-completion path. The two mode flags are mutually exclusive. Add `--threads-serial` to run one guest thread at a time (splits "race" from "wrong per-thread state" in one run) and `--thread-batch-size=N` to set the steps per worker slice (default `--batch-size`, min 1000 — the browser's own rule: host.js hands its main step count to every worker, so main and workers retire work at parity. The old default, `--batch-size` × `--thread-slices` with a 20000 floor, let workers outrun main ~27× and manufactured a startup race in Hype that no real machine and no page run has). `--trace-thread` also reports why a thread got no slice this batch. Runs print a `critical sections:` line, a `held critical sections at exit` list (each section's owner, `LockCount` and `RecursionCount`) and a per-thread `csPark/steal`, `csBadLeave`, `waitingOnCS=… heldBy=…` column whenever a guest thread blocked on a `CRITICAL_SECTION`. **Read the held list first on any threads hang:** a climbing `csPark` says somebody is waiting, but only the owner/counter state says why — a section whose counters sit below the values `InitializeCriticalSection` writes (`lock=-1 recursion=0`) can never be released by the guest again, and a nonzero `csBadLeave` names the thread that put it there. A section owned by a thread that has already exited is released automatically at exit. Sections are never taken by force by default, because doing so rewrites `LockCount`/`RecursionCount` under the owner and the guest CRT reads those — `--cs-steal-after=N` turns it back on for the one measurement it is good for, telling "waiting forever" apart from "took it". See `docs/design-real-threads.md` for what worker mode does and does not get right yet.
 - **Child processes (CLI):** a guest CreateProcess with redirected std handles always runs as a real child emulator (pipes over the vlan wire, `docs/design-anonymous-pipes.md`). Any other CreateProcess only does with `--spawn-processes` (or `spawnProcesses: true` on the app in `lib/apps.js`); without it the call reports success and no child runs, which installer-extraction tests rely on. A spawned child gets a snapshot of the guest's C:\ and registry, finds its exe on that C:\ (current dir, exe dir, SYSTEM, WINDOWS), and what it leaves is merged back before the parent's wait on it returns — so `instmsi -> msiinst -> msiexec` installs Windows Installer in one run. `--pipe-child-args="..."` passes flags to every child down the tree (`--input=B:dlg-cmd:ID` answers a grandchild's dialog). Each child is another 512 MB guest: a three-level chain is boat-sized. The browser does the same with visible in-page instances (host.js `process_spawn`, `VirtualFS.mergeChildFrom`).
+- **Memory child handoff:** `--spawn-processes --child-transport=memory`
+  forks real CLI hosts for ordinary CreateProcess/ShellExecute/WinExec children
+  and grandchildren. The default `--child-transport=disk` retains the host-tree
+  transport. Memory mode sends PE bytes, the private writable C: namespace,
+  empty directories, file names, attributes, FILETIMEs, C: volume metadata and
+  registry/INI state over token-bound, sequenced, hashed Node IPC chunks. It
+  preserves raw command-line spelling, quotes and spacing in GetCommandLineA/W,
+  and explicit/inherited cwd. The current startup layout supports ASCII raw
+  lines up to 383 bytes and parsed arguments up to 200 bytes; memory launches
+  outside those bounds fail closed, rather than silently truncating them.
+  Readonly drives carry source-owned mount recipes and pins; children reopen
+  and verify the original sources without exporting media bytes. Writable lazy
+  entries must support synchronous materialization. Other writable drives and
+  redirected-pipe children are currently refused in memory mode. Launch faults
+  fail closed instead of falling back to a trace-only process ACK.
+
+  Each child sees a fork-time snapshot, not live parent/sibling edits. After a
+  normal guest ExitProcess (including nonzero exit), a complete validated delta
+  merges changed files, directories and whiteouts before its wait is signaled.
+  Untouched parent files and registry keys survive. Conflicting parent writes,
+  open parent file handles, changed registry keys, altered volume/source
+  ownership, malformed/incomplete IPC, host failure and cancellation reject the
+  delta. Refused writes restore the original namespace, bytes, metadata and
+  registry before returning failure; watcher notifications are deferred until
+  commit. A hook with irreversible external side effects is outside that
+  transaction; an exceptional rollback failure is explicitly `partialApplied`.
+  A guest-exit message alone never permits merging: the native host must
+  exit and both output pipes must close. Guest process handles keep virtual IDs;
+  optional `WINE_COM_PROTOCOL_DIR` receipts correlate them with actual OS PIDs,
+  exits, EOFs and merge results. A normally exiting parent keeps its host and
+  desktop authority until its children drain. Cancellation terminates children
+  and discards their deltas. Volatile installation lasts only for that process
+  tree; this provides no durable installation or concurrent shared filesystem.
+
+- **Process desktop polling (`lib/process-desktop.js`).** Every CLI process
+  joins one desktop namespace (the root hosts its authority) so related
+  processes see each other's windows. Its `poll()` runs every batch and from
+  every `check_input`, but costs a synchronous round trip only when there is
+  news: the authority pushes a frame when it queues a post/activation for a
+  session and when the number of live sessions changes, and the client worker
+  mirrors those into shared counters main reads without blocking. A lone
+  process therefore polls nothing and publishes its rows only from the
+  window-changing host imports; once another session is live, rows are
+  published every poll again (a new peer forces one publish on the next poll).
+  Lookups (`FindWindow`, foreign `GetWindow*`) still round-trip on demand.
+- **Batch-loop fast path.** With a local main owner (the default) and neither
+  `--trace-main-scheduler` nor `--d3dim-render-owner`, the batch loop makes the
+  same owner calls in the same order without `await`ing them
+  (`mainExecutionSuspendedSync`, `ThreadManager.noteMainSleepLocal` /
+  `checkMainMessageWaitLocal`), and awaits the COM drain, wave-callback pump,
+  io/timing-wait services, native-fault latch and Worker send resolver only
+  when each has work. It keeps one microtask turn per batch at the top of the
+  loop. Each settled `await` used to suspend and resume the whole (huge,
+  interpreted) `main()` closure. Output is unchanged: same PNGs and API/batch
+  counts (evidence `scratch/runs/20261125-cli-harness-overhead`).
+
 - **Prefer the CLI's own `--max-seconds=N` guard.** Controlled test harnesses
   should launch `run.js` directly and ask it to stop or quit over stdio; do not
   wrap normal runs in `timeout -s KILL`. The internal guard is checked between

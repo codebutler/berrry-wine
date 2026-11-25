@@ -124,6 +124,24 @@ const CASES = [
   // A segment override or REPNE keeps its threaded semantics: declined.
   {name:'rep-seg-declines',regs:{ebp:600},head:'l',declines:true,
    code:[0xFC,L('l'),[0x89,0xD9],[0x83,0xE1,31],[0x26,0xF3,0xA5],[0x83,0xC3,0x07],0x4D,J(cc.NZ,'l'),0xC3]},
+  // ES/CS/SS/DS overrides are flat no-ops outside REP: Quake III's mixer
+  // clip loop (exe+0x42ce17, every access `ds:`), byte for byte, then the
+  // four prefixes on loads, a store and an RMW.
+  {name:'ds-mixer-clip',regs:{ecx:2000},head:0,
+   init:a=>({ebx:a.buf,edi:a.buf+0x10000}),
+   bytes:[0x3e,0x8b,0x44,0x8b,0xf8, 0xc1,0xf8,0x08, 0x3d,0xff,0x7f,0x00,0x00, 0x7f,0x0e,
+          0x3d,0x00,0x80,0xff,0xff, 0x7d,0x0c, 0xb8,0x00,0x80,0xff,0xff, 0xeb,0x05,
+          0xb8,0xff,0x7f,0x00,0x00, 0x3e,0x8b,0x54,0x8b,0xfc, 0xc1,0xfa,0x08,
+          0x81,0xfa,0xff,0x7f,0x00,0x00, 0x7f,0x0f, 0x81,0xfa,0x00,0x80,0xff,0xff, 0x7d,0x0c,
+          0xba,0x00,0x80,0xff,0xff, 0xeb,0x05, 0xba,0xff,0x7f,0x00,0x00, 0xc1,0xe2,0x10,
+          0x25,0xff,0xff,0x00,0x00, 0x0b,0xd0, 0x3e,0x89,0x54,0x4f,0xfc, 0x83,0xe9,0x02,
+          0x75,0xa6, 0xc3]},
+  {name:'seg-prefix-mix',regs:{ecx:N},head:'l',
+   code:[L('l'),[0x26,0x8B,0x06],[0x2E,0x03,0x46,0x04],[0x36,0x89,0x07],[0x3E,0x01,0x47,0x04],
+         [0x83,0xC6,0x04],[0x83,0xC7,0x04],0x49,J(cc.NZ,'l'),0xC3]},
+  // FS keeps its base: still declined.
+  {name:'fs-prefix-declines',regs:{ecx:N},head:'l',declines:true,
+   code:[L('l'),[0x64,0x8B,0x06],[0x89,0x07],[0x83,0xC6,0x04],[0x83,0xC7,0x04],0x49,J(cc.NZ,'l'),0xC3]},
   {
     name: 'lut8', regs: { ecx: N },
     code: [L('l'), [0x0F, 0xB6, 0x06], [0x8A, 0x04, 0x03], [0x88, 0x07], 0x46, 0x47, 0x49, J(cc.NZ, 'l'), 0xC3],
@@ -458,6 +476,88 @@ CASES.push(
            [0x0F, 0xB6, 0x5E, 0x05], [0x83, 0xE3, 0x03], 0x4B, J(cc.O, 'd2'), L('d2'), [0xF7, 0xFB], [0x01, 0xC5], [0x01, 0xD5],
            [0x31, 0xC0], [0xBA, 0x00, 0x00, 0x00, 0x80], J(cc.O, 'd3'), L('d3'), [0xF7, 0xFB], [0x01, 0xC5], [0x01, 0xD5],
            [0x83, 0xC6, 0x04], 0x49, J(cc.NZ, 'l'), ...SEH_OFF, 0xC3],
+  },
+);
+
+// ---- --uop-sse (07e kind 34, 07d SSER/SSEM/SSEMS) ----
+// The source walk is seeded with the values SSE gets wrong most easily --
+// signed zeros, denormals, infinities, quiet/signalling/negative NaNs, the
+// round-to-even halves and integers past the cvt* range (the indefinite
+// 0x80000000) -- every third slot left random, so the upper lanes and
+// mixed-class operands are random too. XMM0-7 start from random memory (the
+// scalar forms must keep the upper lanes they do not write) and are stored
+// to the destination after the loop, so the memory hash covers the whole
+// XMM file; (U)COMIS* flags are read through setcc inside the loop.
+const F32_SPECIALS = [0, 0x80000000, 0x3F800000, 0xBF800000, 0x3FC00000, 0x00011D7C, 0x80011D7C, 0x7F800000,
+  0xFF800000, 0x7FC00000, 0x7F800001, 0xFFC00001, 0x4F32D05E, 0xCF32D05E, 0x4F000000, 0xCF000001, 0x3F000000,
+  0x40200000, 0xC0200000, 0x7E967699, 0x00800000, 0x00000001];
+const F64_SPECIALS = [0n, 0x8000000000000000n, 0x3FF0000000000000n, 0xBFF0000000000000n, 0x4004000000000000n,
+  0xC004000000000000n, 0x41E65A0BC0000000n, 0xC1E65A0BC0000000n, 0x7E37E43C8800759Cn, 0x7FF0000000000000n,
+  0xFFF0000000000000n, 0x7FF8000000000000n, 0x7FF0000000000001n, 0xFFF8000000000001n, 0x0000000000000001n,
+  0x800012D687E3D9A4n, 0x41E0000000000000n, 0xC1E0000000100000n, 0x3FB999999999999An, 0x0010000000000000n,
+  0x47EFFFFFE0000000n, 0x36A0000000000000n];
+const ssePoke = (wide) => (mem, w) => {
+  const dv = new DataView(mem.buffer, mem.byteOffset);
+  let x = 0x2468ACE;
+  for (let k = 0; k < (wide ? 0x1800 : 0x1000); k++) {
+    x = (Math.imul(x, 1103515245) + 12345) | 0;
+    if (k % 3 === 2) continue;
+    const pick = (x >>> 8) % (wide ? F64_SPECIALS.length : F32_SPECIALS.length);
+    if (wide) dv.setBigUint64(w + 8 * k, F64_SPECIALS[pick], true);
+    else dv.setUint32(w + 4 * k, F32_SPECIALS[pick], true);
+  }
+};
+// movups xmmK, [esi + 0x8000 + 16K] for K = 0..7; movups [edi + 16K], xmmK
+const XMM_LOAD = [0, 1, 2, 3, 4, 5, 6, 7].map((k) => [0x0F, 0x10, 0x86 | (k << 3), ...d32(0x8000 + 16 * k)]);
+const XMM_SAVE = [0, 1, 2, 3, 4, 5, 6, 7].map((k) => [0x0F, 0x11, 0x47 | (k << 3), 16 * k]);
+CASES.push(
+  {
+    // Single precision: loads, the arithmetic and min/max on NaN/-0 pairs,
+    // sqrtss from memory, COMISS / UCOMISS (ZF/PF/CF, the unordered
+    // result), CVTTSS2SI / CVTSS2SI past the range, CVTSI2SS, CVTSS2SD,
+    // scalar stores.
+    name: 'sse-scalar-ss', regs: { ecx: N }, sse: true, head: 'l', poke: ssePoke(false), want: { sseSites: '>0' },
+    code: [...XMM_LOAD, L('l'), [0xF3, 0x0F, 0x10, 0x06], [0xF3, 0x0F, 0x10, 0x4E, 0x04], [0xF3, 0x0F, 0x58, 0xC1],
+           [0xF3, 0x0F, 0x59, 0x4E, 0x08], [0xF3, 0x0F, 0x5C, 0xC1], [0xF3, 0x0F, 0x5E, 0x4E, 0x0C],
+           [0xF3, 0x0F, 0x5D, 0xD0], [0xF3, 0x0F, 0x5F, 0xD9], [0xF3, 0x0F, 0x51, 0x26],
+           [0x0F, 0x2F, 0xC1], [0x0F, 0x92, 0xC2], [0x0F, 0x97, 0xC6], [0x01, 0xD5],
+           [0x0F, 0x2E, 0x4E, 0x04], [0x0F, 0x9A, 0xC2], [0x0F, 0x94, 0xC6], [0x01, 0xD3],
+           [0xF3, 0x0F, 0x2C, 0xC0], [0x01, 0xC5], [0xF3, 0x0F, 0x2D, 0x46, 0x08], [0x31, 0xC3],
+           [0xF3, 0x0F, 0x2A, 0xE8], [0xF3, 0x0F, 0x5A, 0xF0], [0xF3, 0x0F, 0x11, 0x07], [0xF3, 0x0F, 0x11, 0x6F, 0x04],
+           [0xF2, 0x0F, 0x11, 0x77, 0x08], [0x83, 0xC7, 0x10], [0x83, 0xC6, 0x04], 0x49, J(cc.NZ, 'l'),
+           ...XMM_SAVE, 0xC3],
+  },
+  {
+    // Double precision: the sd arithmetic, sqrtsd, COMISD / UCOMISD from a
+    // register and from memory, CVTTSD2SI / CVTSD2SI (memory) past the
+    // range, CVTSI2SD, CVTSD2SS (overflow to inf, denormal results),
+    // CVTSS2SD from memory, ANDPD, MOVQ m64 and MOVD r32 stores.
+    name: 'sse-scalar-sd', regs: { ecx: N }, sse: true, head: 'l', poke: ssePoke(true), want: { sseSites: '>0' },
+    code: [...XMM_LOAD, L('l'), [0xF2, 0x0F, 0x10, 0x06], [0xF2, 0x0F, 0x10, 0x4E, 0x08], [0xF2, 0x0F, 0x58, 0xC1],
+           [0xF2, 0x0F, 0x59, 0x4E, 0x10], [0xF2, 0x0F, 0x5C, 0xD0], [0xF2, 0x0F, 0x5E, 0x46, 0x18],
+           [0xF2, 0x0F, 0x51, 0xD9],
+           [0x66, 0x0F, 0x2F, 0xC1], [0x0F, 0x92, 0xC2], [0x0F, 0x97, 0xC6], [0x01, 0xD5],
+           [0x66, 0x0F, 0x2E, 0x16], [0x0F, 0x9A, 0xC2], [0x0F, 0x94, 0xC6], [0x01, 0xD3],
+           [0xF2, 0x0F, 0x2C, 0xC0], [0x01, 0xC5], [0xF2, 0x0F, 0x2D, 0x46, 0x08], [0x31, 0xC3],
+           [0xF2, 0x0F, 0x2A, 0xE0], [0xF2, 0x0F, 0x5A, 0xE8], [0xF3, 0x0F, 0x5A, 0x76, 0x04], [0x66, 0x0F, 0x54, 0xF9],
+           [0xF2, 0x0F, 0x11, 0x07], [0x66, 0x0F, 0xD6, 0x5F, 0x08], [0x66, 0x0F, 0x7E, 0xD0], [0x01, 0xC5],
+           [0x83, 0xC7, 0x10], [0x83, 0xC6, 0x08], 0x49, J(cc.NZ, 'l'),
+           ...XMM_SAVE, 0xC3],
+  },
+  {
+    // Packed forms: MOVUPS/MOVAPS, ADDPS/MULPS/MAXPS, SHUFPS, CMPPS (lt) to
+    // MOVMSKPS, UNPCKLPS, XORPS, CVTPS2PD, MOVLPS load, MOVHPS store, CMPSS
+    // unord, the SSE2 integer forms PSUBD / PSHUFD / PSRLQ imm (the 66 0F 73
+    // group: r/m both source and destination), MOVD xmm, r32.
+    name: 'sse-packed', regs: { ecx: N }, sse: true, head: 'l', poke: ssePoke(false), want: { sseSites: '>0' },
+    code: [...XMM_LOAD, L('l'), [0x0F, 0x10, 0x06], [0x0F, 0x28, 0xC8], [0x0F, 0x10, 0x56, 0x10], [0x0F, 0x58, 0xCA],
+           [0x0F, 0x59, 0xC8], [0x0F, 0xC6, 0xCA, 0x1B], [0x0F, 0xC2, 0xD0, 0x01], [0x0F, 0x50, 0xC2], [0x01, 0xC5],
+           [0x0F, 0x14, 0xD9], [0x0F, 0x57, 0xE3], [0x0F, 0x5F, 0xE9], [0x0F, 0x5A, 0xF0],
+           [0x66, 0x0F, 0xFA, 0xF9], [0x66, 0x0F, 0x70, 0xF7, 0x1B], [0x66, 0x0F, 0x73, 0xD7, 0x03],
+           [0x0F, 0x12, 0x66, 0x08], [0xF3, 0x0F, 0xC2, 0xE8, 0x03], [0x66, 0x0F, 0x6E, 0xC5],
+           [0x0F, 0x11, 0x0F], [0x0F, 0x17, 0x5F, 0x08],
+           [0x83, 0xC7, 0x10], [0x83, 0xC6, 0x10], 0x49, J(cc.NZ, 'l'),
+           ...XMM_SAVE, 0xC3],
   },
 );
 
@@ -878,6 +978,165 @@ CASES.push({
 });
 CASES.push({ name: 'mmx-gate-off', regs: { ecx: N }, declines: true, nommx: true, code: mmxOps(MMX_GROUPS['mmx-addsub']) });
 
+// ---- x87 (07e kind 32, 07d X87M / X87MS / X87R) ----
+// Each case starts with FNINIT so every arm enters with the same x87 state;
+// main() compares TOP, the status word and the tag word besides memory. The
+// loops stay stack-balanced and leave their values through stores, FISTP and
+// FNSTSW AX folded into a general register.
+const X87_TAIL = [[0x83, 0xC6, 0x04], [0x83, 0xC7, 0x04], 0x49, J(cc.NZ, 'l'), 0xC3];
+const x87Mem = (a) => [[0xDB, 0xE3],                        // fninit
+  L('l'), [0xDB, 0x06], [0xDF, 0x46, 0x04],                 // fild dword [esi]; fild word [esi+4]
+  [0xD8, 0xC9],                                             // fmul st0, st1
+  [0xD8, 0x87, ...d32(0x4000)], [0xD9, 0x97, ...d32(0x4000)], // fadd / fst dword [edi+0x4000]
+  [0xD9, 0xC9],                                             // fxch st1
+  [0xDC, 0xA7, ...d32(0x5000)],                             // fsub qword [edi+0x5000]
+  [0xDD, 0x97, ...d32(0x6005)],                             // fst qword [edi+0x6005] (straddles a page now and then)
+  [0xDE, 0xC1],                                             // faddp st1
+  [0x3E, 0xD9, 0x05, ...d32(a.buf + 0x1F000)], 0x9B,        // ds: fld dword [abs]; fwait
+  [0xDE, 0xC9],                                             // fmulp st1
+  [0xD8, 0x56, 0x08], [0xDF, 0xE0],                         // fcom dword [esi+8]; fnstsw ax
+  [0x25, ...d32(0x4700)], [0x01, 0xC3],                     // and eax, 0x4700; add ebx, eax
+  [0xDB, 0x1F], ...X87_TAIL];                               // fistp dword [edi]
+CASES.push({ name: 'x87-mem', regs: { ecx: N }, head: 'l', code: x87Mem });
+// Register forms and the constants, FNSTSW AX into TEST AH / Jcc (the pair
+// threaded code fuses), 16- and 64-bit integer stores, FNSTCW / FLDCW.
+CASES.push({
+  name: 'x87-reg', regs: { ecx: N }, head: 'l',
+  code: [[0xDB, 0xE3],
+    L('l'), [0xDB, 0x06], [0xD9, 0xE8], [0xD9, 0xEB],       // fild dword [esi]; fld1; fldpi
+    [0xD8, 0xCA], [0xD9, 0xCA], [0xD9, 0xE1], [0xD9, 0xE0], // fmul st0,st2; fxch st2; fabs; fchs
+    [0xD8, 0xF1], [0xDE, 0xE2], [0xD9, 0xFC],               // fdiv st0,st1; fsubrp st2; frndint
+    [0xD9, 0xE5], [0xDF, 0xE0], [0x01, 0xC3],               // fxam; fnstsw ax; add ebx, eax
+    [0xD9, 0x7F, 0x08], [0xD9, 0x6F, 0x08],                 // fnstcw / fldcw [edi+8]
+    [0xD9, 0xC1], [0xDF, 0x5F, 0x0C], [0xD9, 0xC0], [0xDF, 0x7F, 0x10], // fld st1; fistp word [edi+12]; fld st0; fistp qword [edi+16]
+    [0xDE, 0xD9], [0xDF, 0xE0], [0x01, 0xC3],               // fcompp; fnstsw ax; add ebx, eax
+    // two random int16s compared: FNSTSW AX / TEST AH / Jcc goes both ways
+    [0xDF, 0x46, 0x02], [0xDE, 0x5E, 0x06],                 // fild word [esi+2]; ficomp word [esi+6]
+    [0xDF, 0xE0], [0xF6, 0xC4, 0x41], J(cc.NZ, 's'), 0x42, L('s'), // fnstsw ax; test ah,41h; jnz; inc edx
+    ...X87_TAIL],
+});
+// What the tier leaves to threaded code: FCOMI (EFLAGS) declines the loop,
+// and so does every x87 form with the gate off (--no-uop-x87).
+CASES.push({ name: 'x87-fcomi', regs: { ecx: N }, declines: true, head: 'l',
+  code: [[0xDB, 0xE3], L('l'), [0xDB, 0x06], [0xD9, 0xE8], [0xDB, 0xF1], [0xDD, 0xD8], [0xDD, 0xD8], ...X87_TAIL] });
+CASES.push({ name: 'x87-gate-off', regs: { ecx: N }, declines: true, nox87: true, head: 'l', code: x87Mem });
+// Quake III's _ftol (quake3.exe 0x49e890: an EBP frame, FWAIT, FNSTCW,
+// FLDCW truncation, FISTP m64, LEAVE) called from the loop. Threaded code
+// runs the body as one fused op (06 $th_ftol_native); the program follows
+// the call and runs it instruction by instruction, LEAVE included (kind 33).
+const Q3_FTOL = [0x55, 0x8B, 0xEC, 0x83, 0xC4, 0xF4, 0x9B, 0xD9, 0x7D, 0xFE, 0x9B, 0x66, 0x8B, 0x45, 0xFE,
+  0x80, 0xCC, 0x0C, 0x66, 0x89, 0x45, 0xFC, 0xD9, 0x6D, 0xFC, 0xDF, 0x7D, 0xF4, 0xD9, 0x6D, 0xFE,
+  0x8B, 0x45, 0xF4, 0x8B, 0x55, 0xF8, 0xC9, 0xC3];
+CASES.push({
+  name: 'x87-ftol-leave', regs: { ecx: N }, head: 'l',
+  code: [[0xDB, 0xE3],
+    L('l'), [0xDB, 0x06], [0xD8, 0x4E, 0x04], CALL('f'),    // fild dword [esi]; fmul dword [esi+4]; call _ftol
+    [0x89, 0x07], [0x89, 0x97, ...d32(0x4000)],             // mov [edi], eax; mov [edi+0x4000], edx
+    ...X87_TAIL, L('f'), Q3_FTOL],
+});
+// ---- native x87 (07d 91-107 in $uop_fast; 88-90 the fallback) ----
+// The seeded buffer read as floats holds normals, denormals, infinities and
+// the odd NaN, so the arms meet the fallback's cases now and then on their
+// own. x87svc counts the instructions that went through $uop_x87.
+// m32 / m64 loads and stores, D8 memory arithmetic, compares into FNSTSW AX.
+const X87N_MEM = [[0xDB, 0xE3],
+    L('l'), [0xD9, 0x06], [0xD8, 0x4E, 0x04], [0xD8, 0x46, 0x08],    // fld [esi]; fmul [esi+4]; fadd [esi+8]
+    [0xD8, 0x66, 0x0C], [0xD8, 0x6E, 0x10], [0xD8, 0x76, 0x14],      // fsub / fsubr / fdiv
+    [0xD8, 0x7E, 0x18], [0xDC, 0x0F],                                // fdivr [esi+24]; fmul qword [edi]
+    [0xD8, 0x56, 0x04], [0xDF, 0xE0], [0x25, ...d32(0x4700)], [0x01, 0xC3], // fcom [esi+4]; fnstsw ax
+    [0xD9, 0x97, ...d32(0x4000)], [0xDD, 0x97, ...d32(0x5000)],      // fst dword / fst qword
+    [0xDB, 0x46, 0x08], [0xDE, 0xC9],                                // fild dword [esi+8]; fmulp st1
+    [0xDB, 0x97, ...d32(0x6000)],                                    // fist dword [edi+0x6000]
+    [0xD8, 0x5E, 0x0C], [0xDF, 0xE0], [0x01, 0xC3],                  // fcomp [esi+12]; fnstsw ax
+    ...X87_TAIL];
+CASES.push({ name: 'x87n-mem', regs: { ecx: N }, head: 'l', code: X87N_MEM });
+// The same with every form a service op: the fallback alone
+CASES.push({ name: 'x87n-mem-svc', regs: { ecx: N }, head: 'l', nox87n: true, want: { x87svc: '>0' },
+  code: X87N_MEM });
+// Register forms: DC / DE (ST(i) destination, no ZE, reversed operands),
+// D8 register arithmetic, FCOM / FUCOM(P) / FCOMPP / FUCOMPP, FXCH, FLD /
+// FST / FSTP ST(i), FCHS / FABS.
+CASES.push({
+  name: 'x87n-reg', regs: { ecx: N }, head: 'l',
+  code: [[0xDB, 0xE3],
+    L('l'), [0xD9, 0x06], [0xD9, 0x46, 0x04], [0xD9, 0x46, 0x08],    // three loads
+    [0xDC, 0xC2], [0xDC, 0xC9], [0xDC, 0xE2], [0xDC, 0xEA],          // fadd st2,st0; fmul st1,st0; fsubr/fsub st2,st0
+    [0xDC, 0xF1], [0xDC, 0xF9], [0xD8, 0xE1], [0xD8, 0xF9],          // fdivr/fdiv st1,st0; fsub st0,st1; fdivr st0,st1
+    [0xD9, 0xC9], [0xD9, 0xE0], [0xD9, 0xCA], [0xD9, 0xE1],          // fxch st1; fchs; fxch st2; fabs
+    [0xD8, 0xD1], [0xDF, 0xE0], [0x01, 0xC3],                        // fcom st1; fnstsw ax
+    [0xDD, 0xE1], [0xDF, 0xE0], [0x01, 0xC3],                        // fucom st1
+    [0xDC, 0xD2], [0xDF, 0xE0], [0x01, 0xC3],                        // DC D2: fcom st2 alias
+    [0xDE, 0xC1], [0xDE, 0xE9],                                      // faddp st1; fsubp st1 -> 1 left
+    [0xD9, 0x46, 0x0C], [0xDE, 0xC9], [0xDD, 0xE9],                  // fld; fmulp st1; fucomp st1 -> 0
+    [0xD9, 0x06], [0xD9, 0xC0], [0xDE, 0xF9], [0xD9, 0x46, 0x10],    // fld; fld st0; fdivp; fld
+    [0xDE, 0xF1], [0xD9, 0xC0], [0xDE, 0xE1], [0xD9, 0xC0],          // fdivrp; fld st0; fsubrp; fld st0
+    [0xDD, 0xD1], [0xDD, 0xD9], [0xD9, 0xC0],                        // fst st1; fstp st1; fld st0
+    [0xD9, 0x17], [0xDD, 0x97, ...d32(0x4000)],                      // fst dword [edi]; fst qword [edi+0x4000]
+    [0xDE, 0xD9], [0xDF, 0xE0], [0x01, 0xC3],                        // fcompp -> empty
+    [0xD9, 0x46, 0x14], [0xD9, 0xC0], [0xDA, 0xE9], [0xDF, 0xE0], [0x01, 0xC3], // fld; fld st0; fucompp
+    [0xD9, 0x06], [0xDD, 0xD8],                                      // fld; fstp st0
+    ...X87_TAIL],
+});
+// Everything the fast arms hand to 06: a zero divisor in the ZE forms (and
+// 0/0), a NaN compare, FISTP of an infinity and of NaN (the indefinite),
+// stack overflow on the ninth push and underflow on the ninth pop, TOP
+// wrapping below 0 from FNINIT's 0. Each of them must come out of $uop_x87
+// with 06's exception bits, mixed with native neighbours.
+CASES.push({
+  name: 'x87n-faults', regs: { ecx: N }, head: 'l', want: { x87svc: '>0' },
+  code: [[0xDB, 0xE3],
+    L('l'), [0xD9, 0xEE], [0xD9, 0x06], [0xD8, 0xF1],               // fldz; fld [esi]; fdiv st0,st1 (ZE)
+    [0xD9, 0x17], [0xD9, 0xC1], [0xD8, 0xF0],                        // fst [edi]; fld st1; fdiv st0,st0 (0/0: ZE, NaN)
+    [0xD8, 0x5E, 0x04], [0xDF, 0xE0], [0x25, ...d32(0x4700)], [0x01, 0xC3], // fcomp [esi+4]: unordered
+    [0xDB, 0x9F, ...d32(0x4000)], [0xD9, 0xC0], [0xDD, 0x9F, ...d32(0x4800)], // fistp inf; fld st0; fstp qword
+    [0xD8, 0x77, 0x08], [0xDD, 0xD8],                               // fdiv dword [edi+8] (0x11111111, nonzero); fstp st0
+    // nine pushes and nine pops: overflow, then underflow
+    [0xD9, 0x06], [0xD9, 0x46, 0x04], [0xD9, 0x46, 0x08], [0xDD, 0x06], [0xDB, 0x46, 0x10],
+    [0xD9, 0xC0], [0xD9, 0xC2], [0xD9, 0x46, 0x14], [0xD9, 0x46, 0x18],
+    [0xD9, 0x9F, ...d32(0x5000)], [0xD9, 0x9F, ...d32(0x5004)], [0xDD, 0x9F, ...d32(0x5008)],
+    [0xDB, 0x9F, ...d32(0x5010)], [0xDD, 0xD8], [0xDE, 0xC1], [0xD9, 0x9F, ...d32(0x5014)],
+    [0xDF, 0x3F], [0xD9, 0x9F, ...d32(0x5018)],                     // ... fistp qword [edi]; the ninth pop
+    [0xDB, 0xE2],                                                    // fnclex: the next trip starts clean
+    ...X87_TAIL],
+});
+// The control word: PC24 FMUL rounding (06 $fpu_mul) and each RC mode for
+// FIST / FISTP m32 / m64, then the original word back.
+const CW = (v) => [0x66, 0xC7, 0x47, 0x08, v & 0xFF, v >>> 8];      // mov word [edi+8], v
+const FLDCW8 = [0xD9, 0x6F, 0x08];
+CASES.push({
+  name: 'x87n-cw', regs: { ecx: N }, head: 'l',
+  code: [[0xDB, 0xE3],
+    L('l'), [0xD9, 0x7F, 0x0C],                                      // fnstcw [edi+12]
+    CW(0x007F), FLDCW8, [0xD9, 0x06], [0xD8, 0x4E, 0x04], [0xD8, 0xC8], // PC24 nearest: fld; fmul m32; fmul st0,st0
+    [0xDC, 0x0F], [0xD9, 0x97, ...d32(0x4000)],                      // fmul qword [edi]; fst
+    [0xDB, 0x97, ...d32(0x4800)],                                    // fist nearest
+    CW(0x047F), FLDCW8, [0xDB, 0x97, ...d32(0x4804)],                // floor
+    CW(0x087F), FLDCW8, [0xDB, 0x97, ...d32(0x4808)],                // ceil
+    CW(0x0F7F), FLDCW8, [0xDB, 0x97, ...d32(0x480C)],                // trunc, PC64
+    [0xD9, 0xC0], [0xDF, 0xBF, ...d32(0x4810)],                      // fld st0; fistp qword trunc
+    CW(0x027F), FLDCW8, [0xD8, 0x0E], [0xDF, 0xBF, ...d32(0x4818)],  // PC53 nearest: fmul [esi]; fistp qword
+    [0xD9, 0x6F, 0x0C], [0xD9, 0x7F, 0x10],                          // fldcw [edi+12]; fnstcw [edi+16]
+    ...X87_TAIL],
+});
+// FILD m64's exact shadow (memcpy's FILD/FXCH/FISTP m64): while one is live
+// the native arms decline and 06 carries it; once popped they run again.
+CASES.push({
+  name: 'x87n-raw-mixed', regs: { ecx: N }, head: 'l', want: { x87svc: '>0' },
+  code: [[0xDB, 0xE3],
+    L('l'), [0xDF, 0x2E], [0xDF, 0x6E, 0x08], [0xD9, 0x46, 0x04],   // fild qword [esi]; fild qword [esi+8]; fld [esi+4]
+    [0xD9, 0x9F, ...d32(0x4000)], [0xD9, 0xC9],                      // fstp dword; fxch st1
+    [0xDF, 0x3F], [0xDF, 0xBF, ...d32(0x4008)],                      // fistp qword [edi]; fistp qword [edi+0x4008]
+    [0xD9, 0x46, 0x0C], [0xD8, 0x46, 0x10], [0xD9, 0x9F, ...d32(0x4010)], // native again
+    ...X87_TAIL],
+});
+// LEAVE alone: an EBP frame around a load and a store, the frame torn down
+// with LEAVE; --no-uop-leave declines the same loop.
+const leaveLoop = [L('l'), CALL('f'), 0x49, J(cc.NZ, 'l'), 0xC3,
+  L('f'), 0x55, [0x89, 0xE5], [0x83, 0xEC, 0x08], [0x8B, 0x06], [0x89, 0x45, 0xFC], [0x03, 0x45, 0xFC],
+  [0x89, 0x07], [0x83, 0xC6, 0x04], [0x83, 0xC7, 0x04], 0xC9, 0xC3];
+CASES.push({ name: 'leave-frame', regs: { ecx: N }, code: leaveLoop });
+CASES.push({ name: 'leave-gate-off', regs: { ecx: N }, declines: true, noleave: true, code: leaveLoop });
+
 // Scan limit: the loop is small, but a never-taken exit leads 4KB away into
 // 700 supported instructions, so the flood from the head overflows MAX_SCAN
 // at the full span. The compiler must halve the span and keep the loop, the
@@ -973,11 +1232,14 @@ function runCase(inst, c, a, codeAddr, mode) {
   // A known MMX file on entry, the same for every mode.
   if (e.set_mmx) for (let k = 0; k < 8; k++) e.set_mmx(k, BigInt.asIntN(64, 0x0123456789ABCDEFn * BigInt(k + 1)));
   if (c.nommx) e.set_uop_mmx(0);
+  if (c.nox87) e.set_uop_x87(0);
+  if (c.nox87n) e.set_uop_x87_native(0);
+  if (c.noleave) e.set_uop_leave(0);
   if (c.norep) e.set_uop_rep(0);
   // A known flag state on entry: a sub that sets CF.
   e.set_uop(mode === 'off' ? 0 : 1);
   if (c.aggr) e.set_aggressive_stack(mode === 'off' ? 0 : 1);
-  const feats = ['muldiv', 'icall', 'iat'].filter((f) => c[f]);
+  const feats = ['muldiv', 'icall', 'iat', 'sse'].filter((f) => c[f]);
   for (const f of feats) e['set_uop_' + f](mode === 'off' ? 0 : 1);
   // c.icgMega: the megamorphic-site threshold for this case (07d
   // $uop_icg_mega), put back to the default after
@@ -996,8 +1258,12 @@ function runCase(inst, c, a, codeAddr, mode) {
   const CTR = { divExits: 16, icPass: 17, icFail: 18, iatPass: 19, iatFail: 20, icSites: -28, iatSites: -29, icRej: -30,
                 megaSites: 21, megaKills: 22, megaRef: -31,
                 ladN: -32, ladHalved: -33, ladIcut: -34, ladHead: -35, ladNocall: -36,
-                bulkSlow: 100, bulkDeopt: 101, mcopyRuns: 200, mcopySlow: 300, mcopyDeopt: 301 };
-  const ctrOf = (i) => (i < 0 ? e.uop_cstat(-i) : i >= 300 ? e.uop_mcopy_stats(i - 300)
+                // --uop-sse: kind-34 sites kept
+                sseSites: -37,
+                bulkSlow: 100, bulkDeopt: 101, mcopyRuns: 200, mcopySlow: 300, mcopyDeopt: 301,
+                // 07d $uop_x87: x87 instructions run through the service path
+                x87svc: 400 };
+  const ctrOf = (i) => (i < 0 ? e.uop_cstat(-i) : i === 400 ? e.uop_x87_ops() >>> 0 : i >= 300 ? e.uop_mcopy_stats(i - 300)
     : i >= 200 ? e.uop_mcopy_cstat(i - 200) : i >= 100 ? e.uop_bulk_stats(i - 100) : e.uop_stats(i));
   const ctr0 = Object.fromEntries(Object.entries(CTR).map(([k, i]) => [k, ctrOf(i)]));
   let sp = null;
@@ -1010,6 +1276,9 @@ function runCase(inst, c, a, codeAddr, mode) {
     if (!pc) {
       if (c.aggr) e.set_aggressive_stack(0);
       if (c.nommx) e.set_uop_mmx(1);
+      if (c.nox87) e.set_uop_x87(1);
+      if (c.nox87n) e.set_uop_x87_native(1);
+      if (c.noleave) e.set_uop_leave(1);
       if (c.norep) e.set_uop_rep(1);
       unfeat();
       if (c.trace) e.set_uop_trace_heads(0);
@@ -1042,6 +1311,7 @@ function runCase(inst, c, a, codeAddr, mode) {
   const st = {
     ok, eip: e.get_eip() >>> 0, stops: stops.join(','), nstops: stops.length, flags: e.uop_flags(), mem: hash(mem, g2w, a),
     regs: REGS.map((r) => e['get_' + r]() >>> 0),
+    fpu: [e.get_fpu_top(), e.get_fpu_sw(), e.get_fpu_tags()].join(','),
     mmx: e.get_mmx ? [0, 1, 2, 3, 4, 5, 6, 7].map((k) => BigInt.asUintN(64, e.get_mmx(k)).toString(16)).join(',') : '',
     installs: e.uop_stats(2) - before.installs, enters: e.uop_stats(4) - before.enters,
     blocks: e.uop_stats(5) - before.blocks, sp, lf: e.get_logical_frame_count() - lf0,
@@ -1051,6 +1321,9 @@ function runCase(inst, c, a, codeAddr, mode) {
   e.set_uop(0);
   if (c.aggr) e.set_aggressive_stack(0);
   if (c.nommx) e.set_uop_mmx(1);
+  if (c.nox87) e.set_uop_x87(1);
+  if (c.nox87n) e.set_uop_x87_native(1);
+  if (c.noleave) e.set_uop_leave(1);
   if (c.norep) e.set_uop_rep(1);
   unfeat();
   if (c.trace) e.set_uop_trace_heads(0);
@@ -1989,6 +2262,7 @@ async function main() {
       if (st.flags !== off.flags) diffs.push(`flags ${st.flags.toString(2)} vs ${off.flags.toString(2)}`);
       if (st.mem !== off.mem) diffs.push('memory differs');
       if (st.mmx !== off.mmx) diffs.push(`mmx ${st.mmx} vs ${off.mmx}`);
+      if (st.fpu !== off.fpu) diffs.push(`fpu top,sw,tag ${st.fpu} vs ${off.fpu}`);
       // Batch stops. Under the block clock the program charges the cuts
       // threaded code makes once it has split at every in-loop entry (steady
       // state); "pre" installs before threaded code has taken every path, so

@@ -1,0 +1,3062 @@
+  ;; ================================================================
+  ;; D3DIM -> GPU stream v2 producer (docs/gpu-stream-v2-migration.md, D2a).
+  ;; Replaces lib/d3dim-gpu.js behind the same WAT seam: the d3dim core still
+  ;; calls opcodes 0x20000 draw, 0x20001 fence, 0x20002 ready, 0x20003 flip,
+  ;; 0x20004 clear, 0x20007 lazy publish and 0x2000A Blt present, and they
+  ;; are lowered HERE into GPS records ($d3dim_gpu_call) -- the only D3DIM
+  ;; renderer; the host only picks the executor (WebGL, software or null).
+  ;; Every rule the JS executor applied (strip/fan expansion, flat shading,
+  ;; depthless z clamp, rhw fix, WRAPU/V, BOTHSRCALPHA, supplied projection,
+  ;; points as 2x2 quads, texture decode and invalidation, DIB <-> RGBA) is
+  ;; in this file; the executor sees only generic records.
+  ;;
+  ;; Colour targets are keyed by DIB address, so GPU contents follow the DIB
+  ;; through a Flip; depth buffers follow the attached Z surface, or the
+  ;; render-target entry for the existing private-depth fallback.
+  ;; Pixels come back (READBACK + SYNC) only for CPU access to a GPU-owned
+  ;; DIB (D2b): Lock, GetDC, a CPU Blt/BltFast reading a GPU source, a CPU
+  ;; present and Texture::Load from a target.
+  ;; Flip, Blt-present, clears and a CPU-source BltFast onto a GPU target
+  ;; (re-uploaded, or a keyed textured quad) stay on the GPU. Every readback
+  ;; is counted by its site ($d3dim_fence_site, stats 16..31).
+  ;;
+  ;; $D3DIM_GPS: +0/+4 recursive lock, +8 producer block (wasm), +12 its
+  ;; guest block, +16 ring header, +20 open failed (software for good).
+  ;; ================================================================
+  (global $D3DIM_GPS i32 (region.addr $D3DIM_GPS 0))
+  (global $D3DIM_GPS_SIZE i32 (region.size $D3DIM_GPS))
+  (global $D3G_PB_SIZE i32 (i32.const 24384))
+  ;; The CPU-access site asking for the next readback (stats 16 + site).
+  (global $d3dim_fence_site (mut i32) (i32.const 0))
+  (global $D3G_RING_BYTES i32 (i32.const 1048576))
+  (global $D3G_ARENA_BYTES i32 (i32.const 8388608))
+  (global $D3G_BAND i32 (i32.const 2097152))
+  (global $D3G_TARGETS i32 (i32.const 32))
+  (global $D3G_SHADER_CACHE i32 (i32.const 64))
+  (global $D3G_SAMPLER_CACHE i32 (i32.const 32))
+  ;; Producer block offsets. Tables: targets 32 x 128 B at 1280, depth
+  ;; 32 x 16 B at 5376, shaders 64 x 8 B at 5888, samplers 32 x 8 B at 6400,
+  ;; at 6656 the $gtc texture cache (wasm; 256-byte payloads, see $d3g_texture). Stats are 16 words at 80 (d3dim_gps_stat).
+  ;; Parked primary: +164 dib, +168 pitch, +172 bpp, +176 fmt, +180 height,
+  ;; +184 parked, +188 entry; park slots 4 x 32 B at 23040 ($d3g_slot), the
+  ;; park sequence at 23168, the merge spare slot at 23184. Readbacks per
+  ;; site: 16 words at 23216. At 23280: +0 keyed GPU BltFasts, +4 uploaded
+  ;; GPU BltFasts, +8 key texture id, +12 its w, +16 its h, +20 readback
+  ;; bytes. Decline reasons: 8 words at 23312 ($d3g_decline). At 23344:
+  ;; lazy Locks whose readback a whole-range CPU overwrite made useless
+  ;; ($d3g_discard, stat 43).
+  ;; Target: +0 dib, +4 entry, +8 w, +12 h, +16 bpp, +20 pitch, +24 fmt,
+  ;; +28 rt id, +32 flags (1 dirty, 2 check, 4 drawn, 8 shadow valid,
+  ;; 16 GetDC deferred: the DIB is stale inside the dirty rect),
+  ;; +36..+48 dirty rect, +52 shadow wa, +56 shadow guest, +64 i64 watch
+  ;; generation, +72 watched length (0 none), +76 length.
+  ;; +80 i64 materialized generation, +88 materialized watch valid. A CPU
+  ;; readback is a cache fill, not a new writer of the displayed primary.
+  ;; Texture: +0 root entry, +4 id, +8 w, +12 h, +16 levels, +20 signature,
+  ;; +24 tracked, +32 i64 interior-page generation, +40 range count, +48
+  ;; ranges (wa, len), +240 i64 edge-page generation, +248 i64 edge-byte hash.
+  ;; Target +96..+108: GDI-touched rect of a deferred GetDC (flag 16).
+  ;; At 23348: texture hits proved by edge bytes (stat 44), 23352 deferred
+  ;; GetDCs (stat 45), 23356 targets currently deferred (not a stat).
+  ;; At 23360: 32 window publication owners, 32 bytes each: hwnd, primary
+  ;; entry, current DIB, RT, actual PRESENT record sequence, surface creator,
+  ;; CPU-present stamp.
+
+  (func $d3g_fail
+    (call $host_log_i32 (i32.const 0x44334750))
+    (unreachable))
+
+  (func $d3g_h (result i32) (i32.load offset=16 (global.get $D3DIM_GPS)))
+  (func $d3g_stat (param $pb i32) (param $i i32) (param $n i32)
+    (local $a i32)
+    (local.set $a (i32.add (i32.add (local.get $pb) (i32.const 80)) (i32.shl (local.get $i) (i32.const 2))))
+    (i32.store (local.get $a) (i32.add (i32.load (local.get $a)) (local.get $n))))
+
+  ;; A draw or clear the stream cannot express. There is no software D3DIM
+  ;; rasterizer behind the producer any more, so a decline is counted (stat
+  ;; 1, and d3dim_gps_stat 35 + $why) and then traps loudly, with
+  ;; 0x44334744 'D3GD' and the reason in the log: 0 target not representable
+  ;; (no DIB, over 2048, not 16/32bpp, or the target table full), 1 texture
+  ;; not uploadable, 2 Z function out of range, 3 blend factor out of range,
+  ;; 4 no depth surface, 5 clear target not creatable, 6 clear background
+  ;; without texture words, 7 unused.
+  (func $d3g_decline (param $pb i32) (param $why i32)
+    (local $a i32)
+    (call $d3g_stat (local.get $pb) (i32.const 1) (i32.const 1))
+    (call $gps_stat_api (global.get $GPS_API_D3DIM) (global.get $GPS_STAT_DECLINES) (i32.const 1))
+    (local.set $a (i32.add (i32.add (local.get $pb) (i32.const 23312)) (i32.shl (local.get $why) (i32.const 2))))
+    (i32.store (local.get $a) (i32.add (i32.load (local.get $a)) (i32.const 1)))
+    (call $host_log_i32 (i32.const 0x44334744))
+    (call $host_log_i32 (local.get $why))
+    (unreachable))
+
+  ;; One readback, charged to the CPU-access site that asked for it.
+  (func $d3g_site_stat (param $pb i32)
+    (local $a i32)
+    (local.set $a (i32.add (i32.add (local.get $pb) (i32.const 23216))
+      (i32.shl (i32.and (global.get $d3dim_fence_site) (i32.const 15)) (i32.const 2))))
+    (i32.store (local.get $a) (i32.add (i32.load (local.get $a)) (i32.const 1))))
+
+  ;; Run with $d3dim_fence_site = $site; returns the previous site.
+  (func $d3g_site (param $site i32) (result i32)
+    (local $old i32)
+    (local.set $old (global.get $d3dim_fence_site))
+    (global.set $d3dim_fence_site (local.get $site))
+    (local.get $old))
+
+  (func $d3g_kick (param $pb i32) (param $mode i32) (result i32)
+    (local $h i32)
+    (local.set $h (call $d3g_h))
+    (call $gps_kick_mark (local.get $h))
+    (call $gps_kick (local.get $h) (local.get $mode)))
+
+  (func $d3g_sync (param $pb i32)
+    (call $d3g_stat (local.get $pb) (i32.const 7) (i32.const 1))
+    (if (i32.ne (call $d3g_kick (local.get $pb) (global.get $GPS_KICK_SYNC)) (i32.const 1))
+      (then (call $d3g_fail))))
+
+  ;; Begin a record ($gps_begin_auto hands the consumer a quarter at a time).
+  (func $d3g_begin (param $pb i32) (param $op i32) (param $n i32) (result i32)
+    (call $gps_begin_auto (call $d3g_h) (local.get $op) (local.get $n)))
+
+  (func $d3g_end (param $p i32) (result i32)
+    (call $gps_end (call $d3g_h) (local.get $p) (i32.const 0)))
+
+  (func $d3g_new_id (param $pb i32) (result i32)
+    (local $id i32)
+    (local.set $id (i32.add (i32.load (local.get $pb)) (i32.const 1)))
+    (i32.store (local.get $pb) (local.get $id))
+    (local.get $id))
+
+  (func $d3g_arena (param $n i32) (result i32) (call $gps_arena_alloc (call $d3g_h) (local.get $n)))
+  (func $d3g_aptr (param $pos i32) (result i32) (call $gps_arena_ptr (call $d3g_h) (local.get $pos)))
+
+  (func $d3g_release (param $pb i32) (param $id i32)
+    (if (i32.eqz (local.get $id)) (then (return)))
+    (if (i32.eq (i32.load offset=64 (local.get $pb)) (local.get $id))
+      (then (i32.store offset=64 (local.get $pb) (i32.const -1))))
+    (if (i32.eq (i32.load offset=68 (local.get $pb)) (local.get $id))
+      (then (i32.store offset=64 (local.get $pb) (i32.const -1))
+            (i32.store offset=68 (local.get $pb) (i32.const -1))))
+    (if (i32.eq (i32.load offset=584 (local.get $pb)) (local.get $id))
+      (then (i32.store offset=576 (local.get $pb) (i32.const -1))))
+    (call $gps_release (call $d3g_h) (local.get $id)))
+
+  (func $d3g_create (param $id i32) (param $kind i32) (param $fmt i32) (param $levels i32)
+      (param $w i32) (param $hgt i32)
+    (call $gps_create (call $d3g_h) (local.get $id) (local.get $kind) (local.get $fmt)
+      (local.get $levels) (local.get $w) (local.get $hgt) (i32.const 0)))
+
+  ;; UPLOAD rows [y, y+n) of level $level from arena position $src (pitch w*4).
+  (func $d3g_upload (param $pb i32) (param $id i32) (param $level i32) (param $y i32)
+      (param $w i32) (param $n i32) (param $src i32)
+    (call $d3g_upload_at (local.get $pb) (local.get $id) (local.get $level) (i32.const 0) (local.get $y)
+      (local.get $w) (local.get $n) (local.get $src)))
+
+  ;; UPLOAD a w x n block at (x, y).
+  (func $d3g_upload_at (param $pb i32) (param $id i32) (param $level i32) (param $x i32) (param $y i32)
+      (param $w i32) (param $n i32) (param $src i32)
+    (call $gps_upload (call $d3g_h) (local.get $id) (local.get $level) (i32.const 0)
+      (local.get $x) (local.get $y) (local.get $w) (local.get $n) (i32.shl (local.get $w) (i32.const 2))
+      (local.get $src) (i32.mul (i32.shl (local.get $w) (i32.const 2)) (local.get $n))))
+
+  ;; Rows per band of $w RGBA pixels.
+  (func $d3g_band_rows (param $w i32) (result i32)
+    (local $n i32)
+    (local.set $n (i32.div_u (global.get $D3G_BAND) (i32.shl (local.get $w) (i32.const 2))))
+    (if (result i32) (local.get $n) (then (local.get $n)) (else (i32.const 1))))
+
+  ;; Upload $hgt rows of already-RGBA pixels at wasm $src (pitch w*4).
+  (func $d3g_upload_rgba (param $pb i32) (param $id i32) (param $level i32)
+      (param $w i32) (param $hgt i32) (param $src i32)
+    (local $y i32) (local $n i32) (local $pos i32) (local $band i32)
+    (local.set $band (call $d3g_band_rows (local.get $w)))
+    (block $done (loop $bands
+      (br_if $done (i32.ge_u (local.get $y) (local.get $hgt)))
+      (local.set $n (i32.sub (local.get $hgt) (local.get $y)))
+      (if (i32.gt_u (local.get $n) (local.get $band)) (then (local.set $n (local.get $band))))
+      (local.set $pos (call $d3g_arena (i32.mul (i32.shl (local.get $w) (i32.const 2)) (local.get $n))))
+      (memory.copy (call $d3g_aptr (local.get $pos))
+        (i32.add (local.get $src) (i32.mul (local.get $y) (i32.shl (local.get $w) (i32.const 2))))
+        (i32.mul (i32.shl (local.get $w) (i32.const 2)) (local.get $n)))
+      (call $d3g_upload (local.get $pb) (local.get $id) (local.get $level) (local.get $y)
+        (local.get $w) (local.get $n) (local.get $pos))
+      (local.set $y (i32.add (local.get $y) (local.get $n)))
+      (br $bands))))
+
+  ;; ---- Pixel conversion (the old executor's _upload / _writeBack) -------
+  ;; One DIB row of $w pixels -> R,G,B,A bytes. fmt: 1 RGB565, 3 A1R5G5B5,
+  ;; 4 A4R4G4B4, other 16-bit X1R5G5B5; 32-bit keeps alpha only for fmt 5.
+  (func $d3g_row_to_rgba (param $src i32) (param $dst i32) (param $w i32) (param $fmt i32) (param $bpp i32)
+    (local $x i32) (local $p i32) (local $r i32) (local $g i32) (local $b i32) (local $a i32)
+    (if (i32.eq (local.get $bpp) (i32.const 32)) (then
+      (block $d32 (loop $l32
+        (br_if $d32 (i32.ge_u (local.get $x) (local.get $w)))
+        (local.set $p (i32.load (local.get $src)))
+        (i32.store (local.get $dst)
+          (i32.or
+            (i32.or (i32.and (local.get $p) (i32.const 0x0000ff00))
+              (i32.or (i32.and (i32.shr_u (local.get $p) (i32.const 16)) (i32.const 255))
+                (i32.shl (i32.and (local.get $p) (i32.const 255)) (i32.const 16))))
+            (if (result i32) (i32.eq (local.get $fmt) (i32.const 5))
+              (then (i32.and (local.get $p) (i32.const 0xff000000))) (else (i32.const 0xff000000)))))
+        (local.set $src (i32.add (local.get $src) (i32.const 4)))
+        (local.set $dst (i32.add (local.get $dst) (i32.const 4)))
+        (local.set $x (i32.add (local.get $x) (i32.const 1)))
+        (br $l32)))
+      (return)))
+    (block $d16 (loop $l16
+      (br_if $d16 (i32.ge_u (local.get $x) (local.get $w)))
+      (local.set $p (i32.load16_u (local.get $src)))
+      (local.set $a (i32.const 255))
+      (if (i32.eq (local.get $fmt) (i32.const 4))
+        (then
+          (local.set $r (i32.mul (i32.and (i32.shr_u (local.get $p) (i32.const 8)) (i32.const 15)) (i32.const 17)))
+          (local.set $g (i32.mul (i32.and (i32.shr_u (local.get $p) (i32.const 4)) (i32.const 15)) (i32.const 17)))
+          (local.set $b (i32.mul (i32.and (local.get $p) (i32.const 15)) (i32.const 17)))
+          (local.set $a (i32.mul (i32.shr_u (local.get $p) (i32.const 12)) (i32.const 17))))
+        (else
+          (if (i32.eq (local.get $fmt) (i32.const 1))
+            (then
+              (local.set $r (i32.shr_u (local.get $p) (i32.const 11)))
+              (local.set $g (i32.and (i32.shr_u (local.get $p) (i32.const 5)) (i32.const 63)))
+              (local.set $g (i32.or (i32.shl (local.get $g) (i32.const 2)) (i32.shr_u (local.get $g) (i32.const 4)))))
+            (else
+              (local.set $r (i32.and (i32.shr_u (local.get $p) (i32.const 10)) (i32.const 31)))
+              (local.set $g (i32.and (i32.shr_u (local.get $p) (i32.const 5)) (i32.const 31)))
+              (local.set $g (i32.or (i32.shl (local.get $g) (i32.const 3)) (i32.shr_u (local.get $g) (i32.const 2))))))
+          (local.set $b (i32.and (local.get $p) (i32.const 31)))
+          (local.set $r (i32.or (i32.shl (local.get $r) (i32.const 3)) (i32.shr_u (local.get $r) (i32.const 2))))
+          (local.set $b (i32.or (i32.shl (local.get $b) (i32.const 3)) (i32.shr_u (local.get $b) (i32.const 2))))
+          (if (i32.eq (local.get $fmt) (i32.const 3))
+            (then (local.set $a (select (i32.const 255) (i32.const 0)
+              (i32.ne (i32.and (local.get $p) (i32.const 0x8000)) (i32.const 0))))))))
+      (i32.store (local.get $dst)
+        (i32.or (i32.or (local.get $r) (i32.shl (local.get $g) (i32.const 8)))
+          (i32.or (i32.shl (local.get $b) (i32.const 16)) (i32.shl (local.get $a) (i32.const 24)))))
+      (local.set $src (i32.add (local.get $src) (i32.const 2)))
+      (local.set $dst (i32.add (local.get $dst) (i32.const 4)))
+      (local.set $x (i32.add (local.get $x) (i32.const 1)))
+      (br $l16))))
+
+  ;; R,G,B,A bytes -> one DIB row of $w pixels.
+  (func $d3g_rgba_to_row (param $src i32) (param $dst i32) (param $w i32) (param $fmt i32) (param $bpp i32)
+    (local $x i32) (local $v i32) (local $r i32) (local $g i32) (local $b i32) (local $p i32)
+    (if (i32.eq (local.get $bpp) (i32.const 32)) (then
+      (block $d32 (loop $l32
+        (br_if $d32 (i32.ge_u (local.get $x) (local.get $w)))
+        (local.set $v (i32.load (local.get $src)))
+        (i32.store (local.get $dst)
+          (i32.or
+            (i32.or (i32.and (local.get $v) (i32.const 0x0000ff00))
+              (i32.or (i32.and (i32.shr_u (local.get $v) (i32.const 16)) (i32.const 255))
+                (i32.shl (i32.and (local.get $v) (i32.const 255)) (i32.const 16))))
+            (if (result i32) (i32.eq (local.get $fmt) (i32.const 5))
+              (then (i32.and (local.get $v) (i32.const 0xff000000))) (else (i32.const 0xff000000)))))
+        (local.set $src (i32.add (local.get $src) (i32.const 4)))
+        (local.set $dst (i32.add (local.get $dst) (i32.const 4)))
+        (local.set $x (i32.add (local.get $x) (i32.const 1)))
+        (br $l32)))
+      (return)))
+    (block $d16 (loop $l16
+      (br_if $d16 (i32.ge_u (local.get $x) (local.get $w)))
+      (local.set $v (i32.load (local.get $src)))
+      (local.set $r (i32.and (local.get $v) (i32.const 255)))
+      (local.set $g (i32.and (i32.shr_u (local.get $v) (i32.const 8)) (i32.const 255)))
+      (local.set $b (i32.and (i32.shr_u (local.get $v) (i32.const 16)) (i32.const 255)))
+      (if (i32.eq (local.get $fmt) (i32.const 4))
+        (then (local.set $p (i32.or
+          (i32.or (i32.shl (i32.shr_u (local.get $v) (i32.const 28)) (i32.const 12))
+            (i32.shl (i32.shr_u (local.get $r) (i32.const 4)) (i32.const 8)))
+          (i32.or (i32.shl (i32.shr_u (local.get $g) (i32.const 4)) (i32.const 4))
+            (i32.shr_u (local.get $b) (i32.const 4))))))
+        (else (if (i32.eq (local.get $fmt) (i32.const 1))
+          (then (local.set $p (i32.or
+            (i32.or (i32.shl (i32.shr_u (local.get $r) (i32.const 3)) (i32.const 11))
+              (i32.shl (i32.shr_u (local.get $g) (i32.const 2)) (i32.const 5)))
+            (i32.shr_u (local.get $b) (i32.const 3)))))
+          (else (local.set $p (i32.or
+            (i32.or (i32.shl (i32.shr_u (local.get $r) (i32.const 3)) (i32.const 10))
+              (i32.shl (i32.shr_u (local.get $g) (i32.const 3)) (i32.const 5)))
+            (i32.or (i32.shr_u (local.get $b) (i32.const 3))
+              (select (i32.const 0x8000) (i32.const 0)
+                (i32.and (i32.eq (local.get $fmt) (i32.const 3))
+                  (i32.ge_u (i32.shr_u (local.get $v) (i32.const 24)) (i32.const 128)))))))))))
+      (i32.store16 (local.get $dst) (local.get $p))
+      (local.set $src (i32.add (local.get $src) (i32.const 4)))
+      (local.set $dst (i32.add (local.get $dst) (i32.const 2)))
+      (local.set $x (i32.add (local.get $x) (i32.const 1)))
+      (br $l16))))
+
+  (func $d3g_row_eq (param $a i32) (param $b i32) (param $n i32) (result i32)
+    (local $i i32)
+    (block $tail (loop $words
+      (br_if $tail (i32.gt_u (i32.add (local.get $i) (i32.const 8)) (local.get $n)))
+      (if (i64.ne (i64.load (i32.add (local.get $a) (local.get $i))) (i64.load (i32.add (local.get $b) (local.get $i))))
+        (then (return (i32.const 0))))
+      (local.set $i (i32.add (local.get $i) (i32.const 8)))
+      (br $words)))
+    (block $done (loop $bytes
+      (br_if $done (i32.ge_u (local.get $i) (local.get $n)))
+      (if (i32.ne (i32.load8_u (i32.add (local.get $a) (local.get $i))) (i32.load8_u (i32.add (local.get $b) (local.get $i))))
+        (then (return (i32.const 0))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $bytes)))
+    (i32.const 1))
+
+  ;; ---- Page-watch generations ------------------------------------------
+  (func $d3g_watch_ok (result i32)
+    (i32.eqz (i32.atomic.load offset=2048 (global.get $PAGE_WATCH_ROOT))))
+
+  ;; Sum of the watch generations of every page under [wa, wa+len); -1 unknown.
+  (func $d3g_gensum (param $wa i32) (param $len i32) (result i64)
+    (local $page i32) (local $end i32) (local $cell i32) (local $sum i64)
+    (if (i32.eqz (local.get $len)) (then (return (i64.const 0))))
+    (local.set $page (i32.and (local.get $wa) (i32.const -4096)))
+    (local.set $end (i32.add (local.get $wa) (local.get $len)))
+    (loop $pages
+      (local.set $cell (call $page_watch_cell (local.get $page)))
+      (if (i32.eqz (local.get $cell)) (then (return (i64.const -1))))
+      (local.set $sum (i64.add (local.get $sum) (i64.atomic.load offset=8 (local.get $cell))))
+      (local.set $page (i32.add (local.get $page) (i32.const 4096)))
+      (br_if $pages (i32.lt_u (local.get $page) (local.get $end))))
+    (local.get $sum))
+
+  (func $d3g_overlap (param $a i32) (param $al i32) (param $b i32) (param $bl i32) (result i32)
+    (i32.and
+      (i64.lt_u (i64.extend_i32_u (local.get $a)) (i64.add (i64.extend_i32_u (local.get $b)) (i64.extend_i32_u (local.get $bl))))
+      (i64.lt_u (i64.extend_i32_u (local.get $b)) (i64.add (i64.extend_i32_u (local.get $a)) (i64.extend_i32_u (local.get $al))))))
+
+  ;; ---- Open --------------------------------------------------------------
+  (func $d3g_layout (param $pb i32) (param $stride i32) (param $tex_type i32) (result i32)
+    (local $id i32) (local $p i32) (local $e i32) (local $i i32)
+    (local.set $id (call $d3g_new_id (local.get $pb)))
+    (local.set $p (call $d3g_begin (local.get $pb) (global.get $GPS_OP_LAYOUT)
+      (i32.add (size-of GpsLayout) (i32.mul (i32.const 4) (size-of GpsLayoutElem)))))
+    (store.field GpsLayout id (local.get $p) (local.get $id))
+    (store.field GpsLayout count (local.get $p) (i32.const 4))
+    (store.field GpsLayout stride (local.get $p) (local.get $stride))
+    (loop $elems
+      (local.set $e (i32.add (i32.add (local.get $p) (size-of GpsLayout)) (i32.mul (local.get $i) (size-of GpsLayoutElem))))
+      (store.field GpsLayoutElem slot (local.get $e) (i32.const 0))
+      (store.field GpsLayoutElem type (local.get $e)
+        (if (result i32) (i32.eqz (local.get $i)) (then (global.get $GPS_VTYPE_FLOAT4))
+          (else (if (result i32) (i32.eq (local.get $i) (i32.const 3)) (then (local.get $tex_type))
+            (else (global.get $GPS_VTYPE_D3DCOLOR))))))
+      (store.field GpsLayoutElem usage (local.get $e)
+        (if (result i32) (i32.eqz (local.get $i)) (then (global.get $GPS_USAGE_POSITIONT))
+          (else (if (result i32) (i32.eq (local.get $i) (i32.const 3)) (then (global.get $GPS_USAGE_TEXCOORD))
+            (else (global.get $GPS_USAGE_COLOR))))))
+      (store.field GpsLayoutElem index (local.get $e) (select (i32.const 1) (i32.const 0) (i32.eq (local.get $i) (i32.const 2))))
+      (store.field GpsLayoutElem offset (local.get $e)
+        (if (result i32) (i32.eqz (local.get $i)) (then (i32.const 0))
+          (else (i32.add (i32.const 12) (i32.shl (local.get $i) (i32.const 2))))))
+      (store.field GpsLayoutElem pad (local.get $e) (i32.const 0))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $elems (i32.lt_u (local.get $i) (i32.const 4))))
+    (drop (call $d3g_end (local.get $p)))
+    (local.get $id))
+
+  ;; The producer block, opening the ring on first use. 0 = no executor
+  ;; (the counted software fallback takes every draw).
+  (func $d3g_pb (result i32)
+    (local $pb i32) (local $guest i32) (local $h i32)
+    (local.set $pb (i32.load offset=8 (global.get $D3DIM_GPS)))
+    (if (local.get $pb) (then (return (local.get $pb))))
+    (local.set $guest (call $gps_alloc (global.get $D3G_PB_SIZE)))
+    (if (i32.eqz (local.get $guest)) (then (call $d3g_fail)))
+    (local.set $pb (call $gps_wa (local.get $guest)))
+    (memory.fill (local.get $pb) (i32.const 0) (global.get $D3G_PB_SIZE))
+    (i32.store offset=12 (global.get $D3DIM_GPS) (local.get $guest))
+    (local.set $guest (call $gps_alloc (i32.const 12352)))
+    (if (i32.eqz (local.get $guest)) (then (call $d3g_fail)))
+    (i32.store offset=36 (local.get $pb) (local.get $guest))
+    (i32.store offset=32 (local.get $pb) (call $gps_wa (local.get $guest)))
+    (i32.store offset=64 (local.get $pb) (i32.const -1))
+    (i32.store offset=576 (local.get $pb) (i32.const -1))
+    (local.set $h (call $d3g_h))
+    (if (i32.eqz (local.get $h)) (then
+      (local.set $h (call $gps_ring_open (global.get $GPS_API_D3DIM)
+        (global.get $D3G_RING_BYTES) (global.get $D3G_ARENA_BYTES)))
+      (if (i32.eqz (local.get $h)) (then (call $d3g_fail)))
+      (i32.store offset=16 (global.get $D3DIM_GPS) (local.get $h))))
+    (i32.store offset=4 (local.get $pb) (call $d3g_layout (local.get $pb) (i32.const 32) (global.get $GPS_VTYPE_FLOAT2)))
+    (i32.store offset=8 (local.get $pb) (call $d3g_layout (local.get $pb) (i32.const 40) (global.get $GPS_VTYPE_FLOAT4)))
+    ;; No executor took the opening kick: D3DIM has no other renderer.
+    (if (i32.ne (call $d3g_kick (local.get $pb) (global.get $GPS_KICK_SYNC)) (i32.const 1))
+      (then (call $d3g_fail)))
+    (i32.store offset=8 (global.get $D3DIM_GPS) (local.get $pb))
+    (local.get $pb))
+
+  ;; ---- Targets -----------------------------------------------------------
+  (func $d3g_t (param $pb i32) (param $i i32) (result i32)
+    (i32.add (i32.add (local.get $pb) (i32.const 1280)) (i32.shl (local.get $i) (i32.const 7))))
+
+  (func $d3g_find (param $pb i32) (param $dib i32) (result i32)
+    (local $i i32) (local $t i32)
+    (if (i32.eqz (local.get $dib)) (then (return (i32.const 0))))
+    (loop $scan
+      (local.set $t (call $d3g_t (local.get $pb) (local.get $i)))
+      (if (i32.eq (i32.load (local.get $t)) (local.get $dib)) (then (return (local.get $t))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $scan (i32.lt_u (local.get $i) (global.get $D3G_TARGETS))))
+    (i32.const 0))
+
+  ;; Read-only fallback policy for one live surface and its CURRENT allocation.
+  ;; Dirty GPU pixels, and a read-only materialization of those pixels, are
+  ;; not CPU publications. The normal retained-Lock path resumes as soon as
+  ;; the watched allocation is written. Targets are cleared by final release;
+  ;; a recycled slot/address cannot inherit this ownership.
+  (func (export "d3dim_gps_dib_is_derived") (param $slot i32) (param $dib i32) (result i32)
+    (local $pb i32) (local $entry i32) (local $t i32)
+    (if (i32.ge_u (local.get $slot) (global.get $DX_MAX)) (then (return (i32.const 0))))
+    (local.set $entry (i32.add (global.get $DX_OBJECTS) (i32.shl (local.get $slot) (i32.const 5))))
+    (if (i32.or (i32.ne (load.field DxObject type (local.get $entry)) (i32.const 2))
+          (i32.ne (load.field DxObject misc1 (local.get $entry)) (local.get $dib)))
+      (then (return (i32.const 0))))
+    (local.set $pb (i32.load offset=8 (global.get $D3DIM_GPS)))
+    (if (i32.eqz (local.get $pb)) (then (return (i32.const 0))))
+    (if (i32.and (i32.ne (i32.load offset=184 (local.get $pb)) (i32.const 0))
+          (i32.and (i32.eq (i32.load offset=188 (local.get $pb)) (local.get $entry))
+                   (i32.eq (i32.load offset=164 (local.get $pb)) (local.get $dib))))
+      (then (return (i32.const 1))))
+    (local.set $t (call $d3g_find (local.get $pb) (local.get $dib)))
+    (if (i32.eqz (local.get $t)) (then (return (i32.const 0))))
+    (if (i32.or (i32.ne (load.field DxObject width (local.get $entry)) (i32.load offset=8 (local.get $t)))
+          (i32.or (i32.ne (load.field DxObject height (local.get $entry)) (i32.load offset=12 (local.get $t)))
+            (i32.or (i32.ne (load.field DxObject pitch (local.get $entry)) (i32.load offset=20 (local.get $t)))
+                    (i32.ne (load.field DxObject bpp (local.get $entry)) (i32.load offset=16 (local.get $t))))))
+      (then (return (i32.const 0))))
+    (if (i32.and (i32.load offset=32 (local.get $t)) (i32.const 1)) (then (return (i32.const 1))))
+    (if (i32.and (i32.ne (i32.load offset=88 (local.get $t)) (i32.const 0)) (call $d3g_watch_ok)) (then
+      (return (i64.eq (i64.load offset=80 (local.get $t))
+        (call $d3g_gensum (local.get $dib) (i32.load offset=76 (local.get $t)))))))
+    (i32.const 0))
+
+  ;; Read RT $id's rect (x, y, w, hgt) back into DIB $dib at (dx, dy).
+  (func (export "d3dim_gps_dib_cpu_generation") (param $slot i32) (param $dib i32) (result i64)
+    (local $pb i32) (local $entry i32) (local $t i32)
+    (if (i32.ge_u (local.get $slot) (global.get $DX_MAX)) (then (return (i64.const -1))))
+    (local.set $entry (i32.add (global.get $DX_OBJECTS) (i32.shl (local.get $slot) (i32.const 5))))
+    (if (i32.or (i32.ne (load.field DxObject type (local.get $entry)) (i32.const 2))
+          (i32.ne (load.field DxObject misc1 (local.get $entry)) (local.get $dib)))
+      (then (return (i64.const -1))))
+    (local.set $pb (i32.load offset=8 (global.get $D3DIM_GPS)))
+    (if (i32.eqz (local.get $pb)) (then (return (i64.const -1))))
+    (local.set $t (call $d3g_find (local.get $pb) (local.get $dib)))
+    (if (i32.eqz (local.get $t)) (then (return (i64.const -1))))
+    (if (i32.or (i32.eqz (i32.load offset=72 (local.get $t))) (i32.eqz (call $d3g_watch_ok)))
+      (then (return (i64.const -1))))
+    (call $d3g_gensum (local.get $dib) (i32.load offset=76 (local.get $t))))
+
+  ;; Read RT $id's rect (x, y, w, hgt) back into DIB $dib at (dx, dy).
+  (func $d3g_read_rect (param $pb i32) (param $id i32) (param $x i32) (param $y i32) (param $w i32) (param $hgt i32)
+      (param $dib i32) (param $pitch i32) (param $bpp i32) (param $fmt i32) (param $dx i32) (param $dy i32)
+    ;; One READBACK per 2 MB band ($gps_readback_rect).
+    (call $d3g_stat (local.get $pb) (i32.const 7)
+      (call $gps_readback_rect (call $d3g_h) (local.get $id) (local.get $x) (local.get $y) (local.get $w) (local.get $hgt)
+        (i32.add (i32.add (local.get $dib) (i32.mul (local.get $dy) (local.get $pitch)))
+          (i32.mul (local.get $dx) (i32.shr_u (local.get $bpp) (i32.const 3))))
+        (local.get $pitch) (local.get $fmt) (local.get $bpp)))
+    (call $page_watch_write
+      (i32.add (i32.add (local.get $dib) (i32.mul (local.get $dy) (local.get $pitch)))
+        (i32.mul (local.get $dx) (i32.shr_u (local.get $bpp) (i32.const 3))))
+      (i32.add (i32.mul (i32.sub (local.get $hgt) (i32.const 1)) (local.get $pitch))
+        (i32.mul (local.get $w) (i32.shr_u (local.get $bpp) (i32.const 3)))))
+    (call $d3g_stat (local.get $pb) (i32.const 2) (i32.const 1))
+    (call $d3g_site_stat (local.get $pb))
+    (i32.store offset=23300 (local.get $pb) (i32.add (i32.load offset=23300 (local.get $pb))
+      (i32.mul (i32.mul (local.get $w) (local.get $hgt)) (i32.shr_u (local.get $bpp) (i32.const 3)))))
+    (call $d3g_stat (local.get $pb) (i32.const 3) (local.get $hgt)))
+
+  ;; GPU-modified pixels of $t -> its DIB (and shadow); clears dirty.
+  (func $d3g_readback (param $pb i32) (param $t i32)
+    (local $l i32) (local $tp i32) (local $r i32) (local $b i32) (local $y i32) (local $off i32)
+    (call $d3g_gdi_flush (local.get $pb) (local.get $t))
+    (if (i32.eqz (i32.and (i32.load offset=32 (local.get $t)) (i32.const 1))) (then (return)))
+    (local.set $l (i32.load offset=36 (local.get $t)))
+    (local.set $tp (i32.load offset=40 (local.get $t)))
+    (local.set $r (i32.load offset=44 (local.get $t)))
+    (local.set $b (i32.load offset=48 (local.get $t)))
+    (if (i32.or (i32.le_s (local.get $r) (local.get $l)) (i32.le_s (local.get $b) (local.get $tp))) (then
+      (i32.store offset=32 (local.get $t) (i32.and (i32.load offset=32 (local.get $t)) (i32.const -2)))
+      (return)))
+    (call $d3g_read_rect (local.get $pb) (i32.load offset=28 (local.get $t))
+      (local.get $l) (local.get $tp) (i32.sub (local.get $r) (local.get $l)) (i32.sub (local.get $b) (local.get $tp))
+      (i32.load (local.get $t)) (i32.load offset=20 (local.get $t)) (i32.load offset=16 (local.get $t))
+      (i32.load offset=24 (local.get $t)) (local.get $l) (local.get $tp))
+    (if (i32.and (i32.load offset=32 (local.get $t)) (i32.const 8)) (then
+      (local.set $y (local.get $tp))
+      (block $done (loop $rows
+        (br_if $done (i32.ge_u (local.get $y) (local.get $b)))
+        (local.set $off (i32.add (i32.mul (local.get $y) (i32.load offset=20 (local.get $t)))
+          (i32.mul (local.get $l) (i32.shr_u (i32.load offset=16 (local.get $t)) (i32.const 3)))))
+        (memory.copy (i32.add (i32.load offset=52 (local.get $t)) (local.get $off))
+          (i32.add (i32.load (local.get $t)) (local.get $off))
+          (i32.mul (i32.sub (local.get $r) (local.get $l)) (i32.shr_u (i32.load offset=16 (local.get $t)) (i32.const 3))))
+        (local.set $y (i32.add (local.get $y) (i32.const 1)))
+        (br $rows)))))
+    (i32.store offset=88 (local.get $t) (i32.const 0))
+    (if (i32.and (i32.ne (i32.load offset=72 (local.get $t)) (i32.const 0)) (call $d3g_watch_ok)) (then
+      (i64.store offset=80 (local.get $t)
+        (call $d3g_gensum (i32.load (local.get $t)) (i32.load offset=76 (local.get $t))))
+      (i32.store offset=88 (local.get $t) (i32.const 1))))
+    ;; Keep GPU ownership while the consumer/readback conversion is in flight.
+    ;; A page-side fallback must never publish an incomplete materialization.
+    (i32.store offset=32 (local.get $t) (i32.and (i32.load offset=32 (local.get $t)) (i32.const -2))))
+
+  ;; Union a dirty rect (floats, already padded) into $t; $bounded 0 = all.
+  (func $d3g_mark (param $t i32) (param $bounded i32) (param $l f32) (param $tp f32) (param $r f32) (param $b f32)
+    (local $il i32) (local $it i32) (local $ir i32) (local $ib i32) (local $w i32) (local $hgt i32)
+    (local.set $w (i32.load offset=8 (local.get $t)))
+    (local.set $hgt (i32.load offset=12 (local.get $t)))
+    (if (local.get $bounded)
+      (then
+        (local.set $il (i32.trunc_sat_f32_s (f32.floor (f32.max (local.get $l) (f32.const 0)))))
+        (local.set $it (i32.trunc_sat_f32_s (f32.floor (f32.max (local.get $tp) (f32.const 0)))))
+        (local.set $ir (i32.trunc_sat_f32_s (f32.ceil (f32.min (local.get $r) (f32.convert_i32_s (local.get $w))))))
+        (local.set $ib (i32.trunc_sat_f32_s (f32.ceil (f32.min (local.get $b) (f32.convert_i32_s (local.get $hgt))))))
+        (if (i32.or (i32.le_s (local.get $ir) (local.get $il)) (i32.le_s (local.get $ib) (local.get $it)))
+          (then (return))))
+      (else (local.set $ir (local.get $w)) (local.set $ib (local.get $hgt))))
+    (if (i32.and (i32.load offset=32 (local.get $t)) (i32.const 1)) (then
+      (if (i32.gt_s (local.get $il) (i32.load offset=36 (local.get $t))) (then (local.set $il (i32.load offset=36 (local.get $t)))))
+      (if (i32.gt_s (local.get $it) (i32.load offset=40 (local.get $t))) (then (local.set $it (i32.load offset=40 (local.get $t)))))
+      (if (i32.lt_s (local.get $ir) (i32.load offset=44 (local.get $t))) (then (local.set $ir (i32.load offset=44 (local.get $t)))))
+      (if (i32.lt_s (local.get $ib) (i32.load offset=48 (local.get $t))) (then (local.set $ib (i32.load offset=48 (local.get $t)))))))
+    (i32.store offset=36 (local.get $t) (local.get $il))
+    (i32.store offset=40 (local.get $t) (local.get $it))
+    (i32.store offset=44 (local.get $t) (local.get $ir))
+    (i32.store offset=48 (local.get $t) (local.get $ib))
+    (i32.store offset=32 (local.get $t) (i32.or (i32.load offset=32 (local.get $t)) (i32.const 5))))
+
+  (func $d3g_target_drop (param $pb i32) (param $t i32) (param $read i32)
+    (if (local.get $read) (then (call $d3g_readback (local.get $pb) (local.get $t))))
+    (if (i32.and (i32.load offset=32 (local.get $t)) (i32.const 16))
+      (then (i32.store offset=23356 (local.get $pb) (i32.sub (i32.load offset=23356 (local.get $pb)) (i32.const 1)))))
+    (call $d3g_release (local.get $pb) (i32.load offset=28 (local.get $t)))
+    (if (i32.load offset=56 (local.get $t)) (then (call $heap_free (i32.load offset=56 (local.get $t)))))
+    (if (i32.load offset=72 (local.get $t))
+      (then (call $page_watch_release (i32.load (local.get $t)) (i32.load offset=72 (local.get $t)))))
+    (memory.fill (local.get $t) (i32.const 0) (i32.const 128)))
+
+  ;; The GPS colour target holding DIB $dib (created on first use), or 0
+  ;; when this surface cannot be a GPU target.
+  (func $d3g_target (param $pb i32) (param $entry i32) (param $dib i32) (param $w i32) (param $hgt i32)
+      (param $bpp i32) (param $pitch i32) (param $fmt i32) (result i32)
+    (local $t i32) (local $i i32) (local $len i32) (local $guest i32) (local $id i32)
+    (if (i32.or (i32.or (i32.eqz (local.get $dib)) (i32.eqz (local.get $w))) (i32.eqz (local.get $hgt)))
+      (then (return (i32.const 0))))
+    (if (i32.or (i32.gt_u (local.get $w) (i32.const 2048)) (i32.gt_u (local.get $hgt) (i32.const 2048)))
+      (then (return (i32.const 0))))
+    (if (i32.and (i32.ne (local.get $bpp) (i32.const 16)) (i32.ne (local.get $bpp) (i32.const 32)))
+      (then (return (i32.const 0))))
+    (local.set $t (call $d3g_find (local.get $pb) (local.get $dib)))
+    (if (local.get $t) (then
+      (if (i32.and
+            (i32.and (i32.eq (i32.load offset=8 (local.get $t)) (local.get $w))
+                     (i32.eq (i32.load offset=12 (local.get $t)) (local.get $hgt)))
+            (i32.and (i32.and (i32.eq (i32.load offset=16 (local.get $t)) (local.get $bpp))
+                              (i32.eq (i32.load offset=20 (local.get $t)) (local.get $pitch)))
+                     (i32.eq (i32.load offset=24 (local.get $t)) (local.get $fmt))))
+        (then
+          (i32.store offset=4 (local.get $t) (local.get $entry))
+          (return (local.get $t))))
+      (local.set $i (call $d3g_site (i32.const 12)))
+      (call $d3g_target_drop (local.get $pb) (local.get $t) (i32.const 1))
+      (drop (call $d3g_site (local.get $i)))
+      (local.set $i (i32.const 0))))
+    (local.set $t (call $d3g_find (local.get $pb) (i32.const 0)))
+    (block $found (loop $scan
+      (local.set $t (call $d3g_t (local.get $pb) (local.get $i)))
+      (br_if $found (i32.eqz (i32.load (local.get $t))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $scan (i32.lt_u (local.get $i) (global.get $D3G_TARGETS)))
+      (return (i32.const 0))))
+    (local.set $id (call $d3g_new_id (local.get $pb)))
+    (call $d3g_create (local.get $id) (global.get $GPS_KIND_RT) (global.get $GPS_FMT_A8B8G8R8)
+      (i32.const 1) (local.get $w) (local.get $hgt))
+    (local.set $len (i32.mul (local.get $pitch) (local.get $hgt)))
+    (i32.store (local.get $t) (local.get $dib))
+    (i32.store offset=4 (local.get $t) (local.get $entry))
+    (i32.store offset=8 (local.get $t) (local.get $w))
+    (i32.store offset=12 (local.get $t) (local.get $hgt))
+    (i32.store offset=16 (local.get $t) (local.get $bpp))
+    (i32.store offset=20 (local.get $t) (local.get $pitch))
+    (i32.store offset=24 (local.get $t) (local.get $fmt))
+    (i32.store offset=28 (local.get $t) (local.get $id))
+    (i32.store offset=32 (local.get $t) (i32.const 2))
+    (i32.store offset=76 (local.get $t) (local.get $len))
+    (local.set $guest (call $gps_alloc (local.get $len)))
+    (if (local.get $guest) (then
+      (i32.store offset=56 (local.get $t) (local.get $guest))
+      (i32.store offset=52 (local.get $t) (call $gps_wa (local.get $guest)))))
+    (if (call $page_watch_acquire (local.get $dib) (local.get $len))
+      (then (i32.store offset=72 (local.get $t) (local.get $len))))
+    (local.get $t))
+
+  ;; DIB rows [top, bottom) -> the GPU copy (and the shadow).
+  (func $d3g_upload_rows (param $pb i32) (param $t i32) (param $top i32) (param $bottom i32)
+    (local $w i32) (local $y i32) (local $n i32) (local $k i32) (local $pos i32) (local $dst i32)
+    (local $band i32) (local $pitch i32)
+    (local.set $w (i32.load offset=8 (local.get $t)))
+    (local.set $pitch (i32.load offset=20 (local.get $t)))
+    (local.set $band (call $d3g_band_rows (local.get $w)))
+    (local.set $y (local.get $top))
+    (block $done (loop $bands
+      (br_if $done (i32.ge_u (local.get $y) (local.get $bottom)))
+      (local.set $n (i32.sub (local.get $bottom) (local.get $y)))
+      (if (i32.gt_u (local.get $n) (local.get $band)) (then (local.set $n (local.get $band))))
+      (local.set $pos (call $d3g_arena (i32.mul (i32.shl (local.get $w) (i32.const 2)) (local.get $n))))
+      (local.set $dst (call $d3g_aptr (local.get $pos)))
+      (local.set $k (i32.const 0))
+      (block $rows_done (loop $rows
+        (br_if $rows_done (i32.ge_u (local.get $k) (local.get $n)))
+        (call $d3g_row_to_rgba
+          (i32.add (i32.load (local.get $t)) (i32.mul (i32.add (local.get $y) (local.get $k)) (local.get $pitch)))
+          (i32.add (local.get $dst) (i32.mul (local.get $k) (i32.shl (local.get $w) (i32.const 2))))
+          (local.get $w) (i32.load offset=24 (local.get $t)) (i32.load offset=16 (local.get $t)))
+        (local.set $k (i32.add (local.get $k) (i32.const 1)))
+        (br $rows)))
+      (call $d3g_upload (local.get $pb) (i32.load offset=28 (local.get $t)) (i32.const 0)
+        (local.get $y) (local.get $w) (local.get $n) (local.get $pos))
+      (local.set $y (i32.add (local.get $y) (local.get $n)))
+      (br $bands)))
+    (if (i32.load offset=52 (local.get $t)) (then
+      (memory.copy (i32.add (i32.load offset=52 (local.get $t)) (i32.mul (local.get $top) (local.get $pitch)))
+        (i32.add (i32.load (local.get $t)) (i32.mul (local.get $top) (local.get $pitch)))
+        (i32.mul (i32.sub (local.get $bottom) (local.get $top)) (local.get $pitch)))
+      (if (i32.and (i32.eqz (local.get $top)) (i32.eq (local.get $bottom) (i32.load offset=12 (local.get $t))))
+        (then (i32.store offset=32 (local.get $t) (i32.or (i32.load offset=32 (local.get $t)) (i32.const 8)))))))
+    (call $d3g_stat (local.get $pb) (i32.const 4) (i32.const 1))
+    (call $d3g_stat (local.get $pb) (i32.const 5) (i32.sub (local.get $bottom) (local.get $top))))
+
+  ;; Bring the GPU copy up to date with the DIB before drawing on it, unless
+  ;; the next op overwrites every pixel ($all). Only rows that differ from
+  ;; the shadow (what the GPU holds) go up; an unchanged watch skips it all.
+  (func $d3g_prepare (param $pb i32) (param $t i32) (param $all i32)
+    (local $flags i32) (local $top i32) (local $bottom i32) (local $rb i32) (local $pitch i32)
+    (local $sh i32) (local $dib i32)
+    ;; GPU work on a target whose DC is still deferred: land it first, and
+    ;; from here on that DC is an ordinary one over a current DIB.
+    (if (i32.and (i32.load offset=32 (local.get $t)) (i32.const 16)) (then
+      (call $d3g_gdi_flush (local.get $pb) (local.get $t))
+      (i32.store offset=32 (local.get $t) (i32.or (i32.load offset=32 (local.get $t)) (i32.const 2)))))
+    (local.set $flags (i32.load offset=32 (local.get $t)))
+    (if (i32.eqz (i32.and (local.get $flags) (i32.const 2))) (then (return)))
+    (if (i32.and (local.get $flags) (i32.const 1)) (then
+      (local.set $sh (call $d3g_site (i32.const 10)))
+      (call $d3g_readback (local.get $pb) (local.get $t))
+      (drop (call $d3g_site (local.get $sh)))))
+    (if (i32.eqz (local.get $all)) (then
+      (local.set $bottom (i32.load offset=12 (local.get $t)))
+      (local.set $flags (i32.load offset=32 (local.get $t)))
+      (if (i32.and (i32.and (i32.ne (i32.and (local.get $flags) (i32.const 8)) (i32.const 0))
+                            (i32.ne (i32.load offset=72 (local.get $t)) (i32.const 0)))
+                   (call $d3g_watch_ok))
+        (then
+          (if (i64.eq (call $d3g_gensum (i32.load (local.get $t)) (i32.load offset=76 (local.get $t)))
+                (i64.load offset=64 (local.get $t)))
+            (then (local.set $bottom (i32.const 0))))))
+      (if (i32.and (i32.gt_s (local.get $bottom) (local.get $top))
+            (i32.ne (i32.and (local.get $flags) (i32.const 8)) (i32.const 0))) (then
+        (local.set $pitch (i32.load offset=20 (local.get $t)))
+        (local.set $rb (i32.mul (i32.load offset=8 (local.get $t)) (i32.shr_u (i32.load offset=16 (local.get $t)) (i32.const 3))))
+        (local.set $sh (i32.load offset=52 (local.get $t)))
+        (local.set $dib (i32.load (local.get $t)))
+        (block $t_done (loop $trim_top
+          (br_if $t_done (i32.ge_s (local.get $top) (local.get $bottom)))
+          (br_if $t_done (i32.eqz (call $d3g_row_eq (i32.add (local.get $dib) (i32.mul (local.get $top) (local.get $pitch)))
+            (i32.add (local.get $sh) (i32.mul (local.get $top) (local.get $pitch))) (local.get $rb))))
+          (local.set $top (i32.add (local.get $top) (i32.const 1)))
+          (br $trim_top)))
+        (block $b_done (loop $trim_bottom
+          (br_if $b_done (i32.le_s (local.get $bottom) (local.get $top)))
+          (br_if $b_done (i32.eqz (call $d3g_row_eq
+            (i32.add (local.get $dib) (i32.mul (i32.sub (local.get $bottom) (i32.const 1)) (local.get $pitch)))
+            (i32.add (local.get $sh) (i32.mul (i32.sub (local.get $bottom) (i32.const 1)) (local.get $pitch))) (local.get $rb))))
+          (local.set $bottom (i32.sub (local.get $bottom) (i32.const 1)))
+          (br $trim_bottom)))))
+      (if (i32.gt_s (local.get $bottom) (local.get $top))
+        (then (call $d3g_upload_rows (local.get $pb) (local.get $t) (local.get $top) (local.get $bottom))))))
+    (if (i32.load offset=72 (local.get $t))
+      (then (i64.store offset=64 (local.get $t)
+        (call $d3g_gensum (i32.load (local.get $t)) (i32.load offset=76 (local.get $t))))))
+    (i32.store offset=32 (local.get $t) (i32.and (i32.load offset=32 (local.get $t)) (i32.const -3))))
+
+  ;; Resolve attachment identity on every use: changing an RT's attached Z
+  ;; must select that surface's plane, and moving a Z between RTs keeps it.
+  ;; With no suitable attachment retain the private per-RT plane.
+  ;; Fresh DS reads 1.0; CPU depth import is a separate limitation.
+  (func $d3g_depth (param $pb i32) (param $entry i32) (param $w i32) (param $hgt i32) (param $create i32) (result i32)
+    (local $i i32) (local $e i32) (local $free i32) (local $id i32) (local $z i32)
+    (local.set $z (call $d3dim_attached_zbuffer (local.get $entry)))
+    (if (local.get $z) (then (local.set $entry (local.get $z))))
+    (loop $scan
+      (local.set $e (i32.add (i32.add (local.get $pb) (i32.const 5376)) (i32.shl (local.get $i) (i32.const 4))))
+      (if (i32.eq (i32.load (local.get $e)) (local.get $entry)) (then
+        (if (i32.and (i32.eq (i32.load offset=4 (local.get $e)) (local.get $w))
+                     (i32.eq (i32.load offset=8 (local.get $e)) (local.get $hgt)))
+          (then (return (i32.load offset=12 (local.get $e)))))
+        (call $d3g_release (local.get $pb) (i32.load offset=12 (local.get $e)))
+        (i32.store (local.get $e) (i32.const 0))))
+      (if (i32.and (i32.eqz (local.get $free)) (i32.eqz (i32.load (local.get $e))))
+        (then (local.set $free (local.get $e))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $scan (i32.lt_u (local.get $i) (i32.const 32))))
+    (if (i32.eqz (local.get $create)) (then (return (i32.const 0))))
+    (if (i32.eqz (local.get $free)) (then (return (i32.const 0))))
+    (local.set $id (call $d3g_new_id (local.get $pb)))
+    (call $d3g_create (local.get $id) (global.get $GPS_KIND_DS) (global.get $GPS_FMT_D16)
+      (i32.const 1) (local.get $w) (local.get $hgt))
+    (i32.store (local.get $free) (local.get $entry))
+    (i32.store offset=4 (local.get $free) (local.get $w))
+    (i32.store offset=8 (local.get $free) (local.get $hgt))
+    (i32.store offset=12 (local.get $free) (local.get $id))
+    (local.get $id))
+
+  (func $d3g_targets (param $pb i32) (param $color i32) (param $depth i32)
+    (local $p i32)
+    (if (i32.and (i32.eq (i32.load offset=64 (local.get $pb)) (local.get $color))
+                 (i32.eq (i32.load offset=68 (local.get $pb)) (local.get $depth))) (then (return)))
+    (local.set $p (call $d3g_begin (local.get $pb) (global.get $GPS_OP_TARGETS) (size-of GpsTargets)))
+    (store.field GpsTargets color (local.get $p) (local.get $color))
+    (store.field GpsTargets depth (local.get $p) (local.get $depth))
+    (drop (call $d3g_end (local.get $p)))
+    (i32.store offset=64 (local.get $pb) (local.get $color))
+    (i32.store offset=68 (local.get $pb) (local.get $depth)))
+
+  ;; ---- State records -----------------------------------------------------
+  ;; RASTER from the stage block (+480), re-emitted only when it changed.
+  (func $d3g_raster (param $pb i32) (param $depth i32) (param $zfunc i32) (param $zwrite i32) (param $cull i32)
+      (param $blend i32) (param $src i32) (param $dst i32) (param $afunc i32) (param $aref i32)
+      (param $sl i32) (param $st i32) (param $sr i32) (param $sb i32) (param $linear i32)
+    (local $s i32) (local $p i32)
+    (local.set $s (i32.add (local.get $pb) (i32.const 480)))
+    (memory.fill (local.get $s) (i32.const 0) (i32.const 96))
+    (store.field GpsRaster depth_mode (local.get $s) (local.get $depth))
+    (store.field GpsRaster zfunc (local.get $s) (local.get $zfunc))
+    (store.field GpsRaster zwrite (local.get $s) (local.get $zwrite))
+    (store.field GpsRaster cull (local.get $s) (local.get $cull))
+    (store.field GpsRaster blend (local.get $s) (local.get $blend))
+    (store.field GpsRaster src_rgb (local.get $s) (local.get $src))
+    (store.field GpsRaster dst_rgb (local.get $s) (local.get $dst))
+    (store.field GpsRaster src_alpha (local.get $s) (local.get $src))
+    (store.field GpsRaster dst_alpha (local.get $s) (local.get $dst))
+    (store.field GpsRaster alpha_func (local.get $s) (local.get $afunc))
+    (store.field GpsRaster alpha_ref (local.get $s) (local.get $aref))
+    (store.field GpsRaster colormask (local.get $s) (i32.const 15))
+    (store.field GpsRaster fill (local.get $s) (i32.const 3))
+    (store.field GpsRaster linear (local.get $s) (local.get $linear))
+    (if (i32.lt_s (local.get $sr) (local.get $sl)) (then (local.set $sr (local.get $sl))))
+    (if (i32.lt_s (local.get $sb) (local.get $st)) (then (local.set $sb (local.get $st))))
+    (store.field GpsRaster scissor_left (local.get $s) (local.get $sl))
+    (store.field GpsRaster scissor_top (local.get $s) (local.get $st))
+    (store.field GpsRaster scissor_right (local.get $s) (local.get $sr))
+    (store.field GpsRaster scissor_bottom (local.get $s) (local.get $sb))
+    (store.field GpsRaster blend_op (local.get $s) (i32.const 1))
+    (store.field GpsRaster blend_op_alpha (local.get $s) (i32.const 1))
+    (if (call $d3g_row_eq (local.get $s) (i32.add (local.get $pb) (i32.const 384)) (i32.const 96))
+      (then (return)))
+    (memory.copy (i32.add (local.get $pb) (i32.const 384)) (local.get $s) (i32.const 96))
+    (local.set $p (call $d3g_begin (local.get $pb) (global.get $GPS_OP_RASTER) (i32.const 96)))
+    (memory.copy (local.get $p) (local.get $s) (i32.const 96))
+    (drop (call $d3g_end (local.get $p))))
+
+  ;; BIND slot 0 (texture 0 = nothing bound).
+  (func $d3g_bind (param $pb i32) (param $tex i32) (param $sampler i32)
+    (local $p i32) (local $n i32)
+    (local.set $n (i32.ne (local.get $tex) (i32.const 0)))
+    (if (i32.and (i32.eq (i32.load offset=576 (local.get $pb)) (local.get $n))
+          (i32.and (i32.eq (i32.load offset=584 (local.get $pb)) (local.get $tex))
+                   (i32.eq (i32.load offset=588 (local.get $pb)) (local.get $sampler))))
+      (then (return)))
+    (local.set $p (call $d3g_begin (local.get $pb) (global.get $GPS_OP_BIND)
+      (i32.add (size-of GpsBind) (i32.mul (local.get $n) (size-of GpsBindEntry)))))
+    (store.field GpsBind count (local.get $p) (local.get $n))
+    (if (local.get $n) (then
+      (local.set $p (i32.add (local.get $p) (size-of GpsBind)))
+      (store.field GpsBindEntry slot (local.get $p) (i32.const 0))
+      (store.field GpsBindEntry texture (local.get $p) (local.get $tex))
+      (store.field GpsBindEntry sampler (local.get $p) (local.get $sampler))
+      (local.set $p (i32.sub (local.get $p) (size-of GpsBind)))))
+    (drop (call $d3g_end (local.get $p)))
+    (i32.store offset=576 (local.get $pb) (local.get $n))
+    (i32.store offset=584 (local.get $pb) (local.get $tex))
+    (i32.store offset=588 (local.get $pb) (local.get $sampler)))
+
+  ;; CONSTS c0 = 0.5 (colour-key threshold), c1 = fog colour (D3DCOLOR).
+  (func $d3g_consts (param $pb i32) (param $fog i32)
+    (local $p i32) (local $c i32)
+    (if (i32.and (i32.ne (i32.load offset=72 (local.get $pb)) (i32.const 0))
+                 (i32.eq (i32.load offset=592 (local.get $pb)) (local.get $fog))) (then (return)))
+    (i32.store offset=72 (local.get $pb) (i32.const 1))
+    (i32.store offset=592 (local.get $pb) (local.get $fog))
+    (local.set $p (call $d3g_begin (local.get $pb) (global.get $GPS_OP_CONSTS) (i32.add (size-of GpsConsts) (i32.const 32))))
+    (store.field GpsConsts stage (local.get $p) (global.get $GPS_STAGE_PS))
+    (store.field GpsConsts pad (local.get $p) (i32.const 0))
+    (store.field GpsConsts first (local.get $p) (i32.const 0))
+    (store.field GpsConsts count (local.get $p) (i32.const 2))
+    (local.set $c (i32.add (local.get $p) (size-of GpsConsts)))
+    (f32.store (local.get $c) (f32.const 0.5))
+    (f32.store offset=4 (local.get $c) (f32.const 0.5))
+    (f32.store offset=8 (local.get $c) (f32.const 0.5))
+    (f32.store offset=12 (local.get $c) (f32.const 0.5))
+    (f32.store offset=16 (local.get $c) (f32.div (f32.convert_i32_u (i32.and (i32.shr_u (local.get $fog) (i32.const 16)) (i32.const 255))) (f32.const 255)))
+    (f32.store offset=20 (local.get $c) (f32.div (f32.convert_i32_u (i32.and (i32.shr_u (local.get $fog) (i32.const 8)) (i32.const 255))) (f32.const 255)))
+    (f32.store offset=24 (local.get $c) (f32.div (f32.convert_i32_u (i32.and (local.get $fog) (i32.const 255))) (f32.const 255)))
+    (f32.store offset=28 (local.get $c) (f32.div (f32.convert_i32_u (i32.shr_u (local.get $fog) (i32.const 24))) (f32.const 255)))
+    (drop (call $d3g_end (local.get $p))))
+
+  ;; Sampler for packed au | av<<4 | min<<8 | mag<<12 | mip<<16.
+  (func $d3g_sampler (param $pb i32) (param $packed i32) (result i32)
+    (local $i i32) (local $e i32) (local $id i32) (local $p i32)
+    (local.set $packed (i32.or (local.get $packed) (i32.const 0x80000000)))
+    (loop $scan
+      (local.set $e (i32.add (i32.add (local.get $pb) (i32.const 6400)) (i32.shl (local.get $i) (i32.const 3))))
+      (if (i32.eq (i32.load (local.get $e)) (local.get $packed)) (then (return (i32.load offset=4 (local.get $e)))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $scan (i32.lt_u (local.get $i) (global.get $D3G_SAMPLER_CACHE))))
+    (local.set $id (call $d3g_new_id (local.get $pb)))
+    (local.set $p (call $d3g_begin (local.get $pb) (global.get $GPS_OP_SAMPLER) (size-of GpsSampler)))
+    (store.field GpsSampler id (local.get $p) (local.get $id))
+    (store.field GpsSampler address_u (local.get $p) (i32.and (local.get $packed) (i32.const 15)))
+    (store.field GpsSampler address_v (local.get $p) (i32.and (i32.shr_u (local.get $packed) (i32.const 4)) (i32.const 15)))
+    (store.field GpsSampler min (local.get $p) (i32.and (i32.shr_u (local.get $packed) (i32.const 8)) (i32.const 15)))
+    (store.field GpsSampler mag (local.get $p) (i32.and (i32.shr_u (local.get $packed) (i32.const 12)) (i32.const 15)))
+    (store.field GpsSampler mip (local.get $p) (i32.and (i32.shr_u (local.get $packed) (i32.const 16)) (i32.const 15)))
+    (store.field GpsSampler address_w (local.get $p) (i32.const 0))
+    (store.field GpsSampler max_level (local.get $p) (i32.const 0))
+    (store.field GpsSampler max_aniso (local.get $p) (i32.const 0))
+    (store.field GpsSampler lod_bias (local.get $p) (f32.const 0))
+    (store.field GpsSampler border (local.get $p) (i32.const 0))
+    (drop (call $d3g_end (local.get $p)))
+    (local.set $i (i32.load offset=48 (local.get $pb)))
+    (i32.store offset=48 (local.get $pb) (i32.rem_u (i32.add (local.get $i) (i32.const 1)) (global.get $D3G_SAMPLER_CACHE)))
+    (local.set $e (i32.add (i32.add (local.get $pb) (i32.const 6400)) (i32.shl (local.get $i) (i32.const 3))))
+    (if (i32.load (local.get $e)) (then (call $d3g_release (local.get $pb) (i32.load offset=4 (local.get $e)))))
+    (i32.store (local.get $e) (local.get $packed))
+    (i32.store offset=4 (local.get $e) (local.get $id))
+    (local.get $id))
+
+  ;; D3DTADDRESS -> GPS address (border lowers to clamp, as before).
+  (func $d3g_addr (param $a i32) (result i32)
+    (if (i32.eq (local.get $a) (i32.const 4)) (then (return (i32.const 3))))
+    (if (i32.or (i32.lt_u (local.get $a) (i32.const 1)) (i32.gt_u (local.get $a) (i32.const 5)))
+      (then (return (i32.const 1))))
+    (local.get $a))
+
+  ;; ---- Fixed-function stage 0 -> pixel shader IR -------------------------
+  ;; Key: bit0 textured, 1-4 colorop, 5-8 alphaop, 9-12 arg is texture
+  ;; (carg1, carg2, aarg1, aarg2), 13 colour-key kill, 14 vertex fog,
+  ;; 15 projected texcoord (texld .dz), bit31 set.
+  (func $d3g_dst (param $reg i32) (param $mask i32) (result i32)
+    (i32.or (i32.or (i32.const 0x80100000) (local.get $reg)) (i32.shl (local.get $mask) (i32.const 16))))
+
+  (func $d3g_ir_op (param $buf i32) (param $n i32) (param $op i32) (param $mask i32) (param $a1 i32) (param $a2 i32)
+      (result i32)
+    (local $d i32)
+    (local.set $d (call $d3g_dst (i32.const 0) (local.get $mask)))
+    (if (i32.eq (local.get $op) (i32.const 2))
+      (then (return (call $gps_ir_ins (local.get $buf) (local.get $n) (global.get $GPS_IR_MOV) (i32.const 2)
+        (local.get $d) (local.get $a1) (i32.const 0) (i32.const 0)))))
+    (if (i32.eq (local.get $op) (i32.const 3))
+      (then (return (call $gps_ir_ins (local.get $buf) (local.get $n) (global.get $GPS_IR_MOV) (i32.const 2)
+        (local.get $d) (local.get $a2) (i32.const 0) (i32.const 0)))))
+    (if (i32.eq (local.get $op) (i32.const 7))
+      (then (return (call $gps_ir_ins (local.get $buf) (local.get $n) (i32.const 2) (i32.const 3)
+        (local.get $d) (local.get $a1) (local.get $a2) (i32.const 0)))))
+    (if (i32.eq (local.get $op) (i32.const 13))
+      (then (return (call $gps_ir_ins (local.get $buf) (local.get $n) (i32.const 18) (i32.const 4)
+        (local.get $d) (i32.const 0x80FF0001) (local.get $a1) (local.get $a2)))))
+    (call $gps_ir_ins (local.get $buf) (local.get $n) (global.get $GPS_IR_MUL) (i32.const 3)
+      (local.get $d) (local.get $a1) (local.get $a2) (i32.const 0)))
+
+  (func $d3g_arg (param $key i32) (param $bit i32) (result i32)
+    (select (i32.const 0x80E40001) (i32.const 0x90E40000)
+      (i32.ne (i32.and (local.get $key) (i32.shl (i32.const 1) (local.get $bit))) (i32.const 0))))
+
+  (func $d3g_shader (param $pb i32) (param $key i32) (result i32)
+    (local $i i32) (local $e i32) (local $id i32) (local $p i32) (local $buf i32) (local $n i32) (local $bytes i32) (local $core i32)
+    (local.set $key (i32.or (local.get $key) (i32.const 0x80000000)))
+    (loop $scan
+      (local.set $e (i32.add (i32.add (local.get $pb) (i32.const 5888)) (i32.shl (local.get $i) (i32.const 3))))
+      (if (i32.eq (i32.load (local.get $e)) (local.get $key)) (then (return (i32.load offset=4 (local.get $e)))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $scan (i32.lt_u (local.get $i) (global.get $D3G_SHADER_CACHE))))
+    (local.set $buf (i32.load offset=32 (local.get $pb)))
+    (if (i32.and (local.get $key) (i32.const 1))
+      (then
+        (local.set $n (call $gps_ir_ins (local.get $buf) (local.get $n) (global.get $GPS_IR_TEX) (i32.const 2)
+          (call $d3g_dst (i32.const 0) (i32.const 15))
+          (select (i32.const 0xB9E40000) (i32.const 0xB0E40000) (i32.ne (i32.and (local.get $key) (i32.const 0x8000)) (i32.const 0)))
+          (i32.const 0) (i32.const 0)))
+        (local.set $n (call $gps_ir_ins (local.get $buf) (local.get $n) (global.get $GPS_IR_MOV) (i32.const 2)
+          (call $d3g_dst (i32.const 1) (i32.const 15)) (i32.const 0x80E40000) (i32.const 0) (i32.const 0)))
+        (if (i32.and (local.get $key) (i32.const 0x2000)) (then
+          ;; Keep negative alpha-minus-threshold values for TEXKILL. The
+          ;; ordinary stage destination saturates, which would turn them into
+          ;; zero and make every keyed fragment survive the strict <0 test.
+          (local.set $n (call $gps_ir_ins (local.get $buf) (local.get $n) (global.get $GPS_IR_SUB) (i32.const 3)
+            (i32.and (call $d3g_dst (i32.const 2) (i32.const 15)) (i32.const -1048577))
+            (i32.const 0x80FF0001) (i32.const 0xA0E40000) (i32.const 0)))
+          (local.set $n (call $gps_ir_ins (local.get $buf) (local.get $n) (global.get $GPS_IR_TEXKILL) (i32.const 1)
+            (call $d3g_dst (i32.const 2) (i32.const 15)) (i32.const 0) (i32.const 0) (i32.const 0)))))
+        (local.set $n (call $d3g_ir_op (local.get $buf) (local.get $n)
+          (i32.and (i32.shr_u (local.get $key) (i32.const 1)) (i32.const 15)) (i32.const 7)
+          (call $d3g_arg (local.get $key) (i32.const 9)) (call $d3g_arg (local.get $key) (i32.const 10))))
+        (local.set $n (call $d3g_ir_op (local.get $buf) (local.get $n)
+          (i32.and (i32.shr_u (local.get $key) (i32.const 5)) (i32.const 15)) (i32.const 8)
+          (call $d3g_arg (local.get $key) (i32.const 11)) (call $d3g_arg (local.get $key) (i32.const 12)))))
+      (else
+        (local.set $n (call $gps_ir_ins (local.get $buf) (local.get $n) (global.get $GPS_IR_MOV) (i32.const 2)
+          (call $d3g_dst (i32.const 0) (i32.const 15)) (i32.const 0x90E40000) (i32.const 0) (i32.const 0)))))
+    (if (i32.and (local.get $key) (i32.const 0x4000)) (then
+      ;; D3D vertex fog: specular alpha is the fraction of the colour kept.
+      (local.set $n (call $gps_ir_ins (local.get $buf) (local.get $n) (i32.const 18) (i32.const 4)
+        (call $d3g_dst (i32.const 0) (i32.const 7)) (i32.const 0x90FF0001) (i32.const 0x80E40000) (i32.const 0xA0E40001)))))
+    (drop (call $gps_ir_finish (local.get $buf) (local.get $n) (global.get $GPS_STAGE_PS) (i32.const 0xffff0104)))
+    ;; These projected inputs are affine U/w,V/w,Q/w planes. Preserve their
+    ;; fixed-function origin so the native sampler uses quotient derivatives.
+    (if (i32.and (local.get $key) (i32.const 0x8000))
+      (then (i32.store offset=28 (local.get $buf) (i32.const 4))))
+    ;; Publish core IR (09af1): every consumer sees one IR; a decline is a bug here.
+    (local.set $core (call $d3d_shader_ir_canonicalize (local.get $buf)))
+    (if (i32.eqz (local.get $core)) (then (call $d3g_fail)))
+    (local.set $bytes (i32.load offset=24 (local.get $core)))
+    (local.set $id (call $d3g_new_id (local.get $pb)))
+    (local.set $p (call $d3g_begin (local.get $pb) (global.get $GPS_OP_SHADER) (i32.add (size-of GpsShader) (local.get $bytes))))
+    (store.field GpsShader id (local.get $p) (local.get $id))
+    (store.field GpsShader stage (local.get $p) (global.get $GPS_STAGE_PS))
+    (store.field GpsShader pad (local.get $p) (i32.const 0))
+    (store.field GpsShader pad2 (local.get $p) (i32.const 0))
+    (store.field GpsShader ir_bytes (local.get $p) (local.get $bytes))
+    (memory.copy (i32.add (local.get $p) (size-of GpsShader)) (local.get $core) (local.get $bytes))
+    (call $d3d_shader_ir_free (local.get $core))
+    (drop (call $d3g_end (local.get $p)))
+    (local.set $i (i32.load offset=44 (local.get $pb)))
+    (i32.store offset=44 (local.get $pb) (i32.rem_u (i32.add (local.get $i) (i32.const 1)) (global.get $D3G_SHADER_CACHE)))
+    (local.set $e (i32.add (i32.add (local.get $pb) (i32.const 5888)) (i32.shl (local.get $i) (i32.const 3))))
+    (if (i32.load (local.get $e)) (then (call $d3g_release (local.get $pb) (i32.load offset=4 (local.get $e)))))
+    (i32.store (local.get $e) (local.get $key))
+    (i32.store offset=4 (local.get $e) (local.get $id))
+    (local.get $id))
+
+  ;; ---- Textures ----------------------------------------------------------
+  ;; Cache slot $e (an entry address) as a texture-diagnostic slot index.
+  (func $d3g_td_slot (param $pb i32) (param $e i32) (result i32)
+    (call $gtc_index (call $d3g_tc (local.get $pb)) (local.get $e)))
+  ;; Created on first use, after the producer's own blocks, so the guest
+  ;; heap layout ahead of the first texture is what it was before the cache.
+  (func $d3g_tc (param $pb i32) (result i32)
+    (local $c i32)
+    (local.set $c (i32.load offset=6656 (local.get $pb)))
+    (if (i32.eqz (local.get $c)) (then
+      (local.set $c (call $gtc_create (global.get $GTC_SLOTS) (i32.const 256) (global.get $GTC_BUDGET)))
+      (i32.store offset=6656 (local.get $pb) (local.get $c))))
+    (local.get $c))
+
+  (func $d3g_tex_free (param $pb i32) (param $e i32)
+    (local $i i32) (local $r i32)
+    (if (i32.eqz (i32.load (local.get $e))) (then (return)))
+    (call $d3g_release (local.get $pb) (i32.load offset=4 (local.get $e)))
+    (block $done (loop $ranges
+      (br_if $done (i32.ge_u (local.get $i) (i32.load offset=40 (local.get $e))))
+      (local.set $r (i32.add (i32.add (local.get $e) (i32.const 48)) (i32.shl (local.get $i) (i32.const 3))))
+      (call $page_watch_release (i32.load (local.get $r)) (i32.load offset=4 (local.get $r)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $ranges)))
+    (call $gtc_drop (call $d3g_tc (local.get $pb)) (call $d3g_td_slot (local.get $pb) (local.get $e)))
+    (memory.fill (local.get $e) (i32.const 0) (i32.const 256)))
+
+  ;; A watched range's pages split in two: interior pages lie wholly inside
+  ;; it, edge pages (its partial first and last page) also hold whatever the
+  ;; allocator put beside it. A SYSTEMMEMORY texture is a guest heap block,
+  ;; so its edge pages share the heap with objects the app rewrites every
+  ;; frame: DXSDK Globe's 256x256 texture page-faulted its first page ~18
+  ;; times per frame and was re-decoded and re-uploaded on every draw.
+  ;; Bit 1: the first page is an edge, bit 2: the last page is a separate edge.
+  (func $d3g_range_edges (param $a i32) (param $len i32) (result i32)
+    (local $p0 i32) (local $pl i32) (local $end i32) (local $m i32)
+    (if (i32.eqz (local.get $len)) (then (return (i32.const 0))))
+    (local.set $p0 (i32.and (local.get $a) (i32.const -4096)))
+    (local.set $end (i32.add (local.get $a) (local.get $len)))
+    (local.set $pl (i32.and (i32.sub (local.get $end) (i32.const 1)) (i32.const -4096)))
+    (if (i32.or (i32.ne (local.get $a) (local.get $p0))
+                (i32.lt_u (local.get $end) (i32.add (local.get $p0) (i32.const 4096))))
+      (then (local.set $m (i32.const 1))))
+    (if (i32.and (i32.ne (local.get $pl) (local.get $p0))
+                 (i32.ne (i32.and (local.get $end) (i32.const 4095)) (i32.const 0)))
+      (then (local.set $m (i32.or (local.get $m) (i32.const 2)))))
+    (local.get $m))
+
+  ;; Watch generations of the cached texture $e: $edge 0 sums its interior
+  ;; pages, 1 its edge pages; -1 unknown.
+  (func $d3g_tex_gen (param $e i32) (param $edge i32) (result i64)
+    (local $i i32) (local $r i32) (local $sum i64) (local $g i64)
+    (local $a i32) (local $len i32) (local $m i32) (local $lo i32) (local $hi i32)
+    (block $done (loop $ranges
+      (br_if $done (i32.ge_u (local.get $i) (i32.load offset=40 (local.get $e))))
+      (local.set $r (i32.add (i32.add (local.get $e) (i32.const 48)) (i32.shl (local.get $i) (i32.const 3))))
+      (local.set $a (i32.load (local.get $r)))
+      (local.set $len (i32.load offset=4 (local.get $r)))
+      (local.set $m (call $d3g_range_edges (local.get $a) (local.get $len)))
+      (if (local.get $edge)
+        (then
+          (if (i32.and (local.get $m) (i32.const 1)) (then
+            (local.set $g (call $d3g_gensum (local.get $a) (i32.const 1)))
+            (if (i64.eq (local.get $g) (i64.const -1)) (then (return (i64.const -1))))
+            (local.set $sum (i64.add (local.get $sum) (local.get $g)))))
+          (if (i32.and (local.get $m) (i32.const 2)) (then
+            (local.set $g (call $d3g_gensum (i32.sub (i32.add (local.get $a) (local.get $len)) (i32.const 1)) (i32.const 1)))
+            (if (i64.eq (local.get $g) (i64.const -1)) (then (return (i64.const -1))))
+            (local.set $sum (i64.add (local.get $sum) (local.get $g))))))
+        (else
+          (local.set $lo (i32.and (local.get $a) (i32.const -4096)))
+          (if (i32.and (local.get $m) (i32.const 1)) (then (local.set $lo (i32.add (local.get $lo) (i32.const 4096)))))
+          (local.set $hi (i32.and (i32.add (i32.add (local.get $a) (local.get $len)) (i32.const 4095)) (i32.const -4096)))
+          (if (i32.and (local.get $m) (i32.const 2)) (then (local.set $hi (i32.sub (local.get $hi) (i32.const 4096)))))
+          (if (i32.gt_u (local.get $hi) (local.get $lo)) (then
+            (local.set $g (call $d3g_gensum (local.get $lo) (i32.sub (local.get $hi) (local.get $lo))))
+            (if (i64.eq (local.get $g) (i64.const -1)) (then (return (i64.const -1))))
+            (local.set $sum (i64.add (local.get $sum) (local.get $g)))))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $ranges)))
+    (local.get $sum))
+
+  ;; FNV-1a (64-bit, per dword then per byte) of [p, p+n).
+  (func $d3g_hash_bytes (param $p i32) (param $n i32) (param $h i64) (result i64)
+    (block $words (loop $w
+      (br_if $words (i32.lt_u (local.get $n) (i32.const 4)))
+      (local.set $h (i64.mul (i64.xor (local.get $h) (i64.extend_i32_u (i32.load (local.get $p))))
+        (i64.const 0x100000001b3)))
+      (local.set $p (i32.add (local.get $p) (i32.const 4)))
+      (local.set $n (i32.sub (local.get $n) (i32.const 4)))
+      (br $w)))
+    (block $bytes (loop $b
+      (br_if $bytes (i32.eqz (local.get $n)))
+      (local.set $h (i64.mul (i64.xor (local.get $h) (i64.extend_i32_u (i32.load8_u (local.get $p))))
+        (i64.const 0x100000001b3)))
+      (local.set $p (i32.add (local.get $p) (i32.const 1)))
+      (local.set $n (i32.sub (local.get $n) (i32.const 1)))
+      (br $b)))
+    (local.get $h))
+
+  ;; Hash of the texture's own bytes on its edge pages (at most 8 KB per
+  ;; range): what a write beside the block cannot change and a write into it
+  ;; must. Interior pages stay on generations alone.
+  (func $d3g_tex_edge_hash (param $e i32) (result i64)
+    (local $i i32) (local $r i32) (local $h i64) (local $a i32) (local $len i32)
+    (local $m i32) (local $end i32) (local $stop i32) (local $pl i32)
+    (local.set $h (i64.const 0xcbf29ce484222325))
+    (block $done (loop $ranges
+      (br_if $done (i32.ge_u (local.get $i) (i32.load offset=40 (local.get $e))))
+      (local.set $r (i32.add (i32.add (local.get $e) (i32.const 48)) (i32.shl (local.get $i) (i32.const 3))))
+      (local.set $a (i32.load (local.get $r)))
+      (local.set $len (i32.load offset=4 (local.get $r)))
+      (local.set $end (i32.add (local.get $a) (local.get $len)))
+      (local.set $m (call $d3g_range_edges (local.get $a) (local.get $len)))
+      (if (i32.and (local.get $m) (i32.const 1)) (then
+        (local.set $stop (i32.add (i32.and (local.get $a) (i32.const -4096)) (i32.const 4096)))
+        (if (i32.gt_u (local.get $stop) (local.get $end)) (then (local.set $stop (local.get $end))))
+        (local.set $h (call $d3g_hash_bytes (local.get $a) (i32.sub (local.get $stop) (local.get $a)) (local.get $h)))))
+      (if (i32.and (local.get $m) (i32.const 2)) (then
+        (local.set $pl (i32.and (i32.sub (local.get $end) (i32.const 1)) (i32.const -4096)))
+        (local.set $h (call $d3g_hash_bytes (local.get $pl) (i32.sub (local.get $end) (local.get $pl)) (local.get $h)))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $ranges)))
+    (local.get $h))
+
+  (func $d3g_tex_watch (param $e i32) (param $wa i32) (param $len i32)
+    (local $r i32) (local $n i32)
+    (local.set $n (i32.load offset=40 (local.get $e)))
+    (if (i32.ge_u (local.get $n) (i32.const 24)) (then
+      (i32.store offset=24 (local.get $e) (i32.const 0)) (return)))
+    (if (i32.eqz (call $page_watch_acquire (local.get $wa) (local.get $len))) (then
+      (i32.store offset=24 (local.get $e) (i32.const 0)) (return)))
+    (local.set $r (i32.add (i32.add (local.get $e) (i32.const 48)) (i32.shl (local.get $n) (i32.const 3))))
+    (i32.store (local.get $r) (local.get $wa))
+    (i32.store offset=4 (local.get $r) (local.get $len))
+    (i32.store offset=40 (local.get $e) (i32.add (local.get $n) (i32.const 1))))
+
+  ;; Texture id for the texture described at $d (describe words), with its
+  ;; mip chain; 0 sends the draw to software. Level records (12 words) at
+  ;; pb+656: entry, w, h, bpp, pitch, dib, pal, pal alpha, key, keyed, fmt.
+  (func $d3g_texture (param $pb i32) (param $d i32) (param $rt_dib i32) (result i32)
+    (local $mip i32) (local $keyed i32) (local $kb i32) (local $mode i32) (local $lv i32) (local $n i32)
+    (local $w i32) (local $hgt i32) (local $bpp i32) (local $pitch i32) (local $wa i32) (local $sig i32)
+    (local $i i32) (local $e i32) (local $slot i32) (local $j i32) (local $t i32) (local $id i32)
+    (local $g i64) (local $diag i32) (local $hash i64) (local $c i32) (local $bytes i32) (local $v i32)
+    (local.set $mip (i32.ne (i32.load offset=188 (local.get $d)) (i32.const 0)))
+    (local.set $keyed (i32.ne (i32.load offset=52 (local.get $d)) (i32.const 0)))
+    (local.set $kb (i32.ne (i32.load offset=160 (local.get $d)) (i32.const 0)))
+    (if (i32.and (local.get $mip) (i32.and (local.get $keyed) (i32.eqz (local.get $kb)))) (then (return (i32.const 0))))
+    (local.set $mode (select (i32.const 2) (local.get $keyed) (i32.and (local.get $keyed) (local.get $kb))))
+    (local.set $lv (i32.add (local.get $pb) (i32.const 656)))
+    (i32.store (local.get $lv) (i32.load offset=28 (local.get $d)))
+    (i32.store offset=4 (local.get $lv) (i32.load offset=32 (local.get $d)))
+    (i32.store offset=8 (local.get $lv) (i32.load offset=36 (local.get $d)))
+    (i32.store offset=12 (local.get $lv) (i32.load offset=40 (local.get $d)))
+    (i32.store offset=16 (local.get $lv) (i32.load offset=44 (local.get $d)))
+    (i32.store offset=20 (local.get $lv) (i32.load offset=48 (local.get $d)))
+    (i32.store offset=24 (local.get $lv) (i32.load offset=60 (local.get $d)))
+    (i32.store offset=28 (local.get $lv) (i32.load offset=156 (local.get $d)))
+    (i32.store offset=32 (local.get $lv) (i32.load offset=56 (local.get $d)))
+    (i32.store offset=36 (local.get $lv) (local.get $keyed))
+    (local.set $sig (i32.const 0x811c9dc5))
+    (block $chain (loop $levels
+      (local.set $e (i32.add (local.get $lv) (i32.mul (local.get $n) (i32.const 48))))
+      (local.set $w (i32.load offset=4 (local.get $e)))
+      (local.set $hgt (i32.load offset=8 (local.get $e)))
+      (local.set $bpp (i32.load offset=12 (local.get $e)))
+      (local.set $pitch (i32.load offset=16 (local.get $e)))
+      (if (i32.or (i32.or (i32.eqz (local.get $w)) (i32.eqz (local.get $hgt)))
+            (i32.or (i32.gt_u (local.get $w) (i32.const 2048)) (i32.gt_u (local.get $hgt) (i32.const 2048))))
+        (then (return (i32.const 0))))
+      (if (i32.eqz (i32.or (i32.or (i32.eq (local.get $bpp) (i32.const 8)) (i32.eq (local.get $bpp) (i32.const 16)))
+            (i32.eq (local.get $bpp) (i32.const 32))))
+        (then (return (i32.const 0))))
+      (if (i32.lt_u (local.get $pitch) (i32.mul (local.get $w) (i32.shr_u (local.get $bpp) (i32.const 3))))
+        (then (return (i32.const 0))))
+      (if (i32.eqz (i32.load offset=20 (local.get $e))) (then (return (i32.const 0))))
+      (if (i32.eq (i32.load offset=20 (local.get $e)) (local.get $rt_dib)) (then (return (i32.const 0))))
+      (if (i32.and (local.get $mip) (i32.and (local.get $keyed) (i32.eqz (i32.load offset=36 (local.get $e)))))
+        (then (return (i32.const 0))))
+      (i32.store offset=40 (local.get $e) (call $dx_surf_fmt_get (i32.load (local.get $e))))
+      (local.set $j (i32.const 0))
+      (loop $hash
+        (local.set $sig (i32.mul (i32.xor (local.get $sig) (i32.load (i32.add (local.get $e) (i32.shl (local.get $j) (i32.const 2)))))
+          (i32.const 0x01000193)))
+        (local.set $j (i32.add (local.get $j) (i32.const 1)))
+        (br_if $hash (i32.lt_u (local.get $j) (i32.const 11))))
+      (local.set $n (i32.add (local.get $n) (i32.const 1)))
+      (br_if $chain (i32.eqz (local.get $mip)))
+      (br_if $chain (i32.ge_u (local.get $n) (i32.const 12)))
+      (br_if $chain (i32.and (i32.eq (local.get $w) (i32.const 1)) (i32.eq (local.get $hgt) (i32.const 1))))
+      (local.set $wa (call $d3dim_gpu_mip_next (i32.load (local.get $e))))
+      (br_if $chain (i32.eqz (local.get $wa)))
+      (br_if $chain (i32.ne (i32.load offset=4 (local.get $wa))
+        (select (i32.shr_u (local.get $w) (i32.const 1)) (i32.const 1) (i32.gt_u (local.get $w) (i32.const 1)))))
+      (br_if $chain (i32.ne (i32.load offset=8 (local.get $wa))
+        (select (i32.shr_u (local.get $hgt) (i32.const 1)) (i32.const 1) (i32.gt_u (local.get $hgt) (i32.const 1)))))
+      (local.set $e (i32.add (local.get $e) (i32.const 48)))
+      (memory.copy (local.get $e) (local.get $wa) (i32.const 36))
+      (i32.store offset=36 (local.get $e)
+        (i32.and (local.get $keyed) (i32.ne (i32.load offset=36 (local.get $wa)) (i32.const 0))))
+      (br $levels)))
+    (local.set $sig (i32.xor (local.get $sig) (i32.or (i32.shl (local.get $n) (i32.const 4)) (local.get $mode))))
+    ;; A level that is a GPU target the CPU cannot see yet: read it back.
+    (local.set $i (i32.const 0))
+    (loop $rts
+      (local.set $e (i32.add (local.get $lv) (i32.mul (local.get $i) (i32.const 48))))
+      (local.set $t (call $d3g_find (local.get $pb) (i32.load offset=20 (local.get $e))))
+      (if (local.get $t) (then
+        (local.set $j (call $d3g_site (i32.const 11)))
+        (call $d3g_readback (local.get $pb) (local.get $t))
+        (drop (call $d3g_site (local.get $j)))
+        (i32.store offset=32 (local.get $t) (i32.or (i32.load offset=32 (local.get $t)) (i32.const 2)))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $rts (i32.lt_u (local.get $i) (local.get $n))))
+    (local.set $i (i32.const 0))
+    (loop $size
+      (local.set $e (i32.add (local.get $lv) (i32.mul (local.get $i) (i32.const 48))))
+      (local.set $bytes (i32.add (local.get $bytes)
+        (i32.shl (i32.mul (i32.load offset=4 (local.get $e)) (i32.load offset=8 (local.get $e))) (i32.const 2))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $size (i32.lt_u (local.get $i) (local.get $n))))
+    ;; Cache: same root entry. Same signature and unchanged watch = hit.
+    ;; One texture per draw: the previous lookup's pin ends here.
+    (local.set $c (call $d3g_tc (local.get $pb)))
+    (call $gtc_unpin (local.get $c))
+    (local.set $i (i32.const 0))
+    (local.set $slot (i32.const 0))
+    (loop $scan
+      (local.set $e (call $gtc_entry (local.get $c) (local.get $i)))
+      (if (i32.eq (i32.load (local.get $e)) (i32.load (local.get $lv))) (then
+        (if (i32.and (i32.and (i32.eq (i32.load offset=20 (local.get $e)) (local.get $sig))
+                              (i32.ne (i32.load offset=24 (local.get $e)) (i32.const 0)))
+                     (call $d3g_watch_ok))
+          (then
+            (local.set $g (call $d3g_tex_gen (local.get $e) (i32.const 0)))
+            (if (i32.and (i64.ne (local.get $g) (i64.const -1))
+                         (i64.eq (local.get $g) (i64.load offset=32 (local.get $e))))
+              (then
+                (local.set $g (call $d3g_tex_gen (local.get $e) (i32.const 1)))
+                (if (i64.eq (local.get $g) (i64.load offset=240 (local.get $e)))
+                  (then
+                    (call $gtc_use (local.get $c) (local.get $i))
+                    (call $gps_td_use (call $d3g_h) (call $d3g_td_slot (local.get $pb) (local.get $e)))
+                    (return (i32.load offset=4 (local.get $e)))))
+                ;; Only edge pages moved: a neighbour's write, unless the
+                ;; texture's own bytes there changed too.
+                (if (i32.and (i64.ne (local.get $g) (i64.const -1))
+                      (i64.eq (call $d3g_tex_edge_hash (local.get $e)) (i64.load offset=248 (local.get $e))))
+                  (then
+                    (i64.store offset=240 (local.get $e) (local.get $g))
+                    (i32.store offset=23348 (local.get $pb) (i32.add (i32.load offset=23348 (local.get $pb)) (i32.const 1)))
+                    (call $gtc_use (local.get $c) (local.get $i))
+                    (call $gps_td_use (call $d3g_h) (call $d3g_td_slot (local.get $pb) (local.get $e)))
+                    (return (i32.load offset=4 (local.get $e)))))))))
+        (local.set $slot (local.get $e))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $scan (i32.lt_u (local.get $i) (call $gtc_slots (local.get $c)))))
+    (call $d3g_stat (local.get $pb) (i32.const 8) (i32.const 1))
+    (local.set $diag (call $gps_td (call $d3g_h)))
+    (if (local.get $slot)
+      (then
+        (if (local.get $diag) (then
+          (call $gps_td_drop (call $d3g_h) (call $d3g_td_slot (local.get $pb) (local.get $slot))
+            (if (result i32) (i32.ne (i32.load offset=20 (local.get $slot)) (local.get $sig))
+              (then (global.get $GPS_TD_DESCRIPTOR))
+              (else (select (global.get $GPS_TD_WRITE) (global.get $GPS_TD_UNTRACKED)
+                (i32.ne (i32.load offset=24 (local.get $slot)) (i32.const 0))))))))
+        (if (i32.ne (i32.load offset=20 (local.get $slot)) (local.get $sig))
+          (then (call $d3g_tex_free (local.get $pb) (local.get $slot))))))
+    ;; A kept entry refills in place: pin it, then evict least recently used
+    ;; textures until this one fits (and a slot is free for a new entry).
+    (if (local.get $slot) (then (if (i32.load (local.get $slot))
+      (then (call $gtc_use (local.get $c) (call $d3g_td_slot (local.get $pb) (local.get $slot)))))))
+    (block $fits (loop $evict
+      (local.set $v (call $gtc_victim (local.get $c) (local.get $bytes) (i32.eqz (local.get $slot))))
+      (br_if $fits (i32.lt_s (local.get $v) (i32.const 0)))
+      (call $gps_td_drop (call $d3g_h) (local.get $v) (global.get $GPS_TD_EVICT))
+      (call $d3g_tex_free (local.get $pb) (call $gtc_entry (local.get $c) (local.get $v)))
+      (br $evict)))
+    (if (i32.eqz (local.get $slot))
+      (then (local.set $slot (call $gtc_entry (local.get $c) (call $gtc_free_slot (local.get $c))))))
+    (local.set $id (i32.load offset=4 (local.get $slot)))
+    (if (i32.eqz (i32.load (local.get $slot))) (then
+      (local.set $id (call $d3g_new_id (local.get $pb)))
+      (call $gtc_claim (local.get $c) (call $d3g_td_slot (local.get $pb) (local.get $slot)) (local.get $bytes))
+      (call $d3g_create (local.get $id) (global.get $GPS_KIND_TEX2D) (global.get $GPS_FMT_A8B8G8R8)
+        (local.get $n) (i32.load offset=4 (local.get $lv)) (i32.load offset=8 (local.get $lv)))
+      (i32.store (local.get $slot) (i32.load (local.get $lv)))
+      (i32.store offset=4 (local.get $slot) (local.get $id))
+      (i32.store offset=8 (local.get $slot) (i32.load offset=4 (local.get $lv)))
+      (i32.store offset=12 (local.get $slot) (i32.load offset=8 (local.get $lv)))
+      (i32.store offset=16 (local.get $slot) (local.get $n))
+      (i32.store offset=20 (local.get $slot) (local.get $sig))
+      (i32.store offset=24 (local.get $slot) (i32.const 1))
+      (local.set $i (i32.const 0))
+      (loop $watch
+        (local.set $e (i32.add (local.get $lv) (i32.mul (local.get $i) (i32.const 48))))
+        (call $d3g_tex_watch (local.get $slot) (i32.load offset=20 (local.get $e))
+          (i32.mul (i32.load offset=16 (local.get $e)) (i32.load offset=8 (local.get $e))))
+        (if (i32.and (i32.eq (i32.load offset=12 (local.get $e)) (i32.const 8))
+                     (i32.ne (i32.load offset=24 (local.get $e)) (i32.const 0)))
+          (then (call $d3g_tex_watch (local.get $slot) (i32.load offset=24 (local.get $e)) (i32.const 1024))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br_if $watch (i32.lt_u (local.get $i) (local.get $n))))))
+    ;; Generations first, then the edge bytes: a write racing this fill can
+    ;; only make the next lookup re-upload, never hit on stale pixels.
+    (i64.store offset=32 (local.get $slot) (call $d3g_tex_gen (local.get $slot) (i32.const 0)))
+    (i64.store offset=240 (local.get $slot) (call $d3g_tex_gen (local.get $slot) (i32.const 1)))
+    (i64.store offset=248 (local.get $slot) (call $d3g_tex_edge_hash (local.get $slot)))
+    (if (local.get $diag) (then (local.set $hash (call $gps_td_seed
+      (i32.load offset=4 (local.get $lv)) (i32.load offset=8 (local.get $lv)) (local.get $n)))))
+    (local.set $i (i32.const 0))
+    (loop $decode
+      (local.set $e (i32.add (local.get $lv) (i32.mul (local.get $i) (i32.const 48))))
+      (local.set $wa (call $d3dim_gpu_decode_texture (i32.load (local.get $e))
+        (select (local.get $mode) (i32.const 0) (i32.ne (i32.load offset=36 (local.get $e)) (i32.const 0)))))
+      (if (i32.eqz (local.get $wa)) (then
+        (call $d3g_tex_free (local.get $pb) (local.get $slot))
+        (return (i32.const 0))))
+      (if (local.get $diag) (then (local.set $hash (call $d3g_hash_bytes (local.get $wa)
+        (i32.shl (i32.mul (i32.load offset=4 (local.get $e)) (i32.load offset=8 (local.get $e))) (i32.const 2))
+        (local.get $hash)))))
+      (call $d3g_upload_rgba (local.get $pb) (local.get $id) (local.get $i)
+        (i32.load offset=4 (local.get $e)) (i32.load offset=8 (local.get $e)) (local.get $wa))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $decode (i32.lt_u (local.get $i) (local.get $n))))
+    (if (local.get $diag) (then
+      (call $gps_td_fill (call $d3g_h) (call $d3g_td_slot (local.get $pb) (local.get $slot)) (local.get $hash))
+      (call $gps_td_use (call $d3g_h) (call $d3g_td_slot (local.get $pb) (local.get $slot)))))
+    (local.get $id))
+
+  ;; ---- Draws -------------------------------------------------------------
+  (func $d3g_f32_ok (param $v f32) (result i32)
+    (f32.eq (f32.sub (local.get $v) (local.get $v)) (f32.const 0)))
+
+  ;; DRAW_UP of $count vertices already written at arena position $pos.
+  (func $d3g_draw_up (param $pb i32) (param $prim i32) (param $ps i32) (param $layout i32)
+      (param $stride i32) (param $pos i32) (param $count i32)
+    (local $p i32)
+    (local.set $p (call $d3g_begin (local.get $pb) (global.get $GPS_OP_DRAW_UP) (size-of GpsDraw)))
+    (store.field GpsDraw prim (local.get $p) (local.get $prim))
+    (store.field GpsDraw index_size (local.get $p) (i32.const 0))
+    (store.field GpsDraw pad2 (local.get $p) (i32.const 0))
+    (store.field GpsDraw vs (local.get $p) (i32.const 0))
+    (store.field GpsDraw ps (local.get $p) (local.get $ps))
+    (store.field GpsDraw layout (local.get $p) (local.get $layout))
+    (store.field GpsDraw vbuf (local.get $p) (i32.const 0))
+    (store.field GpsDraw voff (local.get $p) (local.get $pos))
+    (store.field GpsDraw stride (local.get $p) (local.get $stride))
+    (store.field GpsDraw ibuf (local.get $p) (i32.const 0))
+    (store.field GpsDraw ioff (local.get $p) (i32.const 0))
+    (store.field GpsDraw count (local.get $p) (local.get $count))
+    (store.field GpsDraw vcount (local.get $p) (local.get $count))
+    (drop (call $d3g_end (local.get $p))))
+
+  ;; One TL vertex (32 bytes) at $o.
+  (func $d3g_vtx (param $o i32) (param $x f32) (param $y f32) (param $z f32) (param $c i32) (param $u f32) (param $v f32)
+    (f32.store (local.get $o) (local.get $x))
+    (f32.store offset=4 (local.get $o) (local.get $y))
+    (f32.store offset=8 (local.get $o) (local.get $z))
+    (f32.store offset=12 (local.get $o) (f32.const 1))
+    (i32.store offset=16 (local.get $o) (local.get $c))
+    (i32.store offset=20 (local.get $o) (i32.const 0))
+    (f32.store offset=24 (local.get $o) (local.get $u))
+    (f32.store offset=28 (local.get $o) (local.get $v)))
+
+  ;; Two triangles covering pixels [x0, x1) x [y0, y1) (centres at integers).
+  (func $d3g_quad (param $o i32) (param $x0 f32) (param $y0 f32) (param $x1 f32) (param $y1 f32) (param $z f32)
+      (param $c i32) (param $u0 f32) (param $v0 f32) (param $u1 f32) (param $v1 f32)
+    (local.set $x0 (f32.sub (local.get $x0) (f32.const 0.5)))
+    (local.set $y0 (f32.sub (local.get $y0) (f32.const 0.5)))
+    (local.set $x1 (f32.sub (local.get $x1) (f32.const 0.5)))
+    (local.set $y1 (f32.sub (local.get $y1) (f32.const 0.5)))
+    (call $d3g_vtx (local.get $o) (local.get $x0) (local.get $y0) (local.get $z) (local.get $c) (local.get $u0) (local.get $v0))
+    (call $d3g_vtx (i32.add (local.get $o) (i32.const 32)) (local.get $x1) (local.get $y0) (local.get $z) (local.get $c) (local.get $u1) (local.get $v0))
+    (call $d3g_vtx (i32.add (local.get $o) (i32.const 64)) (local.get $x0) (local.get $y1) (local.get $z) (local.get $c) (local.get $u0) (local.get $v1))
+    (call $d3g_vtx (i32.add (local.get $o) (i32.const 96)) (local.get $x1) (local.get $y0) (local.get $z) (local.get $c) (local.get $u1) (local.get $v0))
+    (call $d3g_vtx (i32.add (local.get $o) (i32.const 128)) (local.get $x1) (local.get $y1) (local.get $z) (local.get $c) (local.get $u1) (local.get $v1))
+    (call $d3g_vtx (i32.add (local.get $o) (i32.const 160)) (local.get $x0) (local.get $y1) (local.get $z) (local.get $c) (local.get $u0) (local.get $v1)))
+
+  ;; Textured copy of RT/texture $tex into the current target (nearest, clamp).
+  (func $d3g_blit (param $pb i32) (param $tex i32) (param $sw i32) (param $sh i32)
+      (param $x0 f32) (param $y0 f32) (param $x1 f32) (param $y1 f32)
+      (param $u0 f32) (param $v0 f32) (param $u1 f32) (param $v1 f32)
+      (param $sl i32) (param $st i32) (param $sr i32) (param $sb i32)
+    (call $d3g_blit_ps (local.get $pb) (local.get $tex) (i32.const 8)
+      (local.get $x0) (local.get $y0) (local.get $x1) (local.get $y1)
+      (local.get $u0) (local.get $v0) (local.get $u1) (local.get $v1)
+      (local.get $sl) (local.get $st) (local.get $sr) (local.get $sb)))
+
+  ;; $d3g_blit with alpha test $afunc against 0 (5 = GREATER: texels with
+  ;; alpha 0 are not written).
+  (func $d3g_blit_ps (param $pb i32) (param $tex i32) (param $afunc i32)
+      (param $x0 f32) (param $y0 f32) (param $x1 f32) (param $y1 f32)
+      (param $u0 f32) (param $v0 f32) (param $u1 f32) (param $v1 f32)
+      (param $sl i32) (param $st i32) (param $sr i32) (param $sb i32)
+    (local $pos i32)
+    (call $d3g_raster (local.get $pb) (i32.const 0) (i32.const 8) (i32.const 0) (i32.const 1)
+      (i32.const 0) (i32.const 2) (i32.const 1) (local.get $afunc) (i32.const 0)
+      (local.get $sl) (local.get $st) (local.get $sr) (local.get $sb) (i32.const 0))
+    (call $d3g_bind (local.get $pb) (local.get $tex)
+      (call $d3g_sampler (local.get $pb) (i32.const 0x01133)))
+    (local.set $pos (call $d3g_arena (i32.const 192)))
+    (call $d3g_quad (call $d3g_aptr (local.get $pos)) (local.get $x0) (local.get $y0) (local.get $x1) (local.get $y1)
+      (f32.const 0) (i32.const -1) (local.get $u0) (local.get $v0) (local.get $u1) (local.get $v1))
+    ;; SELECTARG1(texture) for colour and alpha.
+    (call $d3g_draw_up (local.get $pb) (global.get $GPS_PRIM_TRIANGLELIST)
+      (call $d3g_shader (local.get $pb) (i32.const 0xA45))
+      (i32.load offset=4 (local.get $pb)) (i32.const 32) (local.get $pos) (i32.const 6)))
+
+  ;; ExecuteBuffer extent for D3DRM, clipped to the viewport.
+  (func $d3g_extent (param $d i32) (param $bounded i32) (param $l f32) (param $t f32) (param $r f32) (param $b f32)
+    (local $cl i32) (local $ct i32) (local $cr i32) (local $cb i32)
+    (local.set $cr (i32.load offset=4 (local.get $d)))
+    (local.set $cb (i32.load offset=8 (local.get $d)))
+    (if (i32.load offset=136 (local.get $d)) (then
+      (local.set $cl (i32.load offset=140 (local.get $d)))
+      (local.set $ct (i32.load offset=144 (local.get $d)))
+      (if (i32.lt_s (i32.load offset=148 (local.get $d)) (local.get $cr)) (then (local.set $cr (i32.load offset=148 (local.get $d)))))
+      (if (i32.lt_s (i32.load offset=152 (local.get $d)) (local.get $cb)) (then (local.set $cb (i32.load offset=152 (local.get $d)))))))
+    (if (i32.lt_s (local.get $cl) (i32.const 0)) (then (local.set $cl (i32.const 0))))
+    (if (i32.lt_s (local.get $ct) (i32.const 0)) (then (local.set $ct (i32.const 0))))
+    (if (local.get $bounded) (then
+      (local.set $cl (select (local.get $cl) (i32.trunc_sat_f32_s (f32.floor (local.get $l)))
+        (i32.gt_s (local.get $cl) (i32.trunc_sat_f32_s (f32.floor (local.get $l))))))
+      (local.set $ct (select (local.get $ct) (i32.trunc_sat_f32_s (f32.floor (local.get $t)))
+        (i32.gt_s (local.get $ct) (i32.trunc_sat_f32_s (f32.floor (local.get $t))))))
+      (local.set $cr (select (local.get $cr) (i32.trunc_sat_f32_s (f32.ceil (local.get $r)))
+        (i32.lt_s (local.get $cr) (i32.trunc_sat_f32_s (f32.ceil (local.get $r))))))
+      (local.set $cb (select (local.get $cb) (i32.trunc_sat_f32_s (f32.ceil (local.get $b)))
+        (i32.lt_s (local.get $cb) (i32.trunc_sat_f32_s (f32.ceil (local.get $b))))))))
+    (if (i32.and (i32.gt_s (local.get $cr) (local.get $cl)) (i32.gt_s (local.get $cb) (local.get $ct)))
+      (then (call $d3dim_gpu_extent (i32.load (local.get $d))
+        (local.get $cl) (local.get $ct) (local.get $cr) (local.get $cb)))))
+
+  (func $d3g_scissor_draw (param $pb i32) (param $d i32) (param $depth i32) (param $zfunc i32) (param $zwrite i32)
+      (param $cull i32) (param $blend i32) (param $src i32) (param $dst i32) (param $afunc i32) (param $aref i32) (param $linear i32)
+    (if (i32.load offset=136 (local.get $d))
+      (then (call $d3g_raster (local.get $pb) (local.get $depth) (local.get $zfunc) (local.get $zwrite) (local.get $cull)
+        (local.get $blend) (local.get $src) (local.get $dst) (local.get $afunc) (local.get $aref)
+        (i32.load offset=140 (local.get $d)) (i32.load offset=144 (local.get $d))
+        (i32.load offset=148 (local.get $d)) (i32.load offset=152 (local.get $d)) (local.get $linear)))
+      (else (call $d3g_raster (local.get $pb) (local.get $depth) (local.get $zfunc) (local.get $zwrite) (local.get $cull)
+        (local.get $blend) (local.get $src) (local.get $dst) (local.get $afunc) (local.get $aref)
+        (i32.const 0) (i32.const 0) (i32.load offset=4 (local.get $d)) (i32.load offset=8 (local.get $d)) (local.get $linear)))))
+
+  ;; POINTLIST as viewport_fill_rect paints it: a rounded 2x2 diffuse
+  ;; overwrite, clipped to surface and viewport, depth per ZENABLE.
+  (func $d3g_points (param $pb i32) (param $d i32) (param $verts i32) (param $count i32) (param $istride i32) (result i32)
+    (local $t i32) (local $zen i32) (local $ds i32) (local $src i32) (local $i i32) (local $s i32)
+    (local $x i32) (local $y i32) (local $l i32) (local $tp i32) (local $r i32) (local $b i32)
+    (local $cl i32) (local $ct i32) (local $cr i32) (local $cb i32) (local $sz f32) (local $z f32)
+    (local $pos i32) (local $o i32) (local $n i32) (local $chunk i32) (local $f f32)
+    (local $bl i32) (local $bt i32) (local $br i32) (local $bb i32)
+    (local.set $t (call $d3g_target (local.get $pb) (i32.load (local.get $d)) (i32.load offset=20 (local.get $d))
+      (i32.load offset=4 (local.get $d)) (i32.load offset=8 (local.get $d)) (i32.load offset=12 (local.get $d))
+      (i32.load offset=16 (local.get $d)) (i32.load offset=24 (local.get $d))))
+    (if (i32.eqz (local.get $t)) (then (call $d3g_decline (local.get $pb) (i32.const 0))))
+    (local.set $zen (i32.ne (i32.load offset=64 (local.get $d)) (i32.const 0)))
+    (if (i32.and (local.get $zen) (i32.or (i32.lt_u (i32.load offset=68 (local.get $d)) (i32.const 1))
+          (i32.gt_u (i32.load offset=68 (local.get $d)) (i32.const 8))))
+      (then (call $d3g_decline (local.get $pb) (i32.const 2))))
+    (local.set $ds (call $d3g_depth (local.get $pb) (i32.load (local.get $d))
+      (i32.load offset=4 (local.get $d)) (i32.load offset=8 (local.get $d)) (local.get $zen)))
+    (if (i32.and (local.get $zen) (i32.eqz (local.get $ds))) (then (call $d3g_decline (local.get $pb) (i32.const 4))))
+    (call $d3g_prepare (local.get $pb) (local.get $t) (i32.const 0))
+    (call $d3g_targets (local.get $pb) (i32.load offset=28 (local.get $t)) (local.get $ds))
+    (call $d3g_raster (local.get $pb) (local.get $zen)
+      (select (i32.load offset=68 (local.get $d)) (i32.const 8) (local.get $zen))
+      (i32.and (local.get $zen) (i32.ne (i32.load offset=72 (local.get $d)) (i32.const 0)))
+      (i32.const 1) (i32.const 0) (i32.const 2) (i32.const 1) (i32.const 8) (i32.const 0)
+      (i32.const 0) (i32.const 0) (i32.load offset=8 (local.get $t)) (i32.load offset=12 (local.get $t)) (i32.const 0))
+    (call $d3g_bind (local.get $pb) (i32.const 0) (i32.const 0))
+    (local.set $cr (i32.load offset=8 (local.get $t)))
+    (local.set $cb (i32.load offset=12 (local.get $t)))
+    (if (i32.load offset=136 (local.get $d)) (then
+      (local.set $cl (i32.load offset=140 (local.get $d)))
+      (local.set $ct (i32.load offset=144 (local.get $d)))
+      (if (i32.lt_s (i32.load offset=148 (local.get $d)) (local.get $cr)) (then (local.set $cr (i32.load offset=148 (local.get $d)))))
+      (if (i32.lt_s (i32.load offset=152 (local.get $d)) (local.get $cb)) (then (local.set $cb (i32.load offset=152 (local.get $d)))))))
+    (if (i32.lt_s (local.get $cl) (i32.const 0)) (then (local.set $cl (i32.const 0))))
+    (if (i32.lt_s (local.get $ct) (i32.const 0)) (then (local.set $ct (i32.const 0))))
+    (local.set $bl (i32.const 0x7fffffff)) (local.set $bt (i32.const 0x7fffffff))
+    (local.set $br (i32.const 0x80000000)) (local.set $bb (i32.const 0x80000000))
+    (local.set $src (call $g2w (local.get $verts)))
+    (block $all (loop $chunks
+      (br_if $all (i32.ge_u (local.get $i) (local.get $count)))
+      (local.set $chunk (i32.sub (local.get $count) (local.get $i)))
+      (if (i32.gt_u (local.get $chunk) (i32.const 8192)) (then (local.set $chunk (i32.const 8192))))
+      (local.set $pos (call $d3g_arena (i32.mul (local.get $chunk) (i32.const 192))))
+      (local.set $o (call $d3g_aptr (local.get $pos)))
+      (local.set $n (i32.const 0))
+      (block $pts_done (loop $pts
+        (br_if $pts_done (i32.eqz (local.get $chunk)))
+        (local.set $s (i32.add (local.get $src) (i32.mul (local.get $i) (local.get $istride))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (local.set $chunk (i32.sub (local.get $chunk) (i32.const 1)))
+        (local.set $f (f32.load (local.get $s)))
+        (local.set $x (if (result i32) (f32.ne (local.get $f) (local.get $f)) (then (i32.const 0))
+          (else (i32.trunc_sat_f32_s (f32.floor (f32.add (f32.min (f32.const 1000000) (f32.max (f32.const -1000000) (local.get $f))) (f32.const 0.5)))))))
+        (local.set $f (f32.load offset=4 (local.get $s)))
+        (local.set $y (if (result i32) (f32.ne (local.get $f) (local.get $f)) (then (i32.const 0))
+          (else (i32.trunc_sat_f32_s (f32.floor (f32.add (f32.min (f32.const 1000000) (f32.max (f32.const -1000000) (local.get $f))) (f32.const 0.5)))))))
+        (local.set $l (select (local.get $x) (local.get $cl) (i32.gt_s (local.get $x) (local.get $cl))))
+        (local.set $tp (select (local.get $y) (local.get $ct) (i32.gt_s (local.get $y) (local.get $ct))))
+        (local.set $r (select (i32.add (local.get $x) (i32.const 2)) (local.get $cr) (i32.lt_s (i32.add (local.get $x) (i32.const 2)) (local.get $cr))))
+        (local.set $b (select (i32.add (local.get $y) (i32.const 2)) (local.get $cb) (i32.lt_s (i32.add (local.get $y) (i32.const 2)) (local.get $cb))))
+        (br_if $pts (i32.or (i32.le_s (local.get $r) (local.get $l)) (i32.le_s (local.get $b) (local.get $tp))))
+        (local.set $sz (select (f32.load offset=8 (local.get $s)) (f32.const 0) (local.get $zen)))
+        (br_if $pts (f32.ne (local.get $sz) (local.get $sz)))
+        (local.set $z (select (f32.min (local.get $sz) (f32.const 1)) (f32.const 0) (f32.gt (local.get $sz) (f32.const 0))))
+        (call $d3g_quad (i32.add (local.get $o) (i32.mul (local.get $n) (i32.const 192)))
+          (f32.convert_i32_s (local.get $l)) (f32.convert_i32_s (local.get $tp))
+          (f32.convert_i32_s (local.get $r)) (f32.convert_i32_s (local.get $b)) (local.get $z)
+          (i32.load offset=16 (local.get $s)) (f32.const 0) (f32.const 0) (f32.const 0) (f32.const 0))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (if (i32.lt_s (local.get $l) (local.get $bl)) (then (local.set $bl (local.get $l))))
+        (if (i32.lt_s (local.get $tp) (local.get $bt)) (then (local.set $bt (local.get $tp))))
+        (if (i32.gt_s (local.get $r) (local.get $br)) (then (local.set $br (local.get $r))))
+        (if (i32.gt_s (local.get $b) (local.get $bb)) (then (local.set $bb (local.get $b))))
+        (br $pts)))
+      (if (local.get $n) (then
+        (call $d3g_draw_up (local.get $pb) (global.get $GPS_PRIM_TRIANGLELIST)
+          (call $d3g_shader (local.get $pb) (i32.const 0))
+          (i32.load offset=4 (local.get $pb)) (i32.const 32) (local.get $pos) (i32.mul (local.get $n) (i32.const 6)))))
+      (br $chunks)))
+    (if (i32.gt_s (local.get $br) (local.get $bl)) (then
+      (call $d3g_mark (local.get $t) (i32.const 1)
+        (f32.convert_i32_s (local.get $bl)) (f32.convert_i32_s (local.get $bt))
+        (f32.convert_i32_s (local.get $br)) (f32.convert_i32_s (local.get $bb)))
+      (call $d3g_extent (local.get $d) (i32.const 1)
+        (f32.convert_i32_s (local.get $bl)) (f32.convert_i32_s (local.get $bt))
+        (f32.convert_i32_s (local.get $br)) (f32.convert_i32_s (local.get $bb)))))
+    (i32.store offset=32 (local.get $t) (i32.or (i32.load offset=32 (local.get $t)) (i32.const 4)))
+    (call $d3g_stat (local.get $pb) (i32.const 12) (local.get $count))
+    (i32.const 1))
+
+  (func $d3g_opmap (param $v i32) (result i32)
+    (if (result i32) (i32.or (i32.or (i32.eq (local.get $v) (i32.const 2)) (i32.eq (local.get $v) (i32.const 3)))
+          (i32.eq (local.get $v) (i32.const 13)))
+      (then (local.get $v)) (else (i32.const 4))))
+
+  ;; 0x20000: the draw record {this, primitive, vertex type, vertices,
+  ;; count, state}. 1 = lowered into the stream, 0 = nothing to draw (too few
+  ;; vertices, or no target/state to describe). Everything else traps.
+  (func $d3g_draw (param $pb i32) (param $desc i32) (result i32)
+    (local $this i32) (local $prim i32) (local $vtype i32) (local $verts i32) (local $count i32)
+    (local $lines i32) (local $istride i32) (local $dw i32) (local $d i32) (local $t i32)
+    (local $textured i32) (local $tex i32) (local $smp i32) (local $key i32) (local $a i32)
+    (local $flat i32) (local $depthless i32) (local $zen i32) (local $zfunc i32) (local $zwrite i32)
+    (local $cull i32) (local $blend i32) (local $sb i32) (local $db i32) (local $afunc i32)
+    (local $l40 i32) (local $os i32) (local $ds i32) (local $ps i32) (local $wrap i32) (local $m i32)
+    (local $nprim i32) (local $per i32) (local $k i32) (local $done i32) (local $chunk i32)
+    (local $pos i32) (local $out i32) (local $src i32) (local $j i32) (local $vi i32) (local $s i32)
+    (local $o i32) (local $prov i32) (local $i0 i32)
+    (local $x f32) (local $y f32) (local $z f32) (local $rhw f32) (local $u f32) (local $v f32)
+    (local $ru f32) (local $rv f32) (local $zz f32) (local $ww f32) (local $c i32)
+    (local $bl f32) (local $bt f32) (local $br f32) (local $bb f32) (local $bounded i32)
+    (local.set $this (i32.load (local.get $desc)))
+    (local.set $prim (i32.load offset=4 (local.get $desc)))
+    (local.set $vtype (i32.load offset=8 (local.get $desc)))
+    (local.set $verts (i32.load offset=12 (local.get $desc)))
+    (local.set $count (i32.load offset=16 (local.get $desc)))
+    (local.set $istride (select (i32.const 40) (i32.const 32) (i32.ge_u (local.get $vtype) (i32.const 5))))
+    (local.set $lines (i32.or (i32.eq (local.get $prim) (i32.const 2)) (i32.eq (local.get $prim) (i32.const 3))))
+    (if (i32.or (i32.lt_u (local.get $vtype) (i32.const 3)) (i32.gt_u (local.get $vtype) (i32.const 6)))
+      (then (return (i32.const 0))))
+    (if (i32.eq (local.get $prim) (i32.const 1))
+      (then (if (i32.lt_u (local.get $count) (i32.const 1)) (then (return (i32.const 0)))))
+      (else (if (local.get $lines)
+        (then (if (i32.lt_u (local.get $count) (i32.const 2)) (then (return (i32.const 0)))))
+        (else (if (i32.or (i32.or (i32.lt_u (local.get $prim) (i32.const 4)) (i32.gt_u (local.get $prim) (i32.const 6)))
+                    (i32.lt_u (local.get $count) (i32.const 3)))
+          (then (return (i32.const 0))))))))
+    (local.set $dw (call $d3dim_gpu_describe (local.get $this)))
+    (if (i32.eqz (local.get $dw)) (then (return (i32.const 0))))
+    (local.set $d (i32.add (local.get $pb) (i32.const 192)))
+    (memory.copy (local.get $d) (local.get $dw) (i32.const 192))
+    (if (i32.eq (local.get $prim) (i32.const 1))
+      (then (return (call $d3g_points (local.get $pb) (local.get $d) (local.get $verts) (local.get $count) (local.get $istride)))))
+    (local.set $t (call $d3g_target (local.get $pb) (i32.load (local.get $d)) (i32.load offset=20 (local.get $d))
+      (i32.load offset=4 (local.get $d)) (i32.load offset=8 (local.get $d)) (i32.load offset=12 (local.get $d))
+      (i32.load offset=16 (local.get $d)) (i32.load offset=24 (local.get $d))))
+    (if (i32.eqz (local.get $t)) (then (call $d3g_decline (local.get $pb) (i32.const 0))))
+    (local.set $textured (i32.and (i32.and (i32.eqz (local.get $lines))
+        (i32.ne (i32.load offset=88 (local.get $d)) (i32.const 1)))
+      (i32.and (i32.and (i32.ne (i32.load offset=28 (local.get $d)) (i32.const 0))
+                        (i32.ne (i32.load offset=48 (local.get $d)) (i32.const 0)))
+        (i32.and (i32.and (i32.ne (i32.load offset=32 (local.get $d)) (i32.const 0))
+                          (i32.ne (i32.load offset=36 (local.get $d)) (i32.const 0)))
+                 (i32.ne (i32.load offset=44 (local.get $d)) (i32.const 0))))))
+    (local.set $wrap (i32.load offset=132 (local.get $d)))
+    (if (local.get $textured) (then
+      ;; Stage 0 operands, by the software rasterizer's rule
+      ;; ($d3dim_stage_operation), so a draw reads the same operands on
+      ;; either path: ARG1 (k 0, 2) is diffuse for DIFFUSE/CURRENT and the
+      ;; texture otherwise; ARG2 (k 1, 3) is the texture for exactly TEXTURE
+      ;; and diffuse otherwise. Any other selector (TFACTOR, SPECULAR,
+      ;; modifiers) gets the software path's approximation, not a decline.
+      (local.set $k (i32.const 0))
+      (loop $args
+        (local.set $a (i32.load (i32.add (i32.add (local.get $d) (i32.const 164)) (i32.shl (local.get $k) (i32.const 2)))))
+        (if (if (result i32) (i32.and (local.get $k) (i32.const 1))
+              (then (i32.eq (local.get $a) (i32.const 2)))
+              (else (i32.gt_u (local.get $a) (i32.const 1))))
+          (then (local.set $key (i32.or (local.get $key) (i32.shl (i32.const 0x200) (local.get $k))))))
+        (local.set $k (i32.add (local.get $k) (i32.const 1)))
+        (br_if $args (i32.lt_u (local.get $k) (i32.const 4))))
+      (local.set $tex (call $d3g_texture (local.get $pb) (local.get $d) (i32.load (local.get $t))))
+      (if (i32.eqz (local.get $tex)) (then (call $d3g_decline (local.get $pb) (i32.const 1)) (return (i32.const 0))))
+      (local.set $smp (call $d3g_sampler (local.get $pb)
+        (i32.or (i32.or (call $d3g_addr (i32.load offset=96 (local.get $d)))
+            (i32.shl (call $d3g_addr (i32.load offset=100 (local.get $d))) (i32.const 4)))
+          (i32.or (i32.or
+              (i32.shl (select (i32.load offset=180 (local.get $d)) (select (i32.const 2) (i32.const 1) (i32.load offset=104 (local.get $d)))
+                (i32.load offset=180 (local.get $d))) (i32.const 8))
+              (i32.shl (select (i32.load offset=184 (local.get $d)) (select (i32.const 2) (i32.const 1) (i32.load offset=104 (local.get $d)))
+                (i32.load offset=184 (local.get $d))) (i32.const 12)))
+            (i32.shl (select (i32.load offset=188 (local.get $d)) (i32.const 2) (i32.le_u (i32.load offset=188 (local.get $d)) (i32.const 2)))
+              (i32.const 16))))))
+      (local.set $key (i32.or (local.get $key) (i32.or (i32.const 1)
+        (i32.or (i32.shl (select (i32.const 7) (call $d3g_opmap (i32.load offset=88 (local.get $d)))
+                  (i32.eq (i32.load offset=88 (local.get $d)) (i32.const 7))) (i32.const 1))
+                (i32.shl (call $d3g_opmap (i32.load offset=92 (local.get $d))) (i32.const 5))))))
+      (if (i32.and (i32.ne (i32.load offset=52 (local.get $d)) (i32.const 0)) (i32.eqz (i32.load offset=160 (local.get $d))))
+        (then (local.set $key (i32.or (local.get $key) (i32.const 0x2000)))))
+      (local.set $l40 (i32.ge_u (local.get $vtype) (i32.const 4)))
+      (if (i32.and (local.get $l40) (i32.ne (local.get $vtype) (i32.const 6)))
+        (then (local.set $key (i32.or (local.get $key) (i32.const 0x8000)))))))
+    (if (i32.and (i32.eqz (local.get $lines)) (i32.ne (i32.load offset=124 (local.get $d)) (i32.const 0)))
+      (then (local.set $key (i32.or (local.get $key) (i32.const 0x4000)))))
+    ;; Depth, cull, blend, alpha test.
+    (local.set $zen (i32.ne (i32.load offset=64 (local.get $d)) (i32.const 0)))
+    (local.set $zfunc (i32.load offset=68 (local.get $d)))
+    (if (i32.and (local.get $zen) (i32.or (i32.lt_u (local.get $zfunc) (i32.const 1)) (i32.gt_u (local.get $zfunc) (i32.const 8))))
+      (then (call $d3g_decline (local.get $pb) (i32.const 2)) (return (i32.const 0))))
+    (local.set $zwrite (i32.and (local.get $zen) (i32.ne (i32.load offset=72 (local.get $d)) (i32.const 0))))
+    (if (i32.eqz (local.get $lines)) (then
+      (local.set $cull (i32.load offset=108 (local.get $d)))
+      (local.set $blend (i32.ne (i32.load offset=76 (local.get $d)) (i32.const 0)))
+      (local.set $sb (i32.load offset=80 (local.get $d)))
+      (local.set $db (i32.load offset=84 (local.get $d)))
+      (local.set $afunc (i32.load offset=116 (local.get $d)))))
+    (if (i32.eqz (local.get $zen)) (then (local.set $zfunc (i32.const 8))))
+    (if (i32.and (i32.ne (local.get $cull) (i32.const 2)) (i32.ne (local.get $cull) (i32.const 3)))
+      (then (local.set $cull (i32.const 1))))
+    (if (i32.eq (local.get $sb) (i32.const 12)) (then (local.set $sb (i32.const 5)) (local.set $db (i32.const 6))))
+    (if (i32.eq (local.get $sb) (i32.const 13)) (then (local.set $sb (i32.const 6)) (local.set $db (i32.const 5))))
+    (if (i32.eqz (local.get $blend)) (then (local.set $sb (i32.const 2)) (local.set $db (i32.const 1))))
+    (if (i32.or (i32.or (i32.lt_u (local.get $sb) (i32.const 1)) (i32.gt_u (local.get $sb) (i32.const 11)))
+                (i32.or (i32.lt_u (local.get $db) (i32.const 1)) (i32.gt_u (local.get $db) (i32.const 11))))
+      (then (call $d3g_decline (local.get $pb) (i32.const 3)) (return (i32.const 0))))
+    ;; 16-bit destination alpha (A1R5G5B5, A4R4G4B4) blends on the GPU: the
+    ;; A8B8G8R8 target holds the alpha the DIB had at upload (row_to_rgba
+    ;; widens 1 and 4 bits) and readback narrows it again (rgba_to_row). The
+    ;; one difference from the software rasterizer is that alpha written by
+    ;; one draw is kept at 8 bits until readback instead of being narrowed
+    ;; per draw; a later DESTALPHA blend in the same frame can see it.
+    (if (i32.or (i32.lt_u (local.get $afunc) (i32.const 1)) (i32.gt_u (local.get $afunc) (i32.const 8)))
+      (then (local.set $afunc (i32.const 8))))
+    (local.set $ds (call $d3g_depth (local.get $pb) (i32.load (local.get $d))
+      (i32.load offset=4 (local.get $d)) (i32.load offset=8 (local.get $d)) (local.get $zen)))
+    (if (i32.and (local.get $zen) (i32.eqz (local.get $ds)))
+      (then (call $d3g_decline (local.get $pb) (i32.const 4)) (return (i32.const 0))))
+    (call $d3g_prepare (local.get $pb) (local.get $t) (i32.const 0))
+    (call $d3g_targets (local.get $pb) (i32.load offset=28 (local.get $t)) (local.get $ds))
+    (call $d3g_scissor_draw (local.get $pb) (local.get $d) (local.get $zen) (local.get $zfunc) (local.get $zwrite)
+      (local.get $cull) (local.get $blend) (local.get $sb) (local.get $db) (local.get $afunc)
+      (i32.and (i32.load offset=120 (local.get $d)) (i32.const 255)) (i32.ne (i32.and (local.get $key) (i32.const 0x8000)) (i32.const 0)))
+    (local.set $ps (call $d3g_shader (local.get $pb) (local.get $key)))
+    (call $d3g_bind (local.get $pb) (local.get $tex) (local.get $smp))
+    (if (i32.and (local.get $key) (i32.const 0x6000))
+      (then (call $d3g_consts (local.get $pb) (i32.load offset=128 (local.get $d)))))
+    ;; Vertices: expanded per primitive, so each keeps its provoking colour
+    ;; and its own wrap correction.
+    (local.set $flat (i32.or (local.get $lines) (i32.eq (i32.load offset=112 (local.get $d)) (i32.const 1))))
+    (local.set $depthless (i32.and (i32.lt_u (local.get $vtype) (i32.const 4))
+      (i32.and (i32.eqz (i32.load offset=64 (local.get $d))) (i32.eqz (i32.load offset=72 (local.get $d))))))
+    (local.set $per (select (i32.const 2) (i32.const 3) (local.get $lines)))
+    (local.set $nprim
+      (if (result i32) (i32.eq (local.get $prim) (i32.const 2)) (then (i32.shr_u (local.get $count) (i32.const 1)))
+        (else (if (result i32) (i32.eq (local.get $prim) (i32.const 3)) (then (i32.sub (local.get $count) (i32.const 1)))
+          (else (if (result i32) (i32.eq (local.get $prim) (i32.const 4)) (then (i32.div_u (local.get $count) (i32.const 3)))
+            (else (i32.sub (local.get $count) (i32.const 2)))))))))
+    (local.set $os (select (i32.const 40) (i32.const 32) (local.get $l40)))
+    (if (local.get $l40) (then
+      (local.set $m (call $d3dim_supplied_matrix (call $d3ddev_state (local.get $this))))))
+    (local.set $src (call $g2w (local.get $verts)))
+    (local.set $bounded (i32.const 1))
+    (local.set $bl (f32.const inf)) (local.set $bt (f32.const inf))
+    (local.set $br (f32.const -inf)) (local.set $bb (f32.const -inf))
+    (block $all (loop $chunks
+      (br_if $all (i32.ge_u (local.get $done) (local.get $nprim)))
+      (local.set $chunk (i32.sub (local.get $nprim) (local.get $done)))
+      (if (i32.gt_u (local.get $chunk) (i32.const 16384)) (then (local.set $chunk (i32.const 16384))))
+      (local.set $pos (call $d3g_arena (i32.mul (i32.mul (local.get $chunk) (local.get $per)) (local.get $os))))
+      (local.set $out (call $d3g_aptr (local.get $pos)))
+      (local.set $k (i32.const 0))
+      (block $prims_done (loop $prims
+        (br_if $prims_done (i32.ge_u (local.get $k) (local.get $chunk)))
+        (local.set $vi (i32.add (local.get $done) (local.get $k)))
+        (local.set $j (i32.const 0))
+        (loop $verts_loop
+          ;; Source index of vertex $j of primitive $vi.
+          (local.set $i0
+            (if (result i32) (local.get $lines)
+              (then (i32.add (i32.mul (local.get $vi) (select (i32.const 1) (i32.const 2) (i32.eq (local.get $prim) (i32.const 3)))) (local.get $j)))
+              (else (if (result i32) (i32.eq (local.get $prim) (i32.const 4))
+                (then (i32.add (i32.mul (local.get $vi) (i32.const 3)) (local.get $j)))
+                (else (if (result i32) (i32.eq (local.get $prim) (i32.const 5))
+                  (then (if (result i32) (i32.and (i32.and (local.get $vi) (i32.const 1)) (i32.lt_u (local.get $j) (i32.const 2)))
+                    (then (i32.add (local.get $vi) (i32.sub (i32.const 1) (local.get $j))))
+                    (else (i32.add (local.get $vi) (local.get $j)))))
+                  (else (select (i32.add (local.get $vi) (local.get $j)) (i32.const 0) (local.get $j)))))))))
+          (local.set $s (i32.add (local.get $src) (i32.mul (local.get $i0) (local.get $istride))))
+          (if (i32.eqz (local.get $j)) (then
+            (local.set $prov (i32.load offset=16 (local.get $s)))
+            (local.set $ru (f32.load offset=24 (local.get $s)))
+            (local.set $rv (f32.load offset=28 (local.get $s)))))
+          (local.set $o (i32.add (local.get $out)
+            (i32.mul (i32.add (i32.mul (local.get $k) (local.get $per)) (local.get $j)) (local.get $os))))
+          (local.set $x (f32.load (local.get $s)))
+          (local.set $y (f32.load offset=4 (local.get $s)))
+          (local.set $z (f32.load offset=8 (local.get $s)))
+          (local.set $rhw (f32.load offset=12 (local.get $s)))
+          (if (local.get $depthless) (then
+            (local.set $z (if (result f32) (i32.and (f32.gt (local.get $z) (f32.const 0)) (f32.lt (local.get $z) (f32.const 1)))
+              (then (local.get $z)) (else (select (f32.const 1) (f32.const 0) (f32.ge (local.get $z) (f32.const 1))))))))
+          (if (local.get $bounded) (then
+            (if (i32.and (i32.and (call $d3g_f32_ok (local.get $x)) (call $d3g_f32_ok (local.get $y)))
+                         (f32.gt (local.get $rhw) (f32.const 0)))
+              (then
+                (local.set $bl (f32.min (local.get $bl) (local.get $x)))
+                (local.set $bt (f32.min (local.get $bt) (local.get $y)))
+                (local.set $br (f32.max (local.get $br) (local.get $x)))
+                (local.set $bb (f32.max (local.get $bb) (local.get $y))))
+              (else (local.set $bounded (i32.const 0))))))
+          (if (i32.or (f32.eq (local.get $rhw) (f32.const 0)) (i32.eqz (call $d3g_f32_ok (local.get $rhw))))
+            (then (local.set $rhw (f32.const 1))))
+          (f32.store (local.get $o) (local.get $x))
+          (f32.store offset=4 (local.get $o) (local.get $y))
+          (f32.store offset=8 (local.get $o) (local.get $z))
+          (f32.store offset=12 (local.get $o) (local.get $rhw))
+          (i32.store offset=16 (local.get $o) (select (local.get $prov) (i32.load offset=16 (local.get $s)) (local.get $flat)))
+          (i32.store offset=20 (local.get $o) (i32.load offset=20 (local.get $s)))
+          (local.set $u (f32.load offset=24 (local.get $s)))
+          (local.set $v (f32.load offset=28 (local.get $s)))
+          (if (i32.and (local.get $textured) (i32.ne (local.get $j) (i32.const 0))) (then
+            (if (i32.and (local.get $wrap) (i32.const 1)) (then
+              (if (f32.gt (f32.sub (local.get $u) (local.get $ru)) (f32.const 0.5))
+                (then (local.set $u (f32.sub (local.get $u) (f32.const 1))))
+                (else (if (f32.gt (f32.sub (local.get $ru) (local.get $u)) (f32.const 0.5))
+                  (then (local.set $u (f32.add (local.get $u) (f32.const 1)))))))))
+            (if (i32.and (local.get $wrap) (i32.const 2)) (then
+              (if (f32.gt (f32.sub (local.get $v) (local.get $rv)) (f32.const 0.5))
+                (then (local.set $v (f32.sub (local.get $v) (f32.const 1))))
+                (else (if (f32.gt (f32.sub (local.get $rv) (local.get $v)) (f32.const 0.5))
+                  (then (local.set $v (f32.add (local.get $v) (f32.const 1)))))))))))
+          (if (local.get $l40)
+            (then
+              ;; Supplied texture transform: all four homogeneous components.
+              (local.set $zz (select (f32.load offset=32 (local.get $s)) (f32.const 0) (i32.ge_u (local.get $vtype) (i32.const 5))))
+              (local.set $ww (select (f32.load offset=36 (local.get $s)) (f32.const 1) (i32.ge_u (local.get $vtype) (i32.const 5))))
+              (local.set $c (i32.const 0))
+              (loop $comps
+                (f32.store offset=24 (i32.add (local.get $o) (i32.shl (local.get $c) (i32.const 2)))
+                  (f32.add
+                    (f32.add (f32.mul (local.get $u) (f32.load (i32.add (local.get $m) (i32.shl (local.get $c) (i32.const 2)))))
+                             (f32.mul (local.get $v) (f32.load offset=16 (i32.add (local.get $m) (i32.shl (local.get $c) (i32.const 2))))))
+                    (f32.add (f32.mul (local.get $zz) (f32.load offset=32 (i32.add (local.get $m) (i32.shl (local.get $c) (i32.const 2)))))
+                             (f32.mul (local.get $ww) (f32.load offset=48 (i32.add (local.get $m) (i32.shl (local.get $c) (i32.const 2))))))))
+                (local.set $c (i32.add (local.get $c) (i32.const 1)))
+                (br_if $comps (i32.lt_u (local.get $c) (i32.const 4)))))
+            (else
+              (f32.store offset=24 (local.get $o) (local.get $u))
+              (f32.store offset=28 (local.get $o) (local.get $v))))
+          ;; Projected U/Q and V/Q already cancel the geometric perspective
+          ;; denominator. Carry U/w,V/w,Q/w explicitly with linear varyings:
+          ;; the ratios stay rational while diffuse and vertex fog stay affine.
+          (if (i32.and (local.get $key) (i32.const 0x8000)) (then
+            (local.set $c (i32.const 0))
+            (loop $weight
+              (local.set $s (i32.add (local.get $o) (i32.add (i32.const 24) (i32.shl (local.get $c) (i32.const 2)))))
+              (f32.store (local.get $s) (f32.mul (f32.load (local.get $s)) (local.get $rhw)))
+              (local.set $c (i32.add (local.get $c) (i32.const 1)))
+              (br_if $weight (i32.lt_u (local.get $c) (i32.const 4))))))
+          (local.set $j (i32.add (local.get $j) (i32.const 1)))
+          (br_if $verts_loop (i32.lt_u (local.get $j) (local.get $per))))
+        (local.set $k (i32.add (local.get $k) (i32.const 1)))
+        (br $prims)))
+      (call $d3g_draw_up (local.get $pb)
+        (select (global.get $GPS_PRIM_LINELIST) (global.get $GPS_PRIM_TRIANGLELIST) (local.get $lines))
+        (local.get $ps) (select (i32.load offset=8 (local.get $pb)) (i32.load offset=4 (local.get $pb)) (local.get $l40))
+        (local.get $os) (local.get $pos) (i32.mul (local.get $chunk) (local.get $per)))
+      (local.set $done (i32.add (local.get $done) (local.get $chunk)))
+      (br $chunks)))
+    ;; Two pixels cover integer-centre conversion and one-pixel lines.
+    (call $d3g_mark (local.get $t) (local.get $bounded)
+      (f32.sub (local.get $bl) (f32.const 2)) (f32.sub (local.get $bt) (f32.const 2))
+      (f32.add (local.get $br) (f32.const 2)) (f32.add (local.get $bb) (f32.const 2)))
+    (call $d3g_extent (local.get $d) (local.get $bounded)
+      (f32.sub (local.get $bl) (f32.const 2)) (f32.sub (local.get $bt) (f32.const 2))
+      (f32.add (local.get $br) (f32.const 2)) (f32.add (local.get $bb) (f32.const 2)))
+    (call $d3g_stat (local.get $pb) (i32.const 0) (i32.const 1))
+    (call $d3g_stat (local.get $pb) (i32.const 15) (local.get $nprim))
+    (i32.const 1))
+
+  ;; ---- Clear (0x20004) -----------------------------------------------------
+  (func $d3g_clear (param $pb i32) (param $desc i32) (result i32)
+    (local $rt i32) (local $flags i32) (local $color i32) (local $z f32) (local $x i32) (local $y i32)
+    (local $w i32) (local $hgt i32) (local $t i32) (local $l i32) (local $tp i32) (local $r i32) (local $b i32)
+    (local $d i32) (local $tex i32) (local $ds i32) (local $p i32)
+    (local.set $rt (i32.load (local.get $desc)))
+    (local.set $flags (i32.and (i32.load offset=4 (local.get $desc)) (i32.const 3)))
+    (local.set $color (i32.load offset=8 (local.get $desc)))
+    (local.set $z (f32.load offset=12 (local.get $desc)))
+    (local.set $x (i32.load offset=16 (local.get $desc)))
+    (local.set $y (i32.load offset=20 (local.get $desc)))
+    (local.set $w (i32.load offset=24 (local.get $desc)))
+    (local.set $hgt (i32.load offset=28 (local.get $desc)))
+    ;; A target the GPU has never drawn on stays in software.
+    (local.set $t (call $d3g_find (local.get $pb) (load.field DxObject misc1 (local.get $rt))))
+    (if (i32.or (i32.eqz (local.get $t)) (i32.eqz (i32.and (i32.load offset=32 (local.get $t)) (i32.const 4))))
+      (then (return (i32.const 0))))
+    (local.set $t (call $d3g_target (local.get $pb) (local.get $rt) (load.field DxObject misc1 (local.get $rt))
+      (load.field DxObject width (local.get $rt)) (load.field DxObject height (local.get $rt))
+      (load.field DxObject bpp (local.get $rt)) (load.field DxObject pitch (local.get $rt))
+      (call $dx_surf_fmt_get (local.get $rt))))
+    (if (i32.eqz (local.get $t)) (then (call $d3g_decline (local.get $pb) (i32.const 5)) (return (i32.const 0))))
+    (local.set $l (select (local.get $x) (i32.const 0) (i32.gt_s (local.get $x) (i32.const 0))))
+    (local.set $tp (select (local.get $y) (i32.const 0) (i32.gt_s (local.get $y) (i32.const 0))))
+    (local.set $r (i32.add (local.get $x) (local.get $w)))
+    (if (i32.gt_s (local.get $r) (i32.load offset=8 (local.get $t))) (then (local.set $r (i32.load offset=8 (local.get $t)))))
+    (local.set $b (i32.add (local.get $y) (local.get $hgt)))
+    (if (i32.gt_s (local.get $b) (i32.load offset=12 (local.get $t))) (then (local.set $b (i32.load offset=12 (local.get $t)))))
+    ;; Background image: describe's texture words, unkeyed, no mips.
+    (local.set $tex (i32.and (i32.ne (i32.and (local.get $flags) (i32.const 1)) (i32.const 0))
+      (i32.ne (i32.load offset=32 (local.get $desc)) (i32.const 0))))
+    (if (local.get $tex) (then
+      (if (i32.or (i32.or (i32.eqz (i32.load offset=36 (local.get $desc))) (i32.eqz (i32.load offset=40 (local.get $desc))))
+                  (i32.or (i32.eqz (i32.load offset=48 (local.get $desc))) (i32.eqz (i32.load offset=52 (local.get $desc)))))
+        (then (call $d3g_decline (local.get $pb) (i32.const 6)) (return (i32.const 0))))))
+    (call $d3g_prepare (local.get $pb) (local.get $t)
+      (i32.and (i32.ne (i32.and (local.get $flags) (i32.const 1)) (i32.const 0))
+        (i32.and (i32.and (i32.eqz (local.get $l)) (i32.eqz (local.get $tp)))
+          (i32.and (i32.eq (local.get $r) (i32.load offset=8 (local.get $t))) (i32.eq (local.get $b) (i32.load offset=12 (local.get $t)))))))
+    (if (i32.or (i32.or (i32.le_s (local.get $r) (local.get $l)) (i32.le_s (local.get $b) (local.get $tp))) (i32.eqz (local.get $flags)))
+      (then (return (i32.const 1))))
+    (local.set $ds (call $d3g_depth (local.get $pb) (local.get $rt)
+      (i32.load offset=8 (local.get $t)) (i32.load offset=12 (local.get $t))
+      (i32.ne (i32.and (local.get $flags) (i32.const 2)) (i32.const 0))))
+    (if (i32.and (i32.ne (i32.and (local.get $flags) (i32.const 2)) (i32.const 0)) (i32.eqz (local.get $ds)))
+      (then (call $d3g_fail)))
+    (if (local.get $tex) (then
+      (local.set $d (i32.add (local.get $pb) (i32.const 192)))
+      (memory.fill (local.get $d) (i32.const 0) (i32.const 192))
+      (i32.store offset=28 (local.get $d) (i32.load offset=32 (local.get $desc)))
+      (i32.store offset=32 (local.get $d) (i32.load offset=36 (local.get $desc)))
+      (i32.store offset=36 (local.get $d) (i32.load offset=40 (local.get $desc)))
+      (i32.store offset=40 (local.get $d) (i32.load offset=44 (local.get $desc)))
+      (i32.store offset=44 (local.get $d) (i32.load offset=48 (local.get $desc)))
+      (i32.store offset=48 (local.get $d) (i32.load offset=52 (local.get $desc)))
+      (i32.store offset=56 (local.get $d) (i32.load offset=56 (local.get $desc)))
+      (i32.store offset=60 (local.get $d) (i32.load offset=60 (local.get $desc)))
+      (i32.store offset=156 (local.get $d) (i32.load offset=64 (local.get $desc)))
+      (local.set $p (call $d3g_texture (local.get $pb) (local.get $d) (i32.load (local.get $t))))
+      (if (i32.eqz (local.get $p)) (then (return (i32.const 0))))
+      (call $d3g_targets (local.get $pb) (i32.load offset=28 (local.get $t)) (local.get $ds))
+      (call $d3g_blit (local.get $pb) (local.get $p) (i32.const 0) (i32.const 0)
+        (f32.convert_i32_s (local.get $x)) (f32.convert_i32_s (local.get $y))
+        (f32.convert_i32_s (i32.add (local.get $x) (local.get $w))) (f32.convert_i32_s (i32.add (local.get $y) (local.get $hgt)))
+        (f32.const 0) (f32.const 0) (f32.const 1) (f32.const 1)
+        (i32.const 0) (i32.const 0) (i32.load offset=8 (local.get $t)) (i32.load offset=12 (local.get $t)))
+      (call $d3g_mark (local.get $t) (i32.const 1)
+        (f32.convert_i32_s (i32.sub (local.get $x) (i32.const 2))) (f32.convert_i32_s (i32.sub (local.get $y) (i32.const 2)))
+        (f32.convert_i32_s (i32.add (i32.add (local.get $x) (local.get $w)) (i32.const 2)))
+        (f32.convert_i32_s (i32.add (i32.add (local.get $y) (local.get $hgt)) (i32.const 2))))
+      (if (i32.eqz (i32.and (local.get $flags) (i32.const 2))) (then (return (i32.const 1))))
+      (local.set $flags (i32.const 2))))
+    (call $d3g_targets (local.get $pb) (i32.load offset=28 (local.get $t)) (local.get $ds))
+    (if (i32.eqz (call $d3g_f32_ok (local.get $z))) (then (local.set $z (f32.const 1))))
+    (local.set $z (f32.min (f32.const 1) (f32.max (f32.const 0) (local.get $z))))
+    (local.set $p (call $d3g_begin (local.get $pb) (global.get $GPS_OP_CLEAR) (size-of GpsClear)))
+    (store.field GpsClear mask (local.get $p) (local.get $flags))
+    (store.field GpsClear colormask (local.get $p) (i32.const 15))
+    (store.field GpsClear pad (local.get $p) (i32.const 0))
+    (store.field GpsClear rgba (local.get $p)
+      (i32.or (i32.or (i32.and (local.get $color) (i32.const 0xff00ff00))
+        (i32.and (i32.shr_u (local.get $color) (i32.const 16)) (i32.const 255)))
+        (i32.shl (i32.and (local.get $color) (i32.const 255)) (i32.const 16))))
+    (store.field GpsClear z (local.get $p) (local.get $z))
+    (store.field GpsClear stencil (local.get $p) (i32.const 0))
+    (store.field GpsClear left (local.get $p) (local.get $l))
+    (store.field GpsClear top (local.get $p) (local.get $tp))
+    (store.field GpsClear right (local.get $p) (local.get $r))
+    (store.field GpsClear bottom (local.get $p) (local.get $b))
+    (drop (call $d3g_end (local.get $p)))
+    (if (i32.and (local.get $flags) (i32.const 1))
+      (then (call $d3g_mark (local.get $t) (i32.const 1)
+        (f32.convert_i32_s (local.get $l)) (f32.convert_i32_s (local.get $tp))
+        (f32.convert_i32_s (local.get $r)) (f32.convert_i32_s (local.get $b)))))
+    (call $d3g_stat (local.get $pb) (i32.const 9) (i32.const 1))
+    (i32.const 1))
+
+  ;; ---- Presentation ------------------------------------------------------
+  ;; DirectDraw's process gamma ramp as a 256x1 lookup texture (0 = identity).
+  (func $d3g_gamma (param $pb i32) (result i32)
+    (local $guest i32) (local $wa i32) (local $gen i32) (local $i i32) (local $r i32) (local $g i32) (local $b i32)
+    (local $ident i32) (local $pos i32) (local $dst i32) (local $id i32)
+    (local.set $guest (i32.atomic.load offset=28 (global.get $SHARED_COUNTERS)))
+    (if (i32.eqz (local.get $guest)) (then (return (i32.const 0))))
+    (local.set $gen (i32.atomic.load offset=24 (global.get $SHARED_COUNTERS)))
+    (if (i32.and (i32.ne (i32.load offset=76 (local.get $pb)) (i32.const 0))
+                 (i32.eq (i32.load offset=56 (local.get $pb)) (local.get $gen)))
+      (then (return (select (i32.load offset=52 (local.get $pb)) (i32.const 0) (i32.load offset=60 (local.get $pb))))))
+    (i32.store offset=76 (local.get $pb) (i32.const 1))
+    (i32.store offset=56 (local.get $pb) (local.get $gen))
+    (local.set $wa (call $g2w (local.get $guest)))
+    (local.set $pos (call $d3g_arena (i32.const 1024)))
+    (local.set $dst (call $d3g_aptr (local.get $pos)))
+    (local.set $ident (i32.const 1))
+    (loop $entries
+      (local.set $r (i32.shr_u (i32.load16_u (i32.add (local.get $wa) (i32.shl (local.get $i) (i32.const 1)))) (i32.const 8)))
+      (local.set $g (i32.shr_u (i32.load16_u offset=512 (i32.add (local.get $wa) (i32.shl (local.get $i) (i32.const 1)))) (i32.const 8)))
+      (local.set $b (i32.shr_u (i32.load16_u offset=1024 (i32.add (local.get $wa) (i32.shl (local.get $i) (i32.const 1)))) (i32.const 8)))
+      (if (i32.or (i32.or (i32.ne (local.get $r) (local.get $i)) (i32.ne (local.get $g) (local.get $i))) (i32.ne (local.get $b) (local.get $i)))
+        (then (local.set $ident (i32.const 0))))
+      (i32.store (i32.add (local.get $dst) (i32.shl (local.get $i) (i32.const 2)))
+        (i32.or (i32.or (local.get $r) (i32.shl (local.get $g) (i32.const 8)))
+          (i32.or (i32.shl (local.get $b) (i32.const 16)) (i32.const 0xff000000))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $entries (i32.lt_u (local.get $i) (i32.const 256))))
+    (i32.store offset=60 (local.get $pb) (i32.eqz (local.get $ident)))
+    (if (local.get $ident) (then (return (i32.const 0))))
+    (local.set $id (i32.load offset=52 (local.get $pb)))
+    (if (i32.eqz (local.get $id)) (then
+      (local.set $id (call $d3g_new_id (local.get $pb)))
+      (i32.store offset=52 (local.get $pb) (local.get $id))
+      (call $d3g_create (local.get $id) (global.get $GPS_KIND_TEX2D) (global.get $GPS_FMT_A8B8G8R8)
+        (i32.const 1) (i32.const 256) (i32.const 1))))
+    (call $d3g_upload (local.get $pb) (local.get $id) (i32.const 0) (i32.const 0) (i32.const 256) (i32.const 1) (local.get $pos))
+    (local.get $id))
+
+  (func $d3g_window_owner (param $pb i32) (param $hwnd i32) (param $create i32) (result i32)
+    (local $i i32) (local $r i32) (local $free i32)
+    (loop $scan
+      (local.set $r (i32.add (i32.add (local.get $pb) (i32.const 23360)) (i32.shl (local.get $i) (i32.const 5))))
+      (if (i32.eq (i32.load (local.get $r)) (local.get $hwnd)) (then (return (local.get $r))))
+      (if (i32.eqz (i32.load (local.get $r))) (then (local.set $free (local.get $r))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $scan (i32.lt_u (local.get $i) (i32.const 32))))
+    (if (i32.and (i32.ne (local.get $free) (i32.const 0)) (i32.ne (local.get $create) (i32.const 0)))
+      (then (i32.store (local.get $free) (local.get $hwnd)) (return (local.get $free))))
+    (i32.const 0))
+
+  ;; An exact HWND/primary allocation owns each submitted PRESENT. The page
+  ;; can compare a delayed bitmap with its originating native RT and record,
+  ;; and bind GDI damage to that window's preceding record, not a global clock.
+  (func $d3g_window_present (export "d3dim_gps_window_present") (param $hwnd i32) (param $rt i32) (result i32)
+    (local $pb i32) (local $r i32) (local $entry i32) (local $seq i32)
+    (local.set $pb (i32.load offset=8 (global.get $D3DIM_GPS)))
+    (if (i32.eqz (local.get $pb)) (then (return (i32.const 0))))
+    (local.set $r (call $d3g_window_owner (local.get $pb) (local.get $hwnd) (i32.const 0)))
+    (if (i32.eqz (local.get $r)) (then (return (i32.const 0))))
+    (local.set $seq (i32.atomic.load offset=16 (local.get $r)))
+    (local.set $entry (i32.load offset=4 (local.get $r)))
+    (if (i32.or (i32.ne (load.field DxObject type (local.get $entry)) (i32.const 2))
+          (i32.or (i32.ne (load.field DxObject misc1 (local.get $entry)) (i32.load offset=8 (local.get $r)))
+            (i32.ne (i32.load (call $dx_surf_creator_ptr (local.get $entry))) (i32.load offset=20 (local.get $r)))))
+      (then (return (i32.const 0))))
+    (if (i32.ne (call $dx_surface_target_hwnd (local.get $entry)) (local.get $hwnd))
+      (then (return (i32.const 0))))
+    (if (i32.and (i32.ne (local.get $rt) (i32.const 0)) (i32.ne (local.get $rt) (i32.load offset=12 (local.get $r))))
+      (then (return (i32.const 0))))
+    (if (i32.ne (local.get $seq) (i32.atomic.load offset=16 (local.get $r)))
+      (then (return (i32.const 0))))
+    (local.get $seq))
+
+  ;; CPU fallback must select the primary that actually presented on this
+  ;; HWND, before considering unrelated offscreen pixel content. Validate the
+  ;; allocation/creator and both sequence reads exactly as bitmap acceptance
+  ;; does. A retired/reused surface or a changed cooperative HWND has no pin.
+  (func (export "d3dim_gps_window_primary_slot") (param $hwnd i32) (param $dib i32) (result i32)
+    (local $seq i32) (local $r i32) (local $slot i32) (local $stamp i32)
+    (local.set $seq (call $d3g_window_present (local.get $hwnd) (i32.const 0)))
+    (if (i32.eqz (local.get $seq)) (then (return (i32.const -1))))
+    (local.set $r (call $d3g_window_owner (i32.load offset=8 (global.get $D3DIM_GPS))
+      (local.get $hwnd) (i32.const 0)))
+    (local.set $stamp (i32.atomic.load (region.addr $D3DIM_LAZY_SHARED 24)))
+    (if (i32.ne (i32.load offset=24 (local.get $r)) (local.get $stamp))
+      (then (return (i32.const -1))))
+    (if (i32.and (i32.ne (local.get $dib) (i32.const 0))
+          (i32.ne (local.get $dib) (i32.load offset=8 (local.get $r))))
+      (then (return (i32.const -1))))
+    (local.set $slot (call $dx_slot_of (i32.load offset=4 (local.get $r))))
+    (if (i32.ne (local.get $seq) (call $d3g_window_present (local.get $hwnd) (i32.const 0)))
+      (then (return (i32.const -1))))
+    (if (i32.ne (local.get $stamp) (i32.atomic.load (region.addr $D3DIM_LAZY_SHARED 24)))
+      (then (return (i32.const -1))))
+    (local.get $slot))
+
+  ;; Reserve the next PRESENT before changing its primary's DIB. A consumer
+  ;; may still display the preceding publication while this wait is parked.
+  ;; Swapping first would invalidate that publication throughout the wait.
+  (func $d3g_present_ready (param $pb i32)
+    (local $h i32) (local $old i32)
+    (local.set $h (call $d3g_h))
+    (local.set $old (i32.load offset=24 (local.get $pb)))
+    (if (i32.and (i32.ne (local.get $old) (i32.const 0))
+          (i32.lt_s (i32.sub (i32.atomic.load (i32.add (local.get $h) (offset-of GpsRing done_seq))) (local.get $old)) (i32.const 0)))
+      (then (call $d3g_sync (local.get $pb)))))
+
+  ;; PRESENT; at most two in flight. stamp = the CPU present sequence, so a
+  ;; later CPU present retires this layer.
+  (func $d3g_present (param $pb i32) (param $rt i32) (param $x i32) (param $y i32) (param $w i32) (param $hgt i32)
+      (param $hwnd i32) (param $dx i32) (param $dy i32) (param $primary i32)
+    (local $h i32) (local $p i32) (local $seq i32) (local $gamma i32) (local $owner i32)
+    (local.set $h (call $d3g_h))
+    (local.set $gamma (call $d3g_gamma (local.get $pb)))
+    (call $d3g_present_ready (local.get $pb))
+    (call $gps_mark (local.get $h) (i32.load offset=20 (local.get $pb)) (i32.const 0x44334450))
+    (i32.store offset=20 (local.get $pb) (i32.add (i32.load offset=20 (local.get $pb)) (i32.const 1)))
+    (local.set $p (call $d3g_begin (local.get $pb) (global.get $GPS_OP_PRESENT) (size-of GpsPresent)))
+    (store.field GpsPresent rt (local.get $p) (local.get $rt))
+    (store.field GpsPresent gamma (local.get $p) (local.get $gamma))
+    (store.field GpsPresent x (local.get $p) (local.get $x))
+    (store.field GpsPresent y (local.get $p) (local.get $y))
+    (store.field GpsPresent w (local.get $p) (local.get $w))
+    (store.field GpsPresent h (local.get $p) (local.get $hgt))
+    (store.field GpsPresent surface (local.get $p) (local.get $hwnd))
+    (store.field GpsPresent dst_x (local.get $p) (local.get $dx))
+    (store.field GpsPresent dst_y (local.get $p) (local.get $dy))
+    (store.field GpsPresent stamp (local.get $p) (i32.atomic.load (region.addr $D3DIM_LAZY_SHARED 24)))
+    ;; This producer owns the ring under D3DIM_GPS. Publish the native owner
+    ;; before gps_end exposes the record to an already-running consumer.
+    (local.set $seq (i32.add (i32.atomic.load (load.field.memarg GpsRing seq_counter (local.get $h))) (i32.const 1)))
+    (local.set $owner (call $d3g_window_owner (local.get $pb) (local.get $hwnd) (i32.const 1)))
+    (if (i32.eqz (local.get $owner)) (then (call $d3g_fail)))
+    (i32.atomic.store offset=16 (local.get $owner) (i32.const 0))
+    (i32.store offset=4 (local.get $owner) (local.get $primary))
+    (i32.store offset=8 (local.get $owner) (load.field DxObject misc1 (local.get $primary)))
+    (i32.store offset=12 (local.get $owner) (local.get $rt))
+    (i32.store offset=20 (local.get $owner) (i32.load (call $dx_surf_creator_ptr (local.get $primary))))
+    (i32.store offset=24 (local.get $owner) (load.field GpsPresent stamp (local.get $p)))
+    (i32.atomic.store offset=16 (local.get $owner) (local.get $seq))
+    (if (i32.ne (call $d3g_end (local.get $p)) (local.get $seq)) (then (call $d3g_fail)))
+    (i32.store offset=24 (local.get $pb) (i32.load offset=28 (local.get $pb)))
+    (i32.store offset=28 (local.get $pb) (local.get $seq))
+    (call $d3g_stat (local.get $pb) (i32.const 6) (i32.const 1))
+    (drop (call $d3g_kick (local.get $pb) (global.get $GPS_KICK_ASYNC))))
+
+  ;; 0x20003 {front, back}: a GPU Flip. Swap the chain's DIBs (the colour
+  ;; targets follow them) and PRESENT the new front, with no readback.
+  ;; 3 = flipped and presented; 0 = take the synchronous CPU path.
+  (func $d3g_flip (param $pb i32) (param $desc i32) (result i32)
+    (local $front i32) (local $back i32) (local $t i32) (local $hwnd i32) (local $w i32) (local $hgt i32)
+    (local $px i32) (local $py i32) (local $pw i32) (local $ph i32) (local $cx i32) (local $cy i32)
+    (local $cw i32) (local $ch i32) (local $tmp i32)
+    (local.set $front (i32.load (local.get $desc)))
+    (local.set $back (i32.load offset=4 (local.get $desc)))
+    (local.set $t (call $d3g_find (local.get $pb) (load.field DxObject misc1 (local.get $back))))
+    (if (i32.eqz (local.get $t)) (then (return (i32.const 0))))
+    (local.set $w (load.field DxObject width (local.get $front)))
+    (local.set $hgt (load.field DxObject height (local.get $front)))
+    (if (i32.or (i32.ne (i32.load offset=8 (local.get $t)) (local.get $w)) (i32.ne (i32.load offset=12 (local.get $t)) (local.get $hgt)))
+      (then (return (i32.const 0))))
+    (if (i32.ne (load.field DxObject bpp (local.get $front)) (i32.load offset=16 (local.get $t))) (then (return (i32.const 0))))
+    (if (i32.eq (global.get $dx_scroll_hold_wa) (local.get $front)) (then (return (i32.const 0))))
+    (local.set $hwnd (call $dx_surface_target_hwnd (local.get $front)))
+    (if (i32.eqz (local.get $hwnd)) (then (return (i32.const 0))))
+    (if (call $dx_window_surface_shared (local.get $hwnd)) (then (return (i32.const 0))))
+    (if (i32.ne (call $wnd_top_level (local.get $hwnd)) (local.get $hwnd)) (then (return (i32.const 0))))
+    (if (call $d3d9_present_client_relative (local.get $hwnd)) (then (return (i32.const 0))))
+    (local.set $pw (local.get $w))
+    (local.set $ph (local.get $hgt))
+    ;; Windowed: the sub-rect under the client area, as $dx_present blits it.
+    (if (i32.eqz (call $dx_exclusive_get)) (then
+      (local.set $cx (call $wnd_client_screen_x (local.get $hwnd)))
+      (local.set $cy (call $wnd_client_screen_y (local.get $hwnd)))
+      (local.set $cw (call $wnd_client_w_for_clip (local.get $hwnd)))
+      (local.set $ch (call $wnd_client_h_for_clip (local.get $hwnd)))
+      (if (i32.and (i32.gt_s (local.get $cw) (i32.const 0)) (i32.gt_s (local.get $ch) (i32.const 0))) (then
+        (local.set $px (local.get $cx)) (local.set $py (local.get $cy))
+        (local.set $pw (local.get $cw)) (local.set $ph (local.get $ch))))))
+    (if (i32.or (i32.or (i32.lt_s (local.get $px) (i32.const 0)) (i32.lt_s (local.get $py) (i32.const 0)))
+          (i32.or (i32.gt_s (i32.add (local.get $px) (local.get $pw)) (local.get $w))
+                  (i32.gt_s (i32.add (local.get $py) (local.get $ph)) (local.get $hgt))))
+      (then (return (i32.const 0))))
+    (call $d3g_prepare (local.get $pb) (local.get $t) (i32.const 0))
+    (call $d3g_present_ready (local.get $pb))
+    (call $page_watch_write (local.get $front) (i32.const 32))
+    (call $page_watch_write (local.get $back) (i32.const 32))
+    (local.set $tmp (load.field DxObject misc1 (local.get $front)))
+    (store.field DxObject misc1 (local.get $front) (load.field DxObject misc1 (local.get $back)))
+    (store.field DxObject misc1 (local.get $back) (local.get $tmp))
+    (call $d3g_present (local.get $pb) (i32.load offset=28 (local.get $t))
+      (local.get $px) (local.get $py) (local.get $pw) (local.get $ph) (local.get $hwnd) (i32.const 0) (i32.const 0) (local.get $front))
+    (call $d3g_stat (local.get $pb) (i32.const 10) (i32.const 1))
+    (i32.const 3))
+
+  ;; Park slot $i: +0 x, +4 y, +8 w, +12 h (primary coordinates), +16 RT
+  ;; id (w x h, kept for reuse), +20 parked, +24 park sequence.
+  (func $d3g_slot (param $pb i32) (param $i i32) (result i32)
+    (i32.add (i32.add (local.get $pb) (i32.const 23040)) (i32.shl (local.get $i) (i32.const 5))))
+
+  ;; Slot $s's rect lies inside (x, y, w, h).
+  (func $d3g_slot_in (param $s i32) (param $x i32) (param $y i32) (param $w i32) (param $hgt i32) (result i32)
+    (i32.and
+      (i32.and (i32.ge_s (i32.load (local.get $s)) (local.get $x))
+               (i32.ge_s (i32.load offset=4 (local.get $s)) (local.get $y)))
+      (i32.and (i32.le_s (i32.add (i32.load (local.get $s)) (i32.load offset=8 (local.get $s)))
+                         (i32.add (local.get $x) (local.get $w)))
+               (i32.le_s (i32.add (i32.load offset=4 (local.get $s)) (i32.load offset=12 (local.get $s)))
+                         (i32.add (local.get $y) (local.get $hgt))))))
+
+  ;; Rect (x, y, w, h) lies inside slot $s's rect.
+  (func $d3g_in_slot (param $s i32) (param $x i32) (param $y i32) (param $w i32) (param $hgt i32) (result i32)
+    (i32.and
+      (i32.and (i32.le_s (i32.load (local.get $s)) (local.get $x))
+               (i32.le_s (i32.load offset=4 (local.get $s)) (local.get $y)))
+      (i32.and (i32.ge_s (i32.add (i32.load (local.get $s)) (i32.load offset=8 (local.get $s)))
+                         (i32.add (local.get $x) (local.get $w)))
+               (i32.ge_s (i32.add (i32.load offset=4 (local.get $s)) (i32.load offset=12 (local.get $s)))
+                         (i32.add (local.get $y) (local.get $hgt))))))
+
+  ;; Slots $a and $b overlap.
+  (func $d3g_slots_meet (param $a i32) (param $b i32) (result i32)
+    (i32.and
+      (i32.and (i32.lt_s (i32.load (local.get $a)) (i32.add (i32.load (local.get $b)) (i32.load offset=8 (local.get $b))))
+               (i32.lt_s (i32.load (local.get $b)) (i32.add (i32.load (local.get $a)) (i32.load offset=8 (local.get $a)))))
+      (i32.and (i32.lt_s (i32.load offset=4 (local.get $a)) (i32.add (i32.load offset=4 (local.get $b)) (i32.load offset=12 (local.get $b))))
+               (i32.lt_s (i32.load offset=4 (local.get $b)) (i32.add (i32.load offset=4 (local.get $a)) (i32.load offset=12 (local.get $a)))))))
+
+  ;; Slot $s gets a w x h RT (another size is released and recreated).
+  (func $d3g_slot_rt (param $pb i32) (param $s i32) (param $w i32) (param $hgt i32)
+    (local $id i32)
+    (local.set $id (i32.load offset=16 (local.get $s)))
+    (if (i32.and (i32.ne (local.get $id) (i32.const 0))
+          (i32.or (i32.ne (i32.load offset=8 (local.get $s)) (local.get $w))
+                  (i32.ne (i32.load offset=12 (local.get $s)) (local.get $hgt))))
+      (then (call $d3g_release (local.get $pb) (local.get $id)) (local.set $id (i32.const 0))))
+    (if (i32.eqz (local.get $id)) (then
+      (local.set $id (call $d3g_new_id (local.get $pb)))
+      (call $d3g_create (local.get $id) (global.get $GPS_KIND_RT) (global.get $GPS_FMT_A8B8G8R8)
+        (i32.const 1) (local.get $w) (local.get $hgt))
+      (i32.store offset=16 (local.get $s) (local.get $id))))
+    (i32.store offset=8 (local.get $s) (local.get $w))
+    (i32.store offset=12 (local.get $s) (local.get $hgt)))
+
+  ;; RT $src's rect (sx, sy, w, h) (a sw x sh RT) -> RT $dst at (ox, oy).
+  (func $d3g_copy_rt (param $pb i32) (param $dst i32) (param $src i32) (param $sw i32) (param $sh i32)
+      (param $sx i32) (param $sy i32) (param $w i32) (param $hgt i32) (param $ox i32) (param $oy i32)
+    (call $d3g_targets (local.get $pb) (local.get $dst) (i32.const 0))
+    (call $d3g_blit (local.get $pb) (local.get $src) (i32.const 0) (i32.const 0)
+      (f32.convert_i32_s (local.get $ox)) (f32.convert_i32_s (local.get $oy))
+      (f32.convert_i32_s (i32.add (local.get $ox) (local.get $w))) (f32.convert_i32_s (i32.add (local.get $oy) (local.get $hgt)))
+      (f32.div (f32.convert_i32_s (local.get $sx)) (f32.convert_i32_s (local.get $sw)))
+      (f32.div (f32.convert_i32_s (local.get $sy)) (f32.convert_i32_s (local.get $sh)))
+      (f32.div (f32.convert_i32_s (i32.add (local.get $sx) (local.get $w))) (f32.convert_i32_s (local.get $sw)))
+      (f32.div (f32.convert_i32_s (i32.add (local.get $sy) (local.get $hgt))) (f32.convert_i32_s (local.get $sh)))
+      (local.get $ox) (local.get $oy) (i32.add (local.get $ox) (local.get $w)) (i32.add (local.get $oy) (local.get $hgt))))
+
+  ;; The parked primary DIB's rect (x, y, w, h) -> RT $id at (0, 0).
+  (func $d3g_upload_dib_rect (param $pb i32) (param $id i32) (param $x i32) (param $y i32) (param $w i32) (param $hgt i32)
+    (local $k i32) (local $n i32) (local $j i32) (local $pos i32) (local $dst i32) (local $band i32)
+    (local $pitch i32) (local $bpp i32) (local $src i32)
+    (local.set $pitch (i32.load offset=168 (local.get $pb)))
+    (local.set $bpp (i32.load offset=172 (local.get $pb)))
+    (local.set $src (i32.add (i32.load offset=164 (local.get $pb))
+      (i32.add (i32.mul (local.get $y) (local.get $pitch)) (i32.mul (local.get $x) (i32.shr_u (local.get $bpp) (i32.const 3))))))
+    (local.set $band (call $d3g_band_rows (local.get $w)))
+    (block $done (loop $bands
+      (br_if $done (i32.ge_u (local.get $k) (local.get $hgt)))
+      (local.set $n (i32.sub (local.get $hgt) (local.get $k)))
+      (if (i32.gt_u (local.get $n) (local.get $band)) (then (local.set $n (local.get $band))))
+      (local.set $pos (call $d3g_arena (i32.mul (i32.shl (local.get $w) (i32.const 2)) (local.get $n))))
+      (local.set $dst (call $d3g_aptr (local.get $pos)))
+      (local.set $j (i32.const 0))
+      (block $rows_done (loop $rows
+        (br_if $rows_done (i32.ge_u (local.get $j) (local.get $n)))
+        (call $d3g_row_to_rgba
+          (i32.add (local.get $src) (i32.mul (i32.add (local.get $k) (local.get $j)) (local.get $pitch)))
+          (i32.add (local.get $dst) (i32.mul (local.get $j) (i32.shl (local.get $w) (i32.const 2))))
+          (local.get $w) (i32.load offset=176 (local.get $pb)) (local.get $bpp))
+        (local.set $j (i32.add (local.get $j) (i32.const 1)))
+        (br $rows)))
+      (call $d3g_upload (local.get $pb) (local.get $id) (i32.const 0) (local.get $k) (local.get $w) (local.get $n) (local.get $pos))
+      (local.set $k (i32.add (local.get $k) (local.get $n)))
+      (br $bands)))
+    (call $d3g_stat (local.get $pb) (i32.const 4) (i32.const 1))
+    (call $d3g_stat (local.get $pb) (i32.const 5) (local.get $hgt)))
+
+  ;; Park slot $s's pixels -> the DIB; the slot goes idle.
+  (func $d3g_land_slot (param $pb i32) (param $s i32)
+    (i32.store offset=20 (local.get $s) (i32.const 0))
+    (call $d3g_park_dib_check (local.get $pb))
+    (call $d3g_read_rect (local.get $pb) (i32.load offset=16 (local.get $s)) (i32.const 0) (i32.const 0)
+      (i32.load offset=8 (local.get $s)) (i32.load offset=12 (local.get $s))
+      (i32.load offset=164 (local.get $pb)) (i32.load offset=168 (local.get $pb)) (i32.load offset=172 (local.get $pb))
+      (i32.load offset=176 (local.get $pb)) (i32.load (local.get $s)) (i32.load offset=4 (local.get $s))))
+
+  ;; The oldest parked slot other than $skip (0 = none).
+  (func $d3g_oldest (param $pb i32) (param $skip i32) (result i32)
+    (local $i i32) (local $s i32) (local $old i32)
+    (loop $scan
+      (local.set $s (call $d3g_slot (local.get $pb) (local.get $i)))
+      (if (i32.and (i32.and (i32.ne (i32.load offset=20 (local.get $s)) (i32.const 0)) (i32.ne (local.get $s) (local.get $skip)))
+            (i32.or (i32.eqz (local.get $old))
+                    (i32.lt_s (i32.sub (i32.load offset=24 (local.get $s)) (i32.load offset=24 (local.get $old))) (i32.const 0))))
+        (then (local.set $old (local.get $s))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $scan (i32.lt_u (local.get $i) (i32.const 4))))
+    (local.get $old))
+
+  ;; All four slots are parked: merge the two oldest into one slot on the
+  ;; GPU (the union seeded from the DIB, then both copied in, oldest first)
+  ;; and return the slot that freed. A union larger than the source target
+  ;; ($lw x $lh, which every executor can hold) lands the oldest instead.
+  (func $d3g_park_merge (param $pb i32) (param $lw i32) (param $lh i32) (result i32)
+    (local $a i32) (local $b i32) (local $ux i32) (local $uy i32) (local $ur i32) (local $ub i32)
+    (local $uw i32) (local $uh i32) (local $spare i32) (local $id i32)
+    (local.set $a (call $d3g_oldest (local.get $pb) (i32.const 0)))
+    (local.set $b (call $d3g_oldest (local.get $pb) (local.get $a)))
+    (local.set $ux (select (i32.load (local.get $a)) (i32.load (local.get $b))
+      (i32.lt_s (i32.load (local.get $a)) (i32.load (local.get $b)))))
+    (local.set $uy (select (i32.load offset=4 (local.get $a)) (i32.load offset=4 (local.get $b))
+      (i32.lt_s (i32.load offset=4 (local.get $a)) (i32.load offset=4 (local.get $b)))))
+    (local.set $ur (i32.add (i32.load (local.get $a)) (i32.load offset=8 (local.get $a))))
+    (if (i32.gt_s (i32.add (i32.load (local.get $b)) (i32.load offset=8 (local.get $b))) (local.get $ur))
+      (then (local.set $ur (i32.add (i32.load (local.get $b)) (i32.load offset=8 (local.get $b))))))
+    (local.set $ub (i32.add (i32.load offset=4 (local.get $a)) (i32.load offset=12 (local.get $a))))
+    (if (i32.gt_s (i32.add (i32.load offset=4 (local.get $b)) (i32.load offset=12 (local.get $b))) (local.get $ub))
+      (then (local.set $ub (i32.add (i32.load offset=4 (local.get $b)) (i32.load offset=12 (local.get $b))))))
+    (local.set $uw (i32.sub (local.get $ur) (local.get $ux)))
+    (local.set $uh (i32.sub (local.get $ub) (local.get $uy)))
+    (if (i32.or (i32.gt_s (local.get $uw) (local.get $lw)) (i32.gt_s (local.get $uh) (local.get $lh))) (then
+      (local.set $id (call $d3g_site (i32.const 9)))
+      (call $d3g_land_slot (local.get $pb) (local.get $a))
+      (drop (call $d3g_site (local.get $id)))
+      (return (local.get $a))))
+    ;; The spare slot (at 23184, never parked) takes the union; slot $a
+    ;; then trades RTs with it.
+    (local.set $spare (i32.add (local.get $pb) (i32.const 23184)))
+    (call $d3g_slot_rt (local.get $pb) (local.get $spare) (local.get $uw) (local.get $uh))
+    (local.set $id (i32.load offset=16 (local.get $spare)))
+    (call $d3g_upload_dib_rect (local.get $pb) (local.get $id) (local.get $ux) (local.get $uy) (local.get $uw) (local.get $uh))
+    (call $d3g_copy_rt (local.get $pb) (local.get $id) (i32.load offset=16 (local.get $a))
+      (i32.load offset=8 (local.get $a)) (i32.load offset=12 (local.get $a)) (i32.const 0) (i32.const 0)
+      (i32.load offset=8 (local.get $a)) (i32.load offset=12 (local.get $a))
+      (i32.sub (i32.load (local.get $a)) (local.get $ux)) (i32.sub (i32.load offset=4 (local.get $a)) (local.get $uy)))
+    (call $d3g_copy_rt (local.get $pb) (local.get $id) (i32.load offset=16 (local.get $b))
+      (i32.load offset=8 (local.get $b)) (i32.load offset=12 (local.get $b)) (i32.const 0) (i32.const 0)
+      (i32.load offset=8 (local.get $b)) (i32.load offset=12 (local.get $b))
+      (i32.sub (i32.load (local.get $b)) (local.get $ux)) (i32.sub (i32.load offset=4 (local.get $b)) (local.get $uy)))
+    (i32.store offset=16 (local.get $spare) (i32.load offset=16 (local.get $a)))
+    (i32.store offset=8 (local.get $spare) (i32.load offset=8 (local.get $a)))
+    (i32.store offset=12 (local.get $spare) (i32.load offset=12 (local.get $a)))
+    (i32.store offset=16 (local.get $a) (local.get $id))
+    (i32.store (local.get $a) (local.get $ux))
+    (i32.store offset=4 (local.get $a) (local.get $uy))
+    (i32.store offset=8 (local.get $a) (local.get $uw))
+    (i32.store offset=12 (local.get $a) (local.get $uh))
+    (i32.store offset=24 (local.get $a) (i32.load offset=24 (local.get $b)))
+    (i32.store offset=20 (local.get $b) (i32.const 0))
+    (local.get $b))
+
+  ;; Park primary rect (x, y, w, h), copied from target $t at (sx, sy), and
+  ;; return the slot to present (whole): newest in park order. The same
+  ;; rect reuses its slot; a parked slot holding the rect alone takes it in
+  ;; place; parked rects it covers are superseded; with every slot parked
+  ;; the two oldest merge on the GPU. Nothing is read back here.
+  (func $d3g_park (param $pb i32) (param $t i32) (param $x i32) (param $y i32) (param $w i32) (param $hgt i32)
+      (param $sx i32) (param $sy i32) (result i32)
+    (local $i i32) (local $s i32) (local $o i32) (local $j i32) (local $pick i32) (local $ok i32)
+    ;; The same rect: overwritten whole, so it is newest whatever it overlaps.
+    (loop $exact
+      (local.set $s (call $d3g_slot (local.get $pb) (local.get $i)))
+      (if (i32.and
+            (i32.and (i32.ne (i32.load offset=16 (local.get $s)) (i32.const 0))
+                     (i32.and (i32.eq (i32.load (local.get $s)) (local.get $x))
+                              (i32.eq (i32.load offset=4 (local.get $s)) (local.get $y))))
+            (i32.and (i32.eq (i32.load offset=8 (local.get $s)) (local.get $w))
+                     (i32.eq (i32.load offset=12 (local.get $s)) (local.get $hgt))))
+        (then (local.set $pick (local.get $s))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $exact (i32.and (i32.eqz (local.get $pick)) (i32.lt_u (local.get $i) (i32.const 4)))))
+    ;; A parked slot containing the rect that no other surviving parked
+    ;; slot overlaps: drawing into it keeps the park order exact.
+    (local.set $i (i32.const 0))
+    (if (i32.eqz (local.get $pick)) (then (loop $contain
+      (local.set $s (call $d3g_slot (local.get $pb) (local.get $i)))
+      (if (i32.and (i32.ne (i32.load offset=20 (local.get $s)) (i32.const 0))
+            (call $d3g_in_slot (local.get $s) (local.get $x) (local.get $y) (local.get $w) (local.get $hgt)))
+        (then
+          (local.set $ok (i32.const 1))
+          (local.set $j (i32.const 0))
+          (loop $others
+            (local.set $o (call $d3g_slot (local.get $pb) (local.get $j)))
+            (if (i32.and
+                  (i32.and (i32.ne (local.get $o) (local.get $s)) (i32.ne (i32.load offset=20 (local.get $o)) (i32.const 0)))
+                  (i32.and (i32.eqz (call $d3g_slot_in (local.get $o) (local.get $x) (local.get $y) (local.get $w) (local.get $hgt)))
+                           (call $d3g_slots_meet (local.get $o) (local.get $s))))
+              (then (local.set $ok (i32.const 0))))
+            (local.set $j (i32.add (local.get $j) (i32.const 1)))
+            (br_if $others (i32.lt_u (local.get $j) (i32.const 4))))
+          (if (local.get $ok) (then (local.set $pick (local.get $s))))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $contain (i32.and (i32.eqz (local.get $pick)) (i32.lt_u (local.get $i) (i32.const 4)))))))
+    (if (local.get $pick)
+      (then
+        (call $d3g_copy_rt (local.get $pb) (i32.load offset=16 (local.get $pick)) (i32.load offset=28 (local.get $t))
+          (i32.load offset=8 (local.get $t)) (i32.load offset=12 (local.get $t)) (local.get $sx) (local.get $sy)
+          (local.get $w) (local.get $hgt)
+          (i32.sub (local.get $x) (i32.load (local.get $pick))) (i32.sub (local.get $y) (i32.load offset=4 (local.get $pick)))))
+      (else
+        ;; An idle slot (same size first), else merge two parked ones.
+        (local.set $i (i32.const 0))
+        (loop $same_size
+          (local.set $s (call $d3g_slot (local.get $pb) (local.get $i)))
+          (if (i32.and
+                (i32.and (i32.eqz (i32.load offset=20 (local.get $s))) (i32.ne (i32.load offset=16 (local.get $s)) (i32.const 0)))
+                (i32.and (i32.eq (i32.load offset=8 (local.get $s)) (local.get $w))
+                         (i32.eq (i32.load offset=12 (local.get $s)) (local.get $hgt))))
+            (then (local.set $pick (local.get $s))))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br_if $same_size (i32.and (i32.eqz (local.get $pick)) (i32.lt_u (local.get $i) (i32.const 4)))))
+        (local.set $i (i32.const 0))
+        (if (i32.eqz (local.get $pick)) (then (loop $idle
+          (local.set $s (call $d3g_slot (local.get $pb) (local.get $i)))
+          (if (i32.eqz (i32.load offset=20 (local.get $s))) (then (local.set $pick (local.get $s))))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br_if $idle (i32.and (i32.eqz (local.get $pick)) (i32.lt_u (local.get $i) (i32.const 4)))))))
+        (if (i32.eqz (local.get $pick)) (then
+          (local.set $pick (call $d3g_park_merge (local.get $pb)
+            (i32.load offset=8 (local.get $t)) (i32.load offset=12 (local.get $t))))))
+        (call $d3g_slot_rt (local.get $pb) (local.get $pick) (local.get $w) (local.get $hgt))
+        (i32.store (local.get $pick) (local.get $x))
+        (i32.store offset=4 (local.get $pick) (local.get $y))
+        (call $d3g_copy_rt (local.get $pb) (i32.load offset=16 (local.get $pick)) (i32.load offset=28 (local.get $t))
+          (i32.load offset=8 (local.get $t)) (i32.load offset=12 (local.get $t)) (local.get $sx) (local.get $sy)
+          (local.get $w) (local.get $hgt) (i32.const 0) (i32.const 0))))
+    (local.set $i (i32.const 0))
+    (loop $cover
+      (local.set $s (call $d3g_slot (local.get $pb) (local.get $i)))
+      (if (i32.and (i32.ne (local.get $s) (local.get $pick))
+            (call $d3g_slot_in (local.get $s) (local.get $x) (local.get $y) (local.get $w) (local.get $hgt)))
+        (then (i32.store offset=20 (local.get $s) (i32.const 0))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $cover (i32.lt_u (local.get $i) (i32.const 4))))
+    (i32.store offset=23168 (local.get $pb) (i32.add (i32.load offset=23168 (local.get $pb)) (i32.const 1)))
+    (i32.store offset=24 (local.get $pick) (i32.load offset=23168 (local.get $pb)))
+    (i32.store offset=20 (local.get $pick) (i32.const 1))
+    (local.get $pick))
+
+  ;; Forget the parked frame without landing it (its surface is gone).
+  (func $d3g_park_drop (param $pb i32)
+    (local $i i32)
+    (i32.store offset=184 (local.get $pb) (i32.const 0))
+    (loop $slots
+      (i32.store offset=20 (call $d3g_slot (local.get $pb) (local.get $i)) (i32.const 0))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $slots (i32.lt_u (local.get $i) (i32.const 4)))))
+
+  ;; The parked frame (the Blt-presented rects of the primary) -> its DIB:
+  ;; one readback per parked rect, oldest first, and only when a CPU
+  ;; reader asks.
+  (func $d3g_materialize (param $pb i32)
+    (local $old i32)
+    (if (i32.eqz (i32.load offset=184 (local.get $pb))) (then (return)))
+    (i32.store offset=184 (local.get $pb) (i32.const 0))
+    (block $landed (loop $rects
+      (local.set $old (call $d3g_oldest (local.get $pb) (i32.const 0)))
+      (br_if $landed (i32.eqz (local.get $old)))
+      (call $d3g_land_slot (local.get $pb) (local.get $old))
+      (br $rects))))
+
+  ;; Targets aliasing the parked DIB re-check it before their next GPU use.
+  (func $d3g_park_dib_check (param $pb i32)
+    (local $i i32) (local $t i32) (local $dib i32) (local $len i32)
+    (local.set $dib (i32.load offset=164 (local.get $pb)))
+    (local.set $len (i32.mul (i32.load offset=168 (local.get $pb)) (i32.load offset=180 (local.get $pb))))
+    (loop $scan
+      (local.set $t (call $d3g_t (local.get $pb) (local.get $i)))
+      (if (i32.and (i32.ne (i32.load (local.get $t)) (i32.const 0))
+            (call $d3g_overlap (i32.load (local.get $t)) (i32.load offset=76 (local.get $t)) (local.get $dib) (local.get $len)))
+        (then (i32.store offset=32 (local.get $t) (i32.or (i32.load offset=32 (local.get $t)) (i32.const 2)))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $scan (i32.lt_u (local.get $i) (global.get $D3G_TARGETS)))))
+
+  ;; 0x2000A DXP3 {magic, dst, src, dx, dy, w, h, sx, sy, hwnd, seq, excl}:
+  ;; Blt(primary <- GPU target). Copy the rect into its park slot's RT (the
+  ;; primary's pending pixels) and PRESENT it client-relative; the DIB is
+  ;; written only when a CPU reader fences it. 1 = taken.
+  (func $d3g_blt_present (param $pb i32) (param $desc i32) (result i32)
+    (local $dst i32) (local $src i32) (local $dx i32) (local $dy i32) (local $w i32) (local $hgt i32)
+    (local $sx i32) (local $sy i32) (local $hwnd i32) (local $t i32) (local $s i32)
+    (local $pw i32) (local $ph i32)
+    (if (i32.ne (i32.load (local.get $desc)) (i32.const 0x44585033)) (then (return (i32.const 0))))
+    (local.set $dst (i32.load offset=4 (local.get $desc)))
+    (local.set $src (i32.load offset=8 (local.get $desc)))
+    (local.set $dx (i32.load offset=12 (local.get $desc)))
+    (local.set $dy (i32.load offset=16 (local.get $desc)))
+    (local.set $w (i32.load offset=20 (local.get $desc)))
+    (local.set $hgt (i32.load offset=24 (local.get $desc)))
+    (local.set $sx (i32.load offset=28 (local.get $desc)))
+    (local.set $sy (i32.load offset=32 (local.get $desc)))
+    (local.set $hwnd (i32.load offset=36 (local.get $desc)))
+    (local.set $t (call $d3g_find (local.get $pb) (load.field DxObject misc1 (local.get $src))))
+    (if (i32.eqz (local.get $t)) (then (return (i32.const 0))))
+    (if (call $d3g_find (local.get $pb) (load.field DxObject misc1 (local.get $dst))) (then (return (i32.const 0))))
+    (if (i32.ne (i32.load offset=16 (local.get $t)) (load.field DxObject bpp (local.get $dst))) (then (return (i32.const 0))))
+    (if (i32.or (i32.gt_s (i32.add (local.get $sx) (local.get $w)) (i32.load offset=8 (local.get $t)))
+                (i32.gt_s (i32.add (local.get $sy) (local.get $hgt)) (i32.load offset=12 (local.get $t))))
+      (then (return (i32.const 0))))
+    (local.set $pw (load.field DxObject width (local.get $dst)))
+    (local.set $ph (load.field DxObject height (local.get $dst)))
+    (if (i32.or (i32.or (i32.lt_s (local.get $dx) (i32.const 0)) (i32.lt_s (local.get $dy) (i32.const 0)))
+          (i32.or (i32.gt_s (i32.add (local.get $dx) (local.get $w)) (local.get $pw))
+                  (i32.gt_s (i32.add (local.get $dy) (local.get $hgt)) (local.get $ph))))
+      (then (return (i32.const 0))))
+    (call $d3g_prepare (local.get $pb) (local.get $t) (i32.const 0))
+    ;; A frame parked for another primary (or another DIB / layout of this
+    ;; one) must land first: the park slots describe exactly one DIB.
+    (if (i32.load offset=184 (local.get $pb)) (then
+      (if (i32.or
+            (i32.or (i32.ne (i32.load offset=188 (local.get $pb)) (local.get $dst))
+                    (i32.ne (i32.load offset=164 (local.get $pb)) (load.field DxObject misc1 (local.get $dst))))
+            (i32.or (i32.ne (i32.load offset=168 (local.get $pb)) (load.field DxObject pitch (local.get $dst)))
+                    (i32.ne (i32.load offset=180 (local.get $pb)) (local.get $ph))))
+        (then
+          (local.set $s (call $d3g_site (i32.const 9)))
+          (call $d3g_materialize (local.get $pb))
+          (drop (call $d3g_site (local.get $s)))))))
+    (i32.store offset=164 (local.get $pb) (load.field DxObject misc1 (local.get $dst)))
+    (i32.store offset=168 (local.get $pb) (load.field DxObject pitch (local.get $dst)))
+    (i32.store offset=172 (local.get $pb) (load.field DxObject bpp (local.get $dst)))
+    (i32.store offset=176 (local.get $pb) (call $dx_surf_fmt_get (local.get $dst)))
+    (i32.store offset=180 (local.get $pb) (load.field DxObject height (local.get $dst)))
+    (local.set $s (call $d3g_park (local.get $pb) (local.get $t) (local.get $dx) (local.get $dy)
+      (local.get $w) (local.get $hgt) (local.get $sx) (local.get $sy)))
+    (i32.store offset=184 (local.get $pb) (i32.const 1))
+    (i32.store offset=188 (local.get $pb) (local.get $dst))
+    ;; The whole slot: outside this Blt's rect it holds what the primary shows.
+    (call $d3g_present (local.get $pb) (i32.load offset=16 (local.get $s)) (i32.const 0) (i32.const 0)
+      (i32.load offset=8 (local.get $s)) (i32.load offset=12 (local.get $s))
+      (local.get $hwnd)
+      (i32.sub (i32.load (local.get $s)) (call $wnd_client_screen_x (local.get $hwnd)))
+      (i32.sub (i32.load offset=4 (local.get $s)) (call $wnd_client_screen_y (local.get $hwnd))) (local.get $dst))
+    (call $d3g_stat (local.get $pb) (i32.const 11) (i32.const 1))
+    (i32.const 1))
+
+  ;; ---- CPU-source BltFast onto a GPU target (no readback) ----------------
+  ;; DIB rect (x, y, w, h) of target $t -> its GPU copy (and the shadow).
+  (func $d3g_upload_target_rect (param $pb i32) (param $t i32) (param $x i32) (param $y i32) (param $w i32) (param $hgt i32)
+    (local $k i32) (local $n i32) (local $j i32) (local $pos i32) (local $dst i32) (local $band i32)
+    (local $pitch i32) (local $bps i32) (local $src i32) (local $off i32)
+    (local.set $pitch (i32.load offset=20 (local.get $t)))
+    (local.set $bps (i32.shr_u (i32.load offset=16 (local.get $t)) (i32.const 3)))
+    (local.set $src (i32.add (i32.load (local.get $t))
+      (i32.add (i32.mul (local.get $y) (local.get $pitch)) (i32.mul (local.get $x) (local.get $bps)))))
+    (local.set $band (call $d3g_band_rows (local.get $w)))
+    (block $done (loop $bands
+      (br_if $done (i32.ge_u (local.get $k) (local.get $hgt)))
+      (local.set $n (i32.sub (local.get $hgt) (local.get $k)))
+      (if (i32.gt_u (local.get $n) (local.get $band)) (then (local.set $n (local.get $band))))
+      (local.set $pos (call $d3g_arena (i32.mul (i32.shl (local.get $w) (i32.const 2)) (local.get $n))))
+      (local.set $dst (call $d3g_aptr (local.get $pos)))
+      (local.set $j (i32.const 0))
+      (block $rows_done (loop $rows
+        (br_if $rows_done (i32.ge_u (local.get $j) (local.get $n)))
+        (call $d3g_row_to_rgba
+          (i32.add (local.get $src) (i32.mul (i32.add (local.get $k) (local.get $j)) (local.get $pitch)))
+          (i32.add (local.get $dst) (i32.mul (local.get $j) (i32.shl (local.get $w) (i32.const 2))))
+          (local.get $w) (i32.load offset=24 (local.get $t)) (i32.load offset=16 (local.get $t)))
+        (local.set $j (i32.add (local.get $j) (i32.const 1)))
+        (br $rows)))
+      (call $d3g_upload_at (local.get $pb) (i32.load offset=28 (local.get $t)) (i32.const 0)
+        (local.get $x) (i32.add (local.get $y) (local.get $k)) (local.get $w) (local.get $n) (local.get $pos))
+      (local.set $k (i32.add (local.get $k) (local.get $n)))
+      (br $bands)))
+    (if (i32.load offset=52 (local.get $t)) (then
+      (local.set $j (i32.const 0))
+      (block $sdone (loop $srows
+        (br_if $sdone (i32.ge_u (local.get $j) (local.get $hgt)))
+        (local.set $off (i32.add (i32.mul (i32.add (local.get $y) (local.get $j)) (local.get $pitch))
+          (i32.mul (local.get $x) (local.get $bps))))
+        (memory.copy (i32.add (i32.load offset=52 (local.get $t)) (local.get $off))
+          (i32.add (i32.load (local.get $t)) (local.get $off)) (i32.mul (local.get $w) (local.get $bps)))
+        (local.set $j (i32.add (local.get $j) (i32.const 1)))
+        (br $srows)))))
+    (call $d3g_stat (local.get $pb) (i32.const 4) (i32.const 1))
+    (call $d3g_stat (local.get $pb) (i32.const 5) (local.get $hgt)))
+
+  ;; Source rect (sx, sy, w, h) of a $bpp-bit DIB -> RGBA texture $id at
+  ;; (0, 0), alpha 0 where the pixel equals the colour key exactly (as
+  ;; $dx_ckey_copy_rect compares it).
+  (func $d3g_upload_keyed (param $pb i32) (param $id i32) (param $dib i32) (param $pitch i32) (param $bpp i32)
+      (param $fmt i32) (param $sx i32) (param $sy i32) (param $w i32) (param $hgt i32) (param $key i32)
+    (local $k i32) (local $n i32) (local $j i32) (local $x i32) (local $pos i32) (local $dst i32)
+    (local $band i32) (local $row i32) (local $out i32) (local $bps i32) (local $px i32)
+    (local.set $bps (i32.shr_u (local.get $bpp) (i32.const 3)))
+    (local.set $band (call $d3g_band_rows (local.get $w)))
+    (block $done (loop $bands
+      (br_if $done (i32.ge_u (local.get $k) (local.get $hgt)))
+      (local.set $n (i32.sub (local.get $hgt) (local.get $k)))
+      (if (i32.gt_u (local.get $n) (local.get $band)) (then (local.set $n (local.get $band))))
+      (local.set $pos (call $d3g_arena (i32.mul (i32.shl (local.get $w) (i32.const 2)) (local.get $n))))
+      (local.set $dst (call $d3g_aptr (local.get $pos)))
+      (local.set $j (i32.const 0))
+      (block $rows_done (loop $rows
+        (br_if $rows_done (i32.ge_u (local.get $j) (local.get $n)))
+        (local.set $row (i32.add (local.get $dib)
+          (i32.add (i32.mul (i32.add (local.get $sy) (i32.add (local.get $k) (local.get $j))) (local.get $pitch))
+            (i32.mul (local.get $sx) (local.get $bps)))))
+        (local.set $out (i32.add (local.get $dst) (i32.mul (local.get $j) (i32.shl (local.get $w) (i32.const 2)))))
+        (call $d3g_row_to_rgba (local.get $row) (local.get $out) (local.get $w) (local.get $fmt) (local.get $bpp))
+        (local.set $x (i32.const 0))
+        (block $keys_done (loop $keys
+          (br_if $keys_done (i32.ge_u (local.get $x) (local.get $w)))
+          (local.set $px (if (result i32) (i32.eq (local.get $bps) (i32.const 2))
+            (then (i32.load16_u (i32.add (local.get $row) (i32.shl (local.get $x) (i32.const 1)))))
+            (else (i32.load (i32.add (local.get $row) (i32.shl (local.get $x) (i32.const 2)))))))
+          (if (i32.eq (local.get $px) (local.get $key))
+            (then (i32.store8 offset=3 (i32.add (local.get $out) (i32.shl (local.get $x) (i32.const 2))) (i32.const 0))))
+          (local.set $x (i32.add (local.get $x) (i32.const 1)))
+          (br $keys)))
+        (local.set $j (i32.add (local.get $j) (i32.const 1)))
+        (br $rows)))
+      (call $d3g_upload (local.get $pb) (local.get $id) (i32.const 0) (local.get $k) (local.get $w) (local.get $n) (local.get $pos))
+      (local.set $k (i32.add (local.get $k) (local.get $n)))
+      (br $bands)))
+    (call $d3g_stat (local.get $pb) (i32.const 4) (i32.const 1))
+    (call $d3g_stat (local.get $pb) (i32.const 5) (local.get $hgt)))
+
+  ;; BltFast($dst <- $src, dwTrans $trans) is about to write $dst's DIB on
+  ;; the CPU. 1 = $dst is a GPU target this producer will bring up to date
+  ;; itself afterwards ($d3dim_gps_blt_end), so the destination needs no
+  ;; readback. 0 = the caller fences the destination as before. Declined:
+  ;; a destination key, compressed or extended-key sources, a source that
+  ;; aliases the target (its DIB is stale), a keyed copy into a format whose
+  ;; alpha would collide with the key, a primary, and a dirty target with
+  ;; CPU writes still pending (merging those needs the readback anyway).
+  (func $d3dim_gps_blt_begin (param $dst i32) (param $src i32) (param $trans i32) (result i32)
+    (local $pb i32) (local $t i32) (local $fmt i32) (local $ok i32)
+    (local.set $pb (i32.load offset=8 (global.get $D3DIM_GPS)))
+    (if (i32.or (i32.eqz (local.get $pb)) (i32.or (i32.eqz (local.get $src)) (i32.eqz (local.get $dst))))
+      (then (return (i32.const 0))))
+    (call $lock_acquire (global.get $D3DIM_GPS))
+    (block $no
+      (local.set $t (call $d3g_find (local.get $pb) (load.field DxObject misc1 (local.get $dst))))
+      (br_if $no (i32.eqz (local.get $t)))
+      (br_if $no (i32.or (i32.ne (i32.load offset=20 (local.get $t)) (load.field DxObject pitch (local.get $dst)))
+                         (i32.ne (i32.load offset=12 (local.get $t)) (load.field DxObject height (local.get $dst)))))
+      (br_if $no (i32.or (i32.ne (i32.load offset=16 (local.get $t)) (load.field DxObject bpp (local.get $dst)))
+                         (i32.ne (i32.load offset=16 (local.get $t)) (load.field DxObject bpp (local.get $src)))))
+      (br_if $no (i32.ne (i32.and (local.get $trans) (i32.const 2)) (i32.const 0)))
+      (br_if $no (call $dx_fmt_is_dxt (call $dx_surf_fmt_get (local.get $src))))
+      (br_if $no (call $dx_blt_extended_keys (local.get $dst) (local.get $src)
+        (select (i32.const 0x8000) (i32.const 0) (i32.and (local.get $trans) (i32.const 1)))))
+      (br_if $no (call $d3g_overlap (load.field DxObject misc1 (local.get $src))
+        (i32.mul (load.field DxObject pitch (local.get $src)) (load.field DxObject height (local.get $src)))
+        (i32.load (local.get $t)) (i32.load offset=76 (local.get $t))))
+      ;; A primary is presented from its DIB right after: $dx_present fences it.
+      (br_if $no (i32.ne (i32.and (load.field DxObject flags (local.get $dst)) (i32.const 1)) (i32.const 0)))
+      ;; Pending CPU writes (check) stay pending: the next prepare diffs the
+      ;; DIB against the shadow, which the upload below keeps exact.
+      (br_if $no (i32.eq (i32.and (i32.load offset=32 (local.get $t)) (i32.const 3)) (i32.const 3)))
+      ;; An open deferred DC: its touched rect must not meet a GPU-only rect.
+      (br_if $no (i32.ne (i32.and (i32.load offset=32 (local.get $t)) (i32.const 16)) (i32.const 0)))
+      ;; A keyed copy onto a dirty target is drawn with an alpha test, which
+      ;; would also drop source pixels whose own alpha is 0.
+      (local.set $fmt (i32.load offset=24 (local.get $t)))
+      (br_if $no (i32.and
+        (i32.and (i32.ne (i32.and (local.get $trans) (i32.const 1)) (i32.const 0))
+                 (i32.ne (i32.and (i32.load offset=32 (local.get $t)) (i32.const 1)) (i32.const 0)))
+        (i32.or (i32.or (i32.eq (local.get $fmt) (i32.const 3)) (i32.eq (local.get $fmt) (i32.const 4)))
+                (i32.eq (local.get $fmt) (i32.const 5)))))
+      (local.set $ok (i32.const 1)))
+    (call $lock_release (global.get $D3DIM_GPS))
+    (local.get $ok))
+
+  ;; The CPU BltFast that $d3dim_gps_blt_begin accepted has written the
+  ;; DIB rect (dx, dy, w, h) from source (sx, sy). Unkeyed, or onto a clean
+  ;; target, that rect of the DIB is exact: UPLOAD it into the target.
+  ;; Source-keyed onto a dirty target, the DIB under the key pixels is stale:
+  ;; draw the source as an alpha-0-at-key texture under alpha test GREATER 0 instead, and
+  ;; leave the rect to the next readback.
+  (func $d3dim_gps_blt_end (param $dst i32) (param $src i32) (param $dx i32) (param $dy i32)
+      (param $sx i32) (param $sy i32) (param $w i32) (param $hgt i32) (param $trans i32)
+    (local $pb i32) (local $t i32) (local $x i32) (local $id i32) (local $tw i32) (local $th i32)
+    (local.set $pb (i32.load offset=8 (global.get $D3DIM_GPS)))
+    (if (i32.eqz (local.get $pb)) (then (return)))
+    (call $lock_acquire (global.get $D3DIM_GPS))
+    (block $out
+      (local.set $t (call $d3g_find (local.get $pb) (load.field DxObject misc1 (local.get $dst))))
+      (br_if $out (i32.eqz (local.get $t)))
+      (local.set $tw (i32.load offset=8 (local.get $t)))
+      (local.set $th (i32.load offset=12 (local.get $t)))
+      (br_if $out (i32.or (i32.or (i32.lt_s (local.get $dx) (i32.const 0)) (i32.lt_s (local.get $dy) (i32.const 0)))
+                          (i32.or (i32.le_s (local.get $w) (i32.const 0)) (i32.le_s (local.get $hgt) (i32.const 0)))))
+      (br_if $out (i32.or (i32.gt_s (i32.add (local.get $dx) (local.get $w)) (local.get $tw))
+                          (i32.gt_s (i32.add (local.get $dy) (local.get $hgt)) (local.get $th))))
+      (if (i32.or (i32.eqz (i32.and (local.get $trans) (i32.const 1)))
+                  (i32.eqz (i32.and (i32.load offset=32 (local.get $t)) (i32.const 1)))) (then
+        (call $d3g_upload_target_rect (local.get $pb) (local.get $t) (local.get $dx) (local.get $dy)
+          (local.get $w) (local.get $hgt))
+        (i32.store offset=23284 (local.get $pb) (i32.add (i32.load offset=23284 (local.get $pb)) (i32.const 1)))
+        (br $out)))
+      ;; The key texture: one, recreated when the size changes.
+      (local.set $id (i32.load offset=23288 (local.get $pb)))
+      (if (i32.and (i32.ne (local.get $id) (i32.const 0))
+            (i32.or (i32.ne (i32.load offset=23292 (local.get $pb)) (local.get $w))
+                    (i32.ne (i32.load offset=23296 (local.get $pb)) (local.get $hgt))))
+        (then (call $d3g_release (local.get $pb) (local.get $id)) (local.set $id (i32.const 0))))
+      (if (i32.eqz (local.get $id)) (then
+        (local.set $id (call $d3g_new_id (local.get $pb)))
+        (call $d3g_create (local.get $id) (global.get $GPS_KIND_TEX2D) (global.get $GPS_FMT_A8B8G8R8)
+          (i32.const 1) (local.get $w) (local.get $hgt))
+        (i32.store offset=23288 (local.get $pb) (local.get $id))
+        (i32.store offset=23292 (local.get $pb) (local.get $w))
+        (i32.store offset=23296 (local.get $pb) (local.get $hgt))))
+      (call $d3g_upload_keyed (local.get $pb) (local.get $id) (load.field DxObject misc1 (local.get $src))
+        (load.field DxObject pitch (local.get $src)) (i32.load offset=16 (local.get $t)) (i32.load offset=24 (local.get $t))
+        (local.get $sx) (local.get $sy) (local.get $w) (local.get $hgt) (load.field DxObject misc2 (local.get $src)))
+      (call $d3g_targets (local.get $pb) (i32.load offset=28 (local.get $t)) (i32.const 0))
+      (call $d3g_blit_ps (local.get $pb) (local.get $id) (i32.const 5)
+        (f32.convert_i32_s (local.get $dx)) (f32.convert_i32_s (local.get $dy))
+        (f32.convert_i32_s (i32.add (local.get $dx) (local.get $w))) (f32.convert_i32_s (i32.add (local.get $dy) (local.get $hgt)))
+        (f32.const 0) (f32.const 0) (f32.const 1) (f32.const 1)
+        (i32.const 0) (i32.const 0) (local.get $tw) (local.get $th))
+      (call $d3g_mark (local.get $t) (i32.const 1)
+        (f32.convert_i32_s (local.get $dx)) (f32.convert_i32_s (local.get $dy))
+        (f32.convert_i32_s (i32.add (local.get $dx) (local.get $w))) (f32.convert_i32_s (i32.add (local.get $dy) (local.get $hgt))))
+      (global.set $d3dim_worker_pending (i32.const 1))
+      (i32.store offset=23280 (local.get $pb) (i32.add (i32.load offset=23280 (local.get $pb)) (i32.const 1))))
+    (call $lock_release (global.get $D3DIM_GPS)))
+
+  ;; ---- CPU writers that never read the GPU pixels -----------------------
+  ;; The GPU target holding $entry's DIB at $entry's current geometry, or 0.
+  (func $d3g_entry_target (param $pb i32) (param $entry i32) (result i32)
+    (local $t i32)
+    (local.set $t (call $d3g_find (local.get $pb) (load.field DxObject misc1 (local.get $entry))))
+    (if (i32.eqz (local.get $t)) (then (return (i32.const 0))))
+    (if (i32.or (i32.or (i32.ne (i32.load offset=8 (local.get $t)) (load.field DxObject width (local.get $entry)))
+                        (i32.ne (i32.load offset=12 (local.get $t)) (load.field DxObject height (local.get $entry))))
+                (i32.or (i32.ne (i32.load offset=16 (local.get $t)) (load.field DxObject bpp (local.get $entry)))
+                        (i32.ne (i32.load offset=20 (local.get $t)) (load.field DxObject pitch (local.get $entry)))))
+      (then (return (i32.const 0))))
+    (local.get $t))
+
+  ;; Nothing that would make the skipped CPU fence do more than read this
+  ;; target back: no owed WebGL present, no armed lazy Lock, no shared
+  ;; cooperative owner, not a primary.
+  (func $d3g_cpu_write_ok (param $entry i32) (result i32)
+    (i32.eqz (i32.or
+      (i32.or (global.get $d3dim_gpu_cooperative) (global.get $d3dim_present_pending))
+      (i32.or (i32.atomic.load (region.addr $D3DIM_LAZY_SHARED 16))
+              (i32.and (load.field DxObject flags (local.get $entry)) (i32.const 1))))))
+
+  ;; Blt(DDBLT_COLORFILL) with no source onto a GPU target, about to fill the
+  ;; DIB on the CPU. 1 = no destination readback: $d3dim_gps_fill_end replays
+  ;; the fill on the GPU as a CLEAR, so the DIB and the target agree inside
+  ;; the rect and the GPU keeps every pixel outside it. Flipping apps clear
+  ;; the whole back buffer this way every frame (DXSDK Flip3DTL): after a GPU
+  ;; Flip the back buffer's DIB is two frames stale and the CPU path read it
+  ;; back only to overwrite it. Declined: a region clipper (the CPU fill
+  ;; skips pixels), a dirty target with CPU writes pending, an open deferred
+  ;; DC, and the states $d3g_cpu_write_ok refuses.
+  (func $d3dim_gps_fill_begin (param $dst i32) (result i32)
+    (local $pb i32) (local $t i32) (local $ok i32)
+    (local.set $pb (i32.load offset=8 (global.get $D3DIM_GPS)))
+    (if (i32.eqz (local.get $pb)) (then (return (i32.const 0))))
+    (if (i32.eqz (call $d3g_cpu_write_ok (local.get $dst))) (then (return (i32.const 0))))
+    (if (call $dx_surface_clipper_get (local.get $dst)) (then (return (i32.const 0))))
+    (call $gl_sw_host_fence)
+    (call $lock_acquire (global.get $D3DIM_GPS))
+    (block $no
+      (local.set $t (call $d3g_entry_target (local.get $pb) (local.get $dst)))
+      (br_if $no (i32.eqz (local.get $t)))
+      (br_if $no (i32.eqz (i32.and (i32.load offset=32 (local.get $t)) (i32.const 4))))
+      (br_if $no (i32.eq (i32.and (i32.load offset=32 (local.get $t)) (i32.const 3)) (i32.const 3)))
+      (br_if $no (i32.ne (i32.and (i32.load offset=32 (local.get $t)) (i32.const 16)) (i32.const 0)))
+      (local.set $ok (i32.const 1)))
+    (call $lock_release (global.get $D3DIM_GPS))
+    (local.get $ok))
+
+  ;; The CPU fill $d3dim_gps_fill_begin accepted wrote native pixel $fill
+  ;; over (x, y, w, h) of the DIB. CLEAR the same rect on the GPU with that
+  ;; pixel decoded exactly as an upload would decode it, and keep the shadow
+  ;; equal. A fill covering the whole GPU-only rect leaves the target clean.
+  (func $d3dim_gps_fill_end (param $dst i32) (param $fill i32) (param $x i32) (param $y i32) (param $w i32) (param $hgt i32)
+    (local $pb i32) (local $t i32) (local $l i32) (local $tp i32) (local $r i32) (local $b i32)
+    (local $p i32) (local $bps i32) (local $pitch i32) (local $j i32) (local $off i32)
+    (local.set $pb (i32.load offset=8 (global.get $D3DIM_GPS)))
+    (if (i32.eqz (local.get $pb)) (then (return)))
+    (call $lock_acquire (global.get $D3DIM_GPS))
+    (block $out
+      (local.set $t (call $d3g_entry_target (local.get $pb) (local.get $dst)))
+      (if (i32.eqz (local.get $t)) (then (call $d3g_fail)))
+      (local.set $l (select (local.get $x) (i32.const 0) (i32.gt_s (local.get $x) (i32.const 0))))
+      (local.set $tp (select (local.get $y) (i32.const 0) (i32.gt_s (local.get $y) (i32.const 0))))
+      (local.set $r (i32.add (local.get $x) (local.get $w)))
+      (if (i32.gt_s (local.get $r) (i32.load offset=8 (local.get $t))) (then (local.set $r (i32.load offset=8 (local.get $t)))))
+      (local.set $b (i32.add (local.get $y) (local.get $hgt)))
+      (if (i32.gt_s (local.get $b) (i32.load offset=12 (local.get $t))) (then (local.set $b (i32.load offset=12 (local.get $t)))))
+      (br_if $out (i32.or (i32.le_s (local.get $r) (local.get $l)) (i32.le_s (local.get $b) (local.get $tp))))
+      (local.set $bps (i32.shr_u (i32.load offset=16 (local.get $t)) (i32.const 3)))
+      ;; +92 is scratch: one native pixel, decoded in place.
+      (if (i32.eq (local.get $bps) (i32.const 2))
+        (then (i32.store offset=92 (local.get $t) (i32.and (local.get $fill) (i32.const 0xFFFF))))
+        (else (i32.store offset=92 (local.get $t) (local.get $fill))))
+      (call $d3g_row_to_rgba (i32.add (local.get $t) (i32.const 92)) (i32.add (local.get $t) (i32.const 92))
+        (i32.const 1) (i32.load offset=24 (local.get $t)) (i32.load offset=16 (local.get $t)))
+      (call $d3g_targets (local.get $pb) (i32.load offset=28 (local.get $t)) (i32.const 0))
+      (local.set $p (call $d3g_begin (local.get $pb) (global.get $GPS_OP_CLEAR) (size-of GpsClear)))
+      (store.field GpsClear mask (local.get $p) (i32.const 1))
+      (store.field GpsClear colormask (local.get $p) (i32.const 15))
+      (store.field GpsClear pad (local.get $p) (i32.const 0))
+      (store.field GpsClear rgba (local.get $p) (i32.load offset=92 (local.get $t)))
+      (store.field GpsClear z (local.get $p) (f32.const 1))
+      (store.field GpsClear stencil (local.get $p) (i32.const 0))
+      (store.field GpsClear left (local.get $p) (local.get $l))
+      (store.field GpsClear top (local.get $p) (local.get $tp))
+      (store.field GpsClear right (local.get $p) (local.get $r))
+      (store.field GpsClear bottom (local.get $p) (local.get $b))
+      (drop (call $d3g_end (local.get $p)))
+      (i32.store offset=92 (local.get $t) (i32.const 0))
+      (if (i32.and (i32.ne (i32.load offset=52 (local.get $t)) (i32.const 0))
+                   (i32.ne (i32.and (i32.load offset=32 (local.get $t)) (i32.const 8)) (i32.const 0))) (then
+        (local.set $pitch (i32.load offset=20 (local.get $t)))
+        (local.set $j (local.get $tp))
+        (block $sdone (loop $srows
+          (br_if $sdone (i32.ge_s (local.get $j) (local.get $b)))
+          (local.set $off (i32.add (i32.mul (local.get $j) (local.get $pitch)) (i32.mul (local.get $l) (local.get $bps))))
+          (memory.copy (i32.add (i32.load offset=52 (local.get $t)) (local.get $off))
+            (i32.add (i32.load (local.get $t)) (local.get $off))
+            (i32.mul (i32.sub (local.get $r) (local.get $l)) (local.get $bps)))
+          (local.set $j (i32.add (local.get $j) (i32.const 1)))
+          (br $srows)))))
+      (if (i32.and (i32.ne (i32.and (i32.load offset=32 (local.get $t)) (i32.const 1)) (i32.const 0))
+            (i32.and
+              (i32.and (i32.le_s (local.get $l) (i32.load offset=36 (local.get $t)))
+                       (i32.le_s (local.get $tp) (i32.load offset=40 (local.get $t))))
+              (i32.and (i32.ge_s (local.get $r) (i32.load offset=44 (local.get $t)))
+                       (i32.ge_s (local.get $b) (i32.load offset=48 (local.get $t))))))
+        (then (i32.store offset=32 (local.get $t) (i32.and (i32.load offset=32 (local.get $t)) (i32.const -2)))))
+      (i32.store offset=88 (local.get $t) (i32.const 0))
+      (global.set $d3dim_gpu_last_rt (local.get $dst))
+      (global.set $d3dim_worker_pending (i32.const 1))
+      (call $d3g_stat (local.get $pb) (i32.const 9) (i32.const 1)))
+    (call $lock_release (global.get $D3DIM_GPS)))
+
+  ;; GetDC on a dirty GPU target ($d3dim_gps_getdc_defer) need not read the
+  ;; target back at all when GDI only writes pixels the GPU does not own:
+  ;; DXSDK Flip3DTL draws a cube, then TextOuts a caption above and below it
+  ;; every frame (one 640x253 readback per frame before). The DC is opened
+  ;; deferred (flag 16) with the DIB still stale inside the dirty rect R.
+  ;; Text output reports each pixel it writes ($d3dim_gps_gdi_pixel); those
+  ;; grow a touched rect T kept disjoint from R, uploaded at ReleaseDC. Any
+  ;; other GDI access through $gdi_surface_descriptor, a text pixel inside R,
+  ;; or any GPU/CPU fence of the target lands it first: R read back (charged
+  ;; to getDC), T uploaded, and the DC continues as an ordinary one.
+  (global $gdi_dx_bounded (mut i32) (i32.const 0))
+  (global $d3g_gdi_text_t (mut i32) (i32.const 0))
+
+  ;; Upload T and end the deferral (the target stays dirty in R).
+  (func $d3g_gdi_flush (param $pb i32) (param $t i32)
+    (local $l i32) (local $tp i32) (local $r i32) (local $b i32)
+    (if (i32.eqz (i32.and (i32.load offset=32 (local.get $t)) (i32.const 16))) (then (return)))
+    (local.set $l (i32.load offset=96 (local.get $t)))
+    (local.set $tp (i32.load offset=100 (local.get $t)))
+    (local.set $r (i32.load offset=104 (local.get $t)))
+    (local.set $b (i32.load offset=108 (local.get $t)))
+    (if (i32.and (i32.gt_s (local.get $r) (local.get $l)) (i32.gt_s (local.get $b) (local.get $tp)))
+      (then (call $d3g_upload_target_rect (local.get $pb) (local.get $t) (local.get $l) (local.get $tp)
+        (i32.sub (local.get $r) (local.get $l)) (i32.sub (local.get $b) (local.get $tp)))))
+    (memory.fill (i32.add (local.get $t) (i32.const 96)) (i32.const 0) (i32.const 16))
+    (i32.store offset=32 (local.get $t) (i32.and (i32.load offset=32 (local.get $t)) (i32.const -17)))
+    (if (i32.eq (global.get $d3g_gdi_text_t) (local.get $t)) (then (global.set $d3g_gdi_text_t (i32.const 0))))
+    (i32.store offset=23356 (local.get $pb) (i32.sub (i32.load offset=23356 (local.get $pb)) (i32.const 1))))
+
+  ;; What the skipped GetDC fence would have done: upload T, read R back
+  ;; (charged to getDC), re-check the target before its next GPU use.
+  (func $d3g_gdi_land (param $pb i32) (param $t i32)
+    (local $s i32)
+    (call $d3g_gdi_flush (local.get $pb) (local.get $t))
+    (i32.store offset=32 (local.get $t) (i32.or (i32.load offset=32 (local.get $t)) (i32.const 2)))
+    (local.set $s (call $d3g_site (i32.const 1)))
+    (call $d3g_readback (local.get $pb) (local.get $t))
+    (drop (call $d3g_site (local.get $s))))
+
+  ;; GetDC($entry): 1 = opened deferred, the caller skips its fence.
+  (func $d3dim_gps_getdc_defer (param $entry i32) (result i32)
+    (local $pb i32) (local $t i32) (local $f i32) (local $ok i32)
+    (local.set $pb (i32.load offset=8 (global.get $D3DIM_GPS)))
+    (if (i32.eqz (local.get $pb)) (then (return (i32.const 0))))
+    (if (i32.eqz (call $d3g_cpu_write_ok (local.get $entry))) (then (return (i32.const 0))))
+    (if (i32.eq (i32.atomic.load (region.addr $D3DIM_LAZY_SHARED 20)) (local.get $entry)) (then (return (i32.const 0))))
+    (call $gl_sw_host_fence)
+    (call $lock_acquire (global.get $D3DIM_GPS))
+    (block $no
+      (local.set $t (call $d3g_entry_target (local.get $pb) (local.get $entry)))
+      (br_if $no (i32.eqz (local.get $t)))
+      (local.set $f (i32.load offset=32 (local.get $t)))
+      (br_if $no (i32.eqz (i32.and (local.get $f) (i32.const 1))))
+      (br_if $no (i32.eq (i32.and (local.get $f) (i32.const 3)) (i32.const 3)))
+      (br_if $no (i32.ne (i32.and (local.get $f) (i32.const 16)) (i32.const 0)))
+      (memory.fill (i32.add (local.get $t) (i32.const 96)) (i32.const 0) (i32.const 16))
+      (i32.store offset=32 (local.get $t) (i32.or (local.get $f) (i32.const 16)))
+      (i32.store offset=23356 (local.get $pb) (i32.add (i32.load offset=23356 (local.get $pb)) (i32.const 1)))
+      (i32.store offset=23352 (local.get $pb) (i32.add (i32.load offset=23352 (local.get $pb)) (i32.const 1)))
+      (local.set $ok (i32.const 1)))
+    (call $lock_release (global.get $D3DIM_GPS))
+    (local.get $ok))
+
+  ;; ReleaseDC($entry): 1 = a deferred DC closed with its text uploaded; the
+  ;; target keeps its GPU-only rect and the frame stays on the GPU.
+  (func $d3dim_gps_releasedc (param $entry i32) (result i32)
+    (local $pb i32) (local $t i32) (local $ok i32)
+    (local.set $pb (i32.load offset=8 (global.get $D3DIM_GPS)))
+    (if (i32.eqz (local.get $pb)) (then (return (i32.const 0))))
+    (if (i32.eqz (i32.load offset=23356 (local.get $pb))) (then (return (i32.const 0))))
+    (call $lock_acquire (global.get $D3DIM_GPS))
+    (local.set $t (call $d3g_find (local.get $pb) (load.field DxObject misc1 (local.get $entry))))
+    (if (local.get $t) (then
+      (if (i32.and (i32.load offset=32 (local.get $t)) (i32.const 16)) (then
+        (call $d3g_gdi_flush (local.get $pb) (local.get $t))
+        (local.set $ok (i32.const 1))))))
+    (call $lock_release (global.get $D3DIM_GPS))
+    (local.get $ok))
+
+  ;; $gdi_surface_descriptor on DX surface $entry: GDI is about to access its
+  ;; bits. Unless the caller is bounded text output, land a deferred target.
+  (func $d3dim_gps_gdi_access (param $entry i32)
+    (local $pb i32) (local $t i32)
+    (local.set $pb (i32.load offset=8 (global.get $D3DIM_GPS)))
+    (if (i32.eqz (local.get $pb)) (then (return)))
+    (if (i32.eqz (i32.load offset=23356 (local.get $pb))) (then (return)))
+    (call $lock_acquire (global.get $D3DIM_GPS))
+    (local.set $t (call $d3g_find (local.get $pb) (load.field DxObject misc1 (local.get $entry))))
+    (if (local.get $t) (then
+      (if (i32.and (i32.load offset=32 (local.get $t)) (i32.const 16)) (then
+        (if (global.get $gdi_dx_bounded)
+          (then (global.set $d3g_gdi_text_t (local.get $t)))
+          (else (call $d3g_gdi_land (local.get $pb) (local.get $t))))))))
+    (call $lock_release (global.get $D3DIM_GPS)))
+
+  ;; Text is about to write pixel (x, y) of the deferred target
+  ;; $d3g_gdi_text_t (set by a bounded $d3dim_gps_gdi_access).
+  (func $d3dim_gps_gdi_pixel (param $x i32) (param $y i32)
+    (local $t i32) (local $pb i32) (local $l i32) (local $tp i32) (local $r i32) (local $b i32)
+    (local.set $t (global.get $d3g_gdi_text_t))
+    (if (i32.eqz (i32.and (i32.load offset=32 (local.get $t)) (i32.const 16)))
+      (then (global.set $d3g_gdi_text_t (i32.const 0)) (return)))
+    (local.set $pb (i32.load offset=8 (global.get $D3DIM_GPS)))
+    (if (call $d3g_rect_hits (local.get $t) (local.get $x) (local.get $y)
+          (i32.add (local.get $x) (i32.const 1)) (i32.add (local.get $y) (i32.const 1)))
+      (then
+        (call $lock_acquire (global.get $D3DIM_GPS))
+        (call $d3g_gdi_land (local.get $pb) (local.get $t))
+        (call $lock_release (global.get $D3DIM_GPS))
+        (return)))
+    (local.set $l (local.get $x))
+    (local.set $tp (local.get $y))
+    (local.set $r (i32.add (local.get $x) (i32.const 1)))
+    (local.set $b (i32.add (local.get $y) (i32.const 1)))
+    (if (i32.gt_s (i32.load offset=104 (local.get $t)) (i32.load offset=96 (local.get $t))) (then
+      (if (i32.lt_s (i32.load offset=96 (local.get $t)) (local.get $l)) (then (local.set $l (i32.load offset=96 (local.get $t)))))
+      (if (i32.lt_s (i32.load offset=100 (local.get $t)) (local.get $tp)) (then (local.set $tp (i32.load offset=100 (local.get $t)))))
+      (if (i32.gt_s (i32.load offset=104 (local.get $t)) (local.get $r)) (then (local.set $r (i32.load offset=104 (local.get $t)))))
+      (if (i32.gt_s (i32.load offset=108 (local.get $t)) (local.get $b)) (then (local.set $b (i32.load offset=108 (local.get $t)))))
+      ;; The grown rect would reach into R: send what T holds now and
+      ;; start a new one at this pixel.
+      (if (call $d3g_rect_hits (local.get $t) (local.get $l) (local.get $tp) (local.get $r) (local.get $b)) (then
+        (call $lock_acquire (global.get $D3DIM_GPS))
+        (call $d3g_upload_target_rect (local.get $pb) (local.get $t)
+          (i32.load offset=96 (local.get $t)) (i32.load offset=100 (local.get $t))
+          (i32.sub (i32.load offset=104 (local.get $t)) (i32.load offset=96 (local.get $t)))
+          (i32.sub (i32.load offset=108 (local.get $t)) (i32.load offset=100 (local.get $t))))
+        (call $lock_release (global.get $D3DIM_GPS))
+        (local.set $l (local.get $x))
+        (local.set $tp (local.get $y))
+        (local.set $r (i32.add (local.get $x) (i32.const 1)))
+        (local.set $b (i32.add (local.get $y) (i32.const 1)))))))
+    (i32.store offset=96 (local.get $t) (local.get $l))
+    (i32.store offset=100 (local.get $t) (local.get $tp))
+    (i32.store offset=104 (local.get $t) (local.get $r))
+    (i32.store offset=108 (local.get $t) (local.get $b)))
+
+  ;; 1 when [l, r) x [tp, b) meets $t's GPU-only rect.
+  (func $d3g_rect_hits (param $t i32) (param $l i32) (param $tp i32) (param $r i32) (param $b i32) (result i32)
+    (if (i32.eqz (i32.and (i32.load offset=32 (local.get $t)) (i32.const 1))) (then (return (i32.const 0))))
+    (i32.and
+      (i32.and (i32.lt_s (local.get $l) (i32.load offset=44 (local.get $t)))
+               (i32.gt_s (local.get $r) (i32.load offset=36 (local.get $t))))
+      (i32.and (i32.lt_s (local.get $tp) (i32.load offset=48 (local.get $t)))
+               (i32.gt_s (local.get $b) (i32.load offset=40 (local.get $t))))))
+
+  ;; 0x20001: CPU access to [addr, addr+len) (0 = everything). Overlapping
+  ;; targets are read back and re-checked before their next GPU use; 2 =
+  ;; other targets still hold GPU-only pixels.
+  (func $d3g_fence (param $pb i32) (param $addr i32) (param $len i32) (result i32)
+    (local $i i32) (local $t i32) (local $pending i32) (local $flags i32)
+    (call $d3g_stat (local.get $pb) (i32.const 13) (i32.const 1))
+    (loop $scan
+      (local.set $t (call $d3g_t (local.get $pb) (local.get $i)))
+      (if (i32.load (local.get $t)) (then
+        (local.set $flags (i32.load offset=32 (local.get $t)))
+        (if (i32.and (i32.ne (local.get $len) (i32.const 0))
+              (i32.eqz (call $d3g_overlap (local.get $addr) (local.get $len)
+                (i32.load (local.get $t)) (i32.load offset=76 (local.get $t)))))
+          (then (if (i32.and (local.get $flags) (i32.const 1)) (then (local.set $pending (i32.const 1)))))
+          (else
+            (i32.store offset=32 (local.get $t) (i32.or (local.get $flags) (i32.const 2)))
+            (call $d3g_readback (local.get $pb) (local.get $t))))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $scan (i32.lt_u (local.get $i) (global.get $D3G_TARGETS))))
+    ;; A global barrier never lands the parked primary: only its readers do.
+    (if (i32.and (i32.ne (local.get $len) (i32.const 0)) (i32.ne (i32.load offset=184 (local.get $pb)) (i32.const 0)))
+      (then
+        (if (call $d3g_overlap (local.get $addr) (local.get $len) (i32.load offset=164 (local.get $pb))
+              (i32.mul (i32.load offset=168 (local.get $pb)) (i32.load offset=180 (local.get $pb))))
+          (then (call $d3g_materialize (local.get $pb))))))
+    (select (i32.const 2) (i32.const 1) (local.get $pending)))
+
+  ;; The CPU is about to overwrite every byte of [addr, addr+len) without
+  ;; reading any of it (a REP MOVS / STOS over a whole lazily-locked
+  ;; surface): a readback of the targets inside it would be thrown away. Each
+  ;; dirty one forgets its GPU-only pixels instead and is re-checked with its
+  ;; shadow invalid, so its next GPU use uploads the whole new DIB. 0 when a
+  ;; dirty target or the parked primary only partly overlaps: the caller
+  ;; reads back as before.
+  (func $d3g_discard (param $pb i32) (param $addr i32) (param $len i32) (result i32)
+    (local $i i32) (local $t i32) (local $flags i32) (local $inside i32)
+    (if (i32.eqz (local.get $len)) (then (return (i32.const 0))))
+    (if (i32.ne (i32.load offset=184 (local.get $pb)) (i32.const 0)) (then
+      (if (call $d3g_overlap (local.get $addr) (local.get $len) (i32.load offset=164 (local.get $pb))
+            (i32.mul (i32.load offset=168 (local.get $pb)) (i32.load offset=180 (local.get $pb))))
+        (then (return (i32.const 0))))))
+    (loop $check
+      (local.set $t (call $d3g_t (local.get $pb) (local.get $i)))
+      (if (i32.and (i32.ne (i32.load (local.get $t)) (i32.const 0))
+            (i32.ne (i32.and (i32.load offset=32 (local.get $t)) (i32.const 1)) (i32.const 0))) (then
+        (if (call $d3g_overlap (local.get $addr) (local.get $len)
+              (i32.load (local.get $t)) (i32.load offset=76 (local.get $t))) (then
+          (if (i32.or (i32.lt_u (i32.load (local.get $t)) (local.get $addr))
+                (i64.gt_u (i64.add (i64.extend_i32_u (i32.load (local.get $t))) (i64.extend_i32_u (i32.load offset=76 (local.get $t))))
+                  (i64.add (i64.extend_i32_u (local.get $addr)) (i64.extend_i32_u (local.get $len)))))
+            (then (return (i32.const 0))))))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $check (i32.lt_u (local.get $i) (global.get $D3G_TARGETS))))
+    (local.set $i (i32.const 0))
+    (loop $drop
+      (local.set $t (call $d3g_t (local.get $pb) (local.get $i)))
+      ;; As $d3g_fence: every overlapping target is re-checked; a dirty one
+      ;; also loses its GPU-only pixels and its (now stale) shadow.
+      (if (i32.load (local.get $t)) (then
+        (if (call $d3g_overlap (local.get $addr) (local.get $len)
+              (i32.load (local.get $t)) (i32.load offset=76 (local.get $t))) (then
+          (call $d3g_gdi_flush (local.get $pb) (local.get $t))
+          (local.set $flags (i32.load offset=32 (local.get $t)))
+          (if (i32.and (local.get $flags) (i32.const 1)) (then
+            (local.set $flags (i32.and (local.get $flags) (i32.const -10)))
+            (i32.store offset=88 (local.get $t) (i32.const 0))
+            (local.set $inside (i32.const 1))))
+          (i32.store offset=32 (local.get $t) (i32.or (local.get $flags) (i32.const 2)))))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $drop (i32.lt_u (local.get $i) (global.get $D3G_TARGETS))))
+    (if (local.get $inside)
+      (then (i32.store offset=23344 (local.get $pb) (i32.add (i32.load offset=23344 (local.get $pb)) (i32.const 1)))))
+    (i32.const 1))
+
+  ;; $gps_lazy_overwrite (09a8gv): [wa, wa+len) is about to be overwritten
+  ;; whole. 1 = nothing there needs reading back any more.
+  (func $d3dim_gps_discard (param $wa i32) (param $len i32) (result i32)
+    (local $pb i32) (local $r i32)
+    (local.set $pb (i32.load offset=8 (global.get $D3DIM_GPS)))
+    (if (i32.eqz (local.get $pb)) (then (return (i32.const 1))))
+    (call $lock_acquire (global.get $D3DIM_GPS))
+    (local.set $r (call $d3g_discard (local.get $pb) (local.get $wa) (local.get $len)))
+    (call $lock_release (global.get $D3DIM_GPS))
+    (local.get $r))
+
+  ;; ---- Entry points ------------------------------------------------------
+  ;; A cooperative Node owner needs an execution boundary per guest draw,
+  ;; rather than accumulating an entire frame before the host can service
+  ;; input. Publication and the API epilogue still finish before the yield.
+  (global $d3g_draw_kicks (mut i32) (i32.const 0))
+  (func (export "d3dim_gps_draw_kicks_enable") (param $on i32)
+    (global.set $d3g_draw_kicks (i32.ne (local.get $on) (i32.const 0))))
+  (func $d3dim_gps_call (param $op i32) (param $wa i32) (param $len i32) (result i32)
+    (local $pb i32) (local $r i32)
+    ;; Before the first draw there is no GPU target: a CPU access fence has
+    ;; nothing to read back and must not open the ring (2D apps fence on
+    ;; every GetDC and CPU present).
+    (if (i32.and (i32.eq (local.get $op) (i32.const 0x20001))
+                 (i32.eqz (i32.load offset=8 (global.get $D3DIM_GPS))))
+      (then (return (i32.const 1))))
+    (call $lock_acquire (global.get $D3DIM_GPS))
+    (local.set $pb (call $d3g_pb))
+    (block $done
+      (if (i32.eqz (local.get $pb)) (then
+        (local.set $r (i32.or (i32.eq (local.get $op) (i32.const 0x20001)) (i32.eq (local.get $op) (i32.const 0x20002))))
+        (br $done)))
+      (if (i32.eq (local.get $op) (i32.const 0x20000)) (then
+        (local.set $r (call $d3g_draw (local.get $pb) (local.get $wa)))
+        (if (i32.and (global.get $d3g_draw_kicks) (i32.ne (local.get $r) (i32.const 0)))
+          (then (drop (call $d3g_kick (local.get $pb) (global.get $GPS_KICK_ASYNC)))))
+        (if (i32.eqz (local.get $r)) (then (call $d3g_stat (local.get $pb) (i32.const 14) (i32.const 1))))
+        (br $done)))
+      (if (i32.eq (local.get $op) (i32.const 0x20001)) (then
+        (local.set $r (call $d3g_fence (local.get $pb) (local.get $wa) (local.get $len))) (br $done)))
+      (if (i32.eq (local.get $op) (i32.const 0x20002)) (then (local.set $r (i32.const 1)) (br $done)))
+      (if (i32.eq (local.get $op) (i32.const 0x20003)) (then
+        (local.set $r (call $d3g_flip (local.get $pb) (local.get $wa))) (br $done)))
+      (if (i32.eq (local.get $op) (i32.const 0x20004)) (then
+        (local.set $r (call $d3g_clear (local.get $pb) (local.get $wa))) (br $done)))
+      (if (i32.eq (local.get $op) (i32.const 0x2000A)) (then
+        (local.set $r (call $d3g_blt_present (local.get $pb) (local.get $wa))) (br $done)))
+      ;; 0x20007 (lazy Lock publish): accepted. The producer's targets live
+      ;; in shared memory under $D3DIM_GPS, so there is nothing to publish:
+      ;; a later 0x20001 from any guest thread ($d3dim_lazy_materialize, on
+      ;; the first real access) reads exactly the armed target back. MW3's
+      ;; cockpit leaves 2 of 4 Locks/frame untouched (readbacks 3.0 -> 1.0
+      ;; per frame, docs/lazy-sync-game-results.md). A cooperative instance
+      ;; shares a host owner and stays eager.
+      (if (i32.eq (local.get $op) (i32.const 0x20007)) (then
+        (local.set $r (i32.eqz (global.get $d3dim_gpu_cooperative))) (br $done)))
+      (call $d3g_fail))
+    (call $lock_release (global.get $D3DIM_GPS))
+    (local.get $r))
+
+  ;; The d3dim GPU seam: always the WAT producer.
+  (func $d3dim_gpu_call (param $op i32) (param $wa i32) (param $len i32) (result i32)
+    (call $d3dim_gps_call (local.get $op) (local.get $wa) (local.get $len)))
+
+  ;; Final release of surface $entry: drop its GPU resources (the caller has
+  ;; already fenced, so nothing is read back here).
+  (func $d3dim_gps_forget (param $entry i32)
+    (local $pb i32) (local $t i32) (local $i i32) (local $e i32)
+    (local.set $pb (i32.load offset=8 (global.get $D3DIM_GPS)))
+    (if (i32.eqz (local.get $pb)) (then (return)))
+    (call $lock_acquire (global.get $D3DIM_GPS))
+    (loop $owners
+      (local.set $e (i32.add (i32.add (local.get $pb) (i32.const 23360)) (i32.shl (local.get $i) (i32.const 5))))
+      (if (i32.eq (i32.load offset=4 (local.get $e)) (local.get $entry))
+        (then (memory.fill (local.get $e) (i32.const 0) (i32.const 32))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $owners (i32.lt_u (local.get $i) (i32.const 32))))
+    (local.set $i (i32.const 0))
+    (local.set $t (call $d3g_find (local.get $pb) (load.field DxObject misc1 (local.get $entry))))
+    (if (local.get $t) (then (call $d3g_target_drop (local.get $pb) (local.get $t) (i32.const 0))))
+    ;; Keys are surface identities: releasing an RT drops only its private
+    ;; fallback; releasing an attached Z drops its shared depth resource.
+    (loop $depth
+      (local.set $e (i32.add (i32.add (local.get $pb) (i32.const 5376)) (i32.shl (local.get $i) (i32.const 4))))
+      (if (i32.eq (i32.load (local.get $e)) (local.get $entry)) (then
+        (call $d3g_release (local.get $pb) (i32.load offset=12 (local.get $e)))
+        (i32.store (local.get $e) (i32.const 0))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $depth (i32.lt_u (local.get $i) (i32.const 32))))
+    (local.set $i (i32.const 0))
+    (if (i32.load offset=6656 (local.get $pb)) (then (loop $tex
+      (local.set $e (call $gtc_entry (call $d3g_tc (local.get $pb)) (local.get $i)))
+      (if (i32.eq (i32.load (local.get $e)) (local.get $entry)) (then
+        (call $gps_td_drop (call $d3g_h) (local.get $i) (global.get $GPS_TD_RELEASE))
+        (call $d3g_tex_free (local.get $pb) (local.get $e))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $tex (i32.lt_u (local.get $i) (call $gtc_slots (call $d3g_tc (local.get $pb))))))))
+    (if (i32.eq (i32.load offset=188 (local.get $pb)) (local.get $entry))
+      (then (call $d3g_park_drop (local.get $pb))))
+    (call $lock_release (global.get $D3DIM_GPS)))
+
+  ;; Counters: 0 draws, 1 fallbacks, 2 readbacks, 3 readback rows, 4 uploads,
+  ;; 5 upload rows, 6 presents, 7 syncs, 8 texture uploads, 9 clears,
+  ;; 10 flips, 11 Blt presents, 12 points, 13 fences, 14 declined draws,
+  ;; 15 primitives. 16 + site: readbacks charged to $d3dim_fence_site (0
+  ;; unattributed global fence, 1 GetDC, 2 Blt/BltFast GPU source, 3 Blt/
+  ;; BltFast GPU destination, 4 Lock, 5 Texture::Load, 6 software-fallback
+  ;; draw/clear, 7 final release, 8 CPU present, 9 parked frame of another
+  ;; primary, 10 prepare of a dirty target, 11 texture from a target, 12
+  ;; target re-create, 13 host capture, 14 lazy Lock first touch, 15 other).
+  ;; 32 keyed GPU BltFasts, 33 uploaded GPU BltFasts, 34 readback bytes.
+  ;; 35 + reason: software declines by reason ($d3g_decline), 35..42.
+  ;; 43 lazy Lock readbacks dropped for a whole-range overwrite.
+  (func (export "d3dim_gps_stat") (param $i i32) (result i32)
+    (local $pb i32)
+    (local.set $pb (i32.load offset=8 (global.get $D3DIM_GPS)))
+    (if (i32.or (i32.eqz (local.get $pb)) (i32.ge_u (local.get $i) (i32.const 46))) (then (return (i32.const 0))))
+    (if (i32.eq (local.get $i) (i32.const 45)) (then (return (i32.load offset=23352 (local.get $pb)))))
+    (if (i32.eq (local.get $i) (i32.const 44)) (then (return (i32.load offset=23348 (local.get $pb)))))
+    (if (i32.eq (local.get $i) (i32.const 43)) (then (return (i32.load offset=23344 (local.get $pb)))))
+    (if (i32.ge_u (local.get $i) (i32.const 35))
+      (then (return (i32.load (i32.add (i32.add (local.get $pb) (i32.const 23312))
+        (i32.shl (i32.sub (local.get $i) (i32.const 35)) (i32.const 2)))))))
+    (if (i32.eq (local.get $i) (i32.const 34)) (then (return (i32.load offset=23300 (local.get $pb)))))
+    (if (i32.ge_u (local.get $i) (i32.const 32))
+      (then (return (i32.load (i32.add (i32.add (local.get $pb) (i32.const 23280))
+        (i32.shl (i32.sub (local.get $i) (i32.const 32)) (i32.const 2)))))))
+    (if (i32.ge_u (local.get $i) (i32.const 16))
+      (then (return (i32.load (i32.add (i32.add (local.get $pb) (i32.const 23216))
+        (i32.shl (i32.sub (local.get $i) (i32.const 16)) (i32.const 2)))))))
+    (i32.load (i32.add (i32.add (local.get $pb) (i32.const 80)) (i32.shl (local.get $i) (i32.const 2)))))
+
+  ;; Host capture barrier (test/run.js --png, harness readers): every GPU
+  ;; target and the parked primary land in their DIBs, as a CPU reader of
+  ;; all surfaces would see them. Not called on any guest path.
+  (func (export "d3dim_gps_sync_all")
+    (local $pb i32)
+    (call $lock_acquire (global.get $D3DIM_GPS))
+    (local.set $pb (i32.load offset=8 (global.get $D3DIM_GPS)))
+    (if (local.get $pb) (then
+      (drop (call $d3g_site (i32.const 13)))
+      (drop (call $d3g_fence (local.get $pb) (i32.const 0) (i32.const 0)))
+      (call $d3g_materialize (local.get $pb))
+      (global.set $d3dim_fence_site (i32.const 0))))
+    (call $lock_release (global.get $D3DIM_GPS)))

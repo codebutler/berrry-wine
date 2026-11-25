@@ -523,6 +523,12 @@
           ;; publication never queried by FindWindow; absence is not evidence
           ;; that it was renderer-only. No WND lock is held across this import.
           (i32.store8 (i32.add (region.addr $WND_LOOKUP_RETIRED 0) (local.get $i)) (i32.const 1))
+          ;; Every retirement path, including WAT-native modal tree teardown,
+          ;; must release this instance's focus. Do this before host callbacks
+          ;; can observe the retired HWND. Preserve any unrelated live focus;
+          ;; restoration/activation remains the caller's normal USER policy.
+          (if (i32.eq (global.get $focus_hwnd) (local.get $hwnd))
+            (then (drop (call $focus_publish (i32.const 0)))))
           (call $host_set_window_class (local.get $hwnd) (i32.const -2))
           ;; A top-level window owns its canonical software-GDI presentation.
           ;; Child removal is a no-op because child DCs resolve to that owner.
@@ -641,8 +647,11 @@
       (then (global.set $focus_hwnd (i32.const 0))))
     (if (i32.eq (global.get $active_hwnd) (local.get $hwnd))
       (then (global.set $active_hwnd (i32.const 0))))
-    (if (i32.eq (global.get $capture_hwnd) (local.get $hwnd))
-      (then (global.set $capture_hwnd (i32.const 0))))
+    (if (i32.eq (call $capture_live) (local.get $hwnd))
+      (then (call $capture_store (i32.const 0))))
+    ;; Mouse tracking on a dying window ends with it; the WM_MOUSELEAVE USER
+    ;; would post has no window left to be retrieved for (purged below).
+    (call $tme_window_destroyed (local.get $hwnd))
     (call $post_queue_purge_hwnd (local.get $hwnd))
     ;; Notify host to remove from its table (for each child too)
     (call $host_destroy_window (local.get $hwnd))
@@ -1721,6 +1730,17 @@
                  (i32.eq (local.get $d1) (i32.const 0x616d696e)))
       (then (return (i32.const 34))))
     ;; "syst"+"reev" -> TreeView
+    ;; Public tab fallback is exact, so application classes sharing the prefix
+    ;; retain their registered procedures. CreateWindow's class lookup still
+    ;; wins before this fallback, including an explicitly loaded COMCTL32.
+    (if (i32.and (i32.eq (local.get $d0) (i32.const 0x74737973))
+          (i32.and (i32.eq (local.get $d1) (i32.const 0x6f636261))
+            (i32.and
+              (i32.eq (i32.or (i32.load offset=8 (local.get $wa)) (i32.const 0x20202020))
+                      (i32.const 0x6f72746e))
+              (i32.eq (i32.or (i32.load offset=12 (local.get $wa)) (i32.const 0x00202020))
+                      (i32.const 0x0032336c)))))
+      (then (return (i32.const 27))))
     (if (i32.and (i32.eq (local.get $d0) (i32.const 0x74737973))
                  (i32.eq (local.get $d1) (i32.const 0x76656572)))
       (then (return (i32.const 8))))
@@ -2076,7 +2096,15 @@
     (local $slot i32)
     (local.set $slot (call $class_find_slot (local.get $name_wa)))
     (if (i32.lt_s (local.get $slot) (i32.const 0))
-      (then (return (i32.const 0))))
+      (then
+        ;; Named dialog-template controls also resolve their procedure here.
+        ;; Synthesize only the exact public tab class, after registered-class
+        ;; lookup failed; application and native DLL registrations stay intact.
+        (if (i32.ge_u (local.get $name_wa) (i32.const 0x10000))
+          (then
+            (if (i32.eq (call $comctl_class_ctrl_id (local.get $name_wa)) (i32.const 27))
+              (then (return (i32.or (global.get $WNDPROC_CTRL_KIND) (i32.const 27)))))))
+        (return (i32.const 0))))
     (i32.load offset=12 (call $class_record_addr (local.get $slot)))
   )
 

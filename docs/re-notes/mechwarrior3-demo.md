@@ -1,5 +1,379 @@
 # MechWarrior 3 demo
 
+## November 12 native-source scene admission repair (0755)
+
+Run `20261112-mw3-native-source-composition-admission-0755`, with adjacent
+`-retest` and `-final` evidence, resolves the zero-row dependency from 0708.
+The exact failing disjunct was `windows[0]._exclusiveGdiChildCanvas` in
+`SurfacePublicationJoin.publication`: allocation of the retained shared-child
+canvas was treated as a contributing scene layer. The ordinary compositor
+selected **no shared-child regions**. It intentionally retains this canvas
+before children exist; deleting the canvas would change rendering behavior.
+
+The original WebGL before capture contains 15 complete native sources and
+zero qualified rows. For descriptor 24758268, serial 1, front 131805344,
+canonical selection returned source version 1 at read epoch 188, host version
+28, with complete 640×480 RGB565/pitch1280, identity gamma and no clipping.
+The post-`cacheDxLayer` outcome binds that exact source to the real DX canvas;
+25 cache proofs succeeded during the window. Composition-entry source proof
+and complete transfers reached the display output, but the allocated-canvas
+scene disjunct blocked publication. A passive wrapper around the actual
+compositor selection recorded 20 empty region selections with that canvas
+present. The separate null-HUD surface 4259859 did not erase the front binding.
+The earlier pre-cache `putImageData` token is not used as postdecode evidence.
+
+The repair reports the compositor's existing region selection once, without
+changing it. Qualification requires an empty selection in this composition,
+exact window/memory/shared canvas/DX layer/version and the existing source
+admission. Nonempty, missing, replaced or previous-composition proof rejects;
+a previously blocked cache still requires a fresh decode. Owner, writer,
+epoch, callback, lifetime, source pages, palette, gamma, clipping, scene and
+partial-HUD exclusions remain. No stale tags are restored and no queued path
+is forced. Observation remains default-off.
+
+The final original registered software and WebGL runs use baseline
+`2aa8833a40e4ea6cf0004a2c1772eb30b1d53d3e` plus only the two owned production
+file diffs, exact original media/helper pins and no shared WIP. Executing guest
+and render-worker WASM both remain
+`04c534192ee3fe39e388536c2ce710c12c47a5cd2ca4d95c19f9d00b1e8f0a17`.
+Full completed captures were reviewed before each dependent native input;
+independently released Digit5 produced moving cockpit/terrain on both.
+CDP identifies WebGL as SwiftShader Vulkan/SwANGLE 5.0.0 despite its Intel API
+string. Each backend has one all-writer arm: WebGL covers 167 commands and
+software 219, all on the admitted epoch.
+
+Both backends produce **10 exact-source qualified scene rows**. Every row
+binds its descriptor/serial/front to a full front upload, successful ordinary
+fallback decode, retained 614400-byte source, current composition admission,
+empty shared-overlay proof and complete transfer to 684×480 display output.
+The bounded instrumented timing samples are:
+
+| Backend | Observation window | Qualified intervals / first-to-last span | Mean interval | Source completion to publication |
+| --- | --- | --- | --- | --- |
+| Original software | 8084.93 ms | 9 / 5571.215 ms | 619.024 ms | 22.865–43.415 ms |
+| Original WebGL (SwiftShader) | 8346.63 ms | 9 / 7949.870 ms | 883.319 ms | 8.190–44.735 ms |
+
+Only qualified publication intervals yield sample rates of 1.615/s software
+and 1.132/s WebGL. These are instrumented sample results, not whole-window or
+steady-state game FPS, nor a backend comparison. Passive pixel probe overhead
+was 15.635/17.200 ms respectively; other diagnostic costs are not subtracted.
+Source/Flip/copy counts are not frame counts. Both traces are stable with no
+probe failure or source rejection ledger. WebGL's end snapshot happens during
+an active writer; earlier rows were individually admitted under exclusion.
+
+The actual WAT/production Worker/ordinary decoder/compositor control fails
+with the original canvas disjunct and passes with the repair. It also rejects
+real contributing shared pixels, missing selection, wrong canvas, carried
+proof and partial HUD. Producer identity, DirectX-layer, source-lifetime,
+transient-scene/writer and all three focused scheduler suites pass, as does
+`flock /tmp/wine-build.lock bash tools/build.sh`. The existing source-lifetime
+baseline test now anchors its mutation to the exact publication clause.
+
+Unique evidence was recovered by independent double GET and SHA verification.
+Both runtime parents and Chrome processes waited/EOF with status 0. All three
+0755 boxes are normally stopped/archived with cleared expiry; final box
+`bx_jxba5ryj` receipt `stop_27e893b4715aff67`. Initial missing-deadline launch,
+local capture preparation error and final refused parent-file-read command
+remain recorded and were not replayed. The final refusal occurred after both
+observation windows and normal quit acknowledgement; files-only recovery
+obtained the actual parent-wait records. Durable command/watchdog custody
+completed 0 with EOF; its outer local launcher returned 143, preserved as such.
+Prior 0708 custody failures remain terminal. Full 27-game, parity, audio,
+crash and broader performance coverage remain open.
+
+## November 12 synchronous native Flip source witness (0708)
+
+Run `20261112-mw3-synchronous-flip-producer-witness-0708` adds an opt-in
+completed-source observer to the actual synchronous native
+`handle_IDirectDrawSurface_Flip`. The begin boundary follows the real worker
+fence and precedes association writes. Completion follows the whole-chain
+rotation, before a present import can park the owning guest Worker. It uses a
+separate native descriptor/serial namespace and per-Worker journal. It does
+not select the queued fast path or infer completion from `dx_trace`.
+
+The source record binds the original command handoff, native instance,
+Worker/process incarnation and unchanged sole-writer epoch/host version across
+rotation and capture. Native page versions cover source metadata, format and the complete RGB565
+DIB; copied native descriptor words bind the request. A bounded generation-checked retained copy owns
+all pixels after guest storage is reused. The existing canonical decoder and
+compositor retain their request, lifetime, writer, scene and partial-upload
+guards. Null HUD requests stay null. The default rendering path remains
+unobserved; no guest code is skipped and no media, input configuration, clocks
+or interpreter/JIT choices change. The exact original queued-fast-path
+rejection guard is still unproven.
+
+The actual WAT/owning-Worker control fails with baseline `29f6295a2` because
+there is no completed synchronous source. With this change it captures the
+real rotated green RGB565 source and the existing decoder/compositor qualifies
+that same native request once. A native partial red HUD write still renders
+current pixels, clears the request and cannot qualify the older retained
+source. Duplicate completion/repaint, concurrent writers, epoch ABA, host
+version changes, stale serials and owner replacement remain rejected. The
+full producer/publication suite, both transient suites and locked build pass.
+The final locked rebuild reproduces the executing module SHA-256
+`04c534192ee3fe39e388536c2ce710c12c47a5cd2ca4d95c19f9d00b1e8f0a17`.
+
+The original registered WebGL retest is in the adjacent
+`20261112-mw3-synchronous-flip-producer-witness-0708-retest` run. It uses
+baseline `29f6295a2c0eadd6c8c5dfea9ed8c0e44dd28225` plus the seven owned
+production-file diffs, pinned original media/helpers, and excludes concurrent
+WIP. The full KeyI, pilot a/Enter, pointer-lock, Accept/Instant Action/Launch
+route was reviewed before each input. Independently released Digit5 reached
+40.5 km/h. Actual guest and renderer module identities match the SHA above. CDP pins
+SwiftShader Vulkan / SwANGLE 5.0.0, despite the Intel Mesa WebGL API string.
+One all-writer admission covers its sole live link and all 158 observed
+commands before/during the 8117.66 ms diagnostic; no repeated rate
+windows were collected. Its 12 synchronous native records include **11
+accepted complete 640×480, pitch-1280 RGB565 source copies** and one
+`source-writer-not-sole` rejection. Queued source records remain zero. Every
+accepted native descriptor/serial/front/DIB binds to its exact full front
+upload and at least one observed fallback copy; see
+`original-source-binding.json`. Source records are not displayed frames.
+
+**Completed gameplay FPS and frame times remain UNKNOWN.** There are zero
+qualified compositor rows despite genuine nonzero source membership. The
+trace contains 22 fallback copies and 22 publications, but neither count is a
+completed-frame count. In this window the full front uploads and fallback
+copies retain the exact new request; the null HUD uploads seen here target a
+separate surface. A `putImageData` token sample is taken before cache binding
+and cannot identify the failing guard. The newly exposed dependency is the
+exact canonical decoder/cache and composition admission for those native
+requests: capture its ordinary read stamp, source selection/cache outcome and
+scene/layer transfer without changing those guards. Clipping, gamma,
+concurrency or HUD composition must not be asserted as the cause without that
+capture. No old request was restored and no older image was selected to make
+the diagnostic qualify. The software original was not retested in this run;
+full27, parity, audio and historical cursor cause remain open.
+
+Both private boxes are stopped with expiry NULL and unforced completed
+receipts: `bx_cz9m22wz` / `stop_e89e5726de3f0562` at 07:28:49Z and
+`bx_p5tn9eda` / `stop_fd2bd1c39cb1d928` at 07:43:11Z, before the unchanged
+08:14:06Z deadline. The first attempt stopped after a zero-effect stale input
+refusal and malformed recovery-capture command. The retest completed its
+source diagnostic; a later failed read-only summary closed gameplay command
+custody. Explicitly delegated cleanup-only SIGUSR1 then produced actual
+runtime-parent wait/EOF (intentional status 1), Chrome status 0 and separate
+EOF; manager/watchdogs have actual successful waits. Retest outer lifecycle
+PTY returned 143 and its separate client/owner wait files are absent; it is
+not reported as an all-zero lifecycle. Raw source/trace/module evidence and
+13 full reviewed images were recovered and independently rehashed before
+stop. Reports and recovery recipes retain both command failures and limits.
+
+
+## November 12 all-writer attachment repair (0625)
+
+Run `20261112-mw3-all-writer-observer-boundary-0625` repairs the generic
+attachment boundary in `host.js`, `lib/guest-thread-host.js` and
+`lib/thread-manager.js`. The main completed-step boundary now reserves the
+next secondary free-run continuations while already dispatched guest work,
+RPCs and bootstrap finish normally. Installation remains synchronous across
+all original participants; replacement, retirement, new links, host writes
+and bounded timeout remain fail closed. Release preserves admitted dispatch
+arguments/order and skips replaced owners. No work is covered retroactively.
+
+The actual two-Worker/Wasm regression captures the formerly missing
+participant state: main pending zero, secondary pending `callExport` /
+`guest_write32`, no starting links/host writes/readiness/stop. The old host
+fails the idle guard with this same control; the repaired host waits for that
+native store to finish, installs on both Workers, and resumes the next
+continuation once. Actual bootstrap, timeout, participant-change and renderer
+acknowledgement failure controls supplement publication/transient tests and
+the locked build. This identifies a concrete failing disjunct in the control,
+not retrospectively in the uncaptured 0518 attempts.
+
+Original registered MW3 software and WebGL both admitted once on runtime
+`d55e326c55acffe15c03edbd401197430dd614ba` plus the three owned source patches,
+canonical `1165f15c…`. Concurrent audio changes were excluded with exact Git
+bytes. Executing source/module/owner/driver pins and unchanged media hashes
+are retained. Reviewed KeyI, pilot a/Enter, native pointer lock,
+Accept/Instant Action/Launch and independently released Digit5 produced
+40.5 km/h motion. Each admission enrolled its sole live guest link before the
+bounded diagnostic; the secondary had already exited. All 151 WebGL and 282
+software observed commands carried the installed epoch. These are command
+counts, not frame counts. Epoch poison remained zero before intentional
+retirement; WebGL was transiently busy at the final snapshot.
+
+**Completed gameplay FPS/frame-time distributions remain UNKNOWN.** The
+8173.67 ms WebGL and 8039.43 ms software diagnostics produced zero source
+records and zero qualified join rows despite native Flip/present notifications
+and displayed updates. The newly located first dependency is earlier than
+the post-HUD join: the producer observer only consumes queued `RECORD_FLIP`,
+while original gameplay takes the synchronous guest Flip/present path. In
+these windows all 10/16 native Flip traces were followed by direct kind-5
+present with NULL request; no kind-31 request appeared. A separate passive
+render-worker probe saw 106 WebGL / 128 software replay batches, all ordinary
+kind-0 commands, active observation on every batch, and zero
+`completedProducer` calls. WebGL queued-flip lifetime counters stayed 535
+across the probe. Source inspection locates the synchronous metadata rotation
+and direct `dx_present` in `handle_IDirectDrawSurface_Flip`; the exact reason
+`d3dim_worker_try_flip` was not used remains uncaptured.
+
+The next repair needs a real source witness for that synchronous swap and a
+post-HUD identity that survives concurrent writes, duplicates, reorder, stale
+requests and owner replacement. A raw kind-6 trace or carried old request is
+not that witness. The 0518 partial-green/retained-red false qualification
+remains invalid; canvas paths, terrain changes and the earlier Hz ranges are
+not completed gameplay FPS. Full27, audio/parity and historical cursor cause
+remain open.
+
+Unique outputs were double-read remotely and rehashed locally (410 paths,
+17,812,201 raw bytes). Box `bx_5drn7qjj` stopped normally at 06:51:16Z,
+`stop_3e4ca9e97d9e0192`, before its 07:23:31Z deadline; archived, expiry NULL,
+forced false. Both runtime/Chrome parents and the lifecycle/watchdog have
+actual successful waits and separate EOF evidence. Recovery details are in
+the run's `report.txt`, `RECOVERY.txt` and `retrieval-manifest.json`.
+
+## November 12 completed-generation measurement dependency
+
+Run `20261112-mw3-completed-frame-generation-0518` retested original moving
+software and WebGL with actual guest/render Workers on runtime
+`b54b1cbf8d5269e22cb47922aab1a29d5417c15c`, canonical `1165f15c…`.
+622 source/media/helper pins and executing JavaScript/Wasm identities are
+retained. The ordinary KeyI, pilot a/Enter, pointer-lock, Accept/Instant
+Action/Launch route and independently released Digit5 again produced reviewed
+40.5 km/h motion. CDP identifies SwiftShader Vulkan / SwANGLE 5.0.0 despite
+the inconsistent Intel Mesa WebGL API string; this is not hardware-GPU evidence.
+
+**Completed gameplay FPS and frame times remain UNKNOWN.** Both live bounded
+join attempts failed with `writer observation requires an idle live
+GuestThreadHost`. `host.js` waits for the ordinary main completed-step boundary,
+but `GuestThreadHost.setWriterObservation` also requires every main/secondary
+link to have no pending request/readiness/stop, no starting link, and no host
+write in flight. The observed refusal does not identify which disjunct was
+active. No guard was weakened and neither attempt was retried for admission.
+The resulting journal/join was absent, rather than a valid zero-FPS sample.
+
+The source frontier is the render consumer's `RECORD_FLIP` after the natural
+backend fence, front/back swap, and sealed front descriptor/DIB page witness
+(or its exact retained copy). EndScene, draw, HUD upload and raw Flip notification
+are insufficient. A valid decode must retain owner/module/Worker/observation
+identity, request descriptor/serial, layout/allocation, writer/page or retained
+copy generation, then the exact decoded canvas through compositor publication.
+
+Passive 8.005-second WebGL and 8.003-second software windows traced respectively
+25 and 39 natural fallback-copy→canvas→output publication paths, with zero
+request-bearing copies. Separate failed-arm diagnostic windows traced 28 and
+67 paths over 8.520 and 8.676 seconds. These counts include duplicates and partial
+updates and are **not frames or FPS**. All four traces kept stable owners and
+reported no observer failure. Existing ImageData hashing added no pixel readback;
+measured callback/hash self-time was 13.91–34.16 ms (0.17–0.39%), a lower bound
+excluding dispatch, snapshots, allocation/GC, scheduling and debugger costs.
+No screenshot/profile capture overlapped these windows.
+
+Twelve focused production-path controls distinguish null HUD uploads, native
+watched writes, stale requests, wrong process/window owners, post-decode writes,
+retained-copy expiry/reservation and clear ordering. A new counterfactual is
+particularly decisive: after a genuine watched green pixel write and null HUD
+upload, normal decoding displays green and qualifies nothing; carrying the old
+request instead selects the retained **red pre-HUD image** and qualifies that
+older image. Without a retained copy, the same stale carry is rejected by page
+guards. Carrying the request therefore changes pixels or fails correctness;
+it cannot repair measurement. Existing producer identity, transient writer and
+transient scene suites also passed, including ABA/coalescing/lifetime controls.
+
+Next: add an actual-Worker control with a secondary request still pending at
+the main completed-step boundary, then implement observer attachment only after
+all relevant natural writer boundaries are covered, preserving their scheduled
+continuations and owner checks. Retest original admission before addressing
+post-HUD generation membership. That second step must distinguish a completed
+producer snapshot from later partial HUD writes without selecting old pixels or
+changing rendering. Only then admit repeated completed-frame timing windows.
+Exact traces, controls, rejected attempts and recovery are in `report.txt`,
+`trace-summary.json`, `natural-canvas-paths.json` and `RECOVERY.txt` in the run.
+No production code changed; full27, parity, audio and historical cursor cause
+remain open. The leased box was normally stopped after verified recovery.
+
+## November 12 moving-scene cost and native16 synchronization
+
+Run `20261112-mw3-moving-scene-frame-cost-0410` measures original cockpit motion
+on current main / canonical `1165f15c…`, serially on one private box with actual
+guest and render Workers. The documented original native route and released Digit5
+produce terrain progress and 40.5 km/h on the right HUD. CDP SystemInfo reports
+SwiftShader Vulkan / SwANGLE 5.0.0; the WebGL API reports an inconsistent Intel
+Mesa string, so these results do not establish hardware-GPU performance.
+
+The observer fingerprints existing decoded ImageData, follows ordinary canvas
+transfers, and timestamps successful display publications with the page's
+monotonic clock. Consecutive unchanged terrain and HUD-only updates are excluded.
+It adds no readback or pixel-buffer copy. These are **distinct displayed terrain
+update rates**, not raw Flip/draw rates. Ordinary HUD uploads discard the original
+request metadata; immutable completed guest-frame identity and strict gameplay
+FPS remain **UNKNOWN**. Software canonical uploads also lack a concurrent-writer
+proof. ROI weather/content changes can differ from logical game steps.
+
+Three 12-second moving windows per initial arm measured:
+
+| Backend | Terrain updates / window | Update Hz | Median interval ms | p95 interval ms |
+| --- | --- | --- | --- | --- |
+| Software Worker | 36 / 46 / 31 | 3.00 / 3.83 / 2.58 | 225 / 219 / 217 | 1237 / 320 / 1232 |
+| WebGL Worker, baseline | 21 / 24 / 25 | 1.75 / 2.00 / 2.08 | 591 / 502 / 482 | 654 / 584 / 528 |
+
+A separate six-second profile placed 3781 of 6607 sampled render-Worker wall
+milliseconds in `_storeNative16`'s synchronous `getError`, and 1365 ms in
+`readPixels`; the guest mostly waited for rendering. Native GL samples include
+GPU/driver waits, not just query overhead. Software's guest spent 4163/6604 ms
+in `_waitFor`, while its render Worker was mostly idle; per-draw transport waits
+remain a separate target.
+
+The renderer now queries accumulated GL errors on the final native16 conversion
+of each submitted draw. Every primitive conversion, region and ordering remains;
+standalone storage still checks by default. Errors reject the submission before
+success/publication, although later primitives inside a failed submission can
+execute before rejection. Exact native DIB/RGBA controls cover WebGL 1/2, all four
+16-bit formats, dependent blends, grouped tails and injected early GL failures.
+
+A live renderer-method A/B retained the same GPU instance/context, guest, Workers,
+module, driver and epoch. Independent source/method hashes bind baseline and
+candidate; common counters were present in both arms. Three A/B pairs followed
+by three reversed B/A pairs used 12-second windows with one-second warmups:
+
+| Arm | Timed seconds | Updates | Update Hz | Storage conversions | Storage error queries | Submission ms / conversion |
+| --- | --- | --- | --- | --- | --- | --- |
+| Baseline | 72.035 | 127 | 1.763 | 152242 | 152242 | 0.3217 |
+| Candidate | 72.037 | 135 | 1.874 | 155687 | 35021 | 0.2869 |
+
+Queries decreased 77.5%; submission time per conversion decreased 10.8%, with
+about 11% reductions in each run order. Aggregate update rate rose 6.3%, but the
+naturally evolving scene and overlapping per-window ranges limit causal/general
+FPS claims. This is not an identical-frame or cross-backend parity result.
+Callback/hash self-time was about 0.28% in both A/B arms; unmeasured dispatch,
+JIT/GC and common counter costs prevent a total observer-overhead bound.
+
+The locked build passed with both canonical module hashes unchanged; focused
+renderer and exact-pixel/error tests passed. Full cockpit images before/after
+candidate execution were reviewed separately. Existing transient HUD speckling
+also occurs in baseline captures and is not repaired here. Exact durations,
+sample counts, distributions, identities, failed observer attempts and recovery
+are retained in the run's `report.txt`, `timing-summary.json`, `ab-summary.json`
+and `profile-summary.json`. Strict frame-generation joins, full27, parity and
+audio remain open; this result does not close acceptance scope.
+
+## November 12 native throttle and stop
+
+Run `20261112-mw3-native-cursor-throttle-stop-0345` reached the original
+cockpit on main `30f9318e6`, canonical module `1165f15c…`, with actual guest
+Workers and WebGL legacy D3D. Native `i` opens Pilot Entry; pilot `a`/Enter,
+ordinary pointer lock and guarded native Accept/Instant Action/Launch inputs
+then work. The earlier main-menu cursor freeze remains unexplained; this is
+a working original input route, not a causal emulator repair.
+
+The original readme binds Digit5 to 50% throttle, Digit1 to 0%, and Digit0
+to 100%. Digit5 produced persistent motion after its physical release.
+Separately reviewed full scenes show 40.5 km/h before Digit1, followed by
+24.9, 8.5 and 0.0 km/h. Read the **right-side** speed HUD; the earlier top-panel
+crops are not speed evidence. Waypoint distance is non-monotonic as the mech
+passes it and must not substitute for speed. Independent release timers and
+separate image review preceded dependent inputs. The parent's zero-speed
+precondition and two review-order gaps remain scoped to
+`20261112-mw3-current-cockpit-controls-0318`.
+
+The coordinator checked 309 recovered paths / 276 unique raw hashes and the
+full moving/stopped scenes plus the derived HUD strip. Focused tests passed
+14 with 3 skipped; the additional actual-renderer diagnostic repair control
+passed. No production code changed or new build was required. The box stopped
+normally with actual runtime parent waits/EOF; outer transport exit143 remains
+separate. Scene-qualified FPS, parity, audio and the full corpus remain open.
+
 ## Binary and runtime layout
 
 - App id: `mw3`

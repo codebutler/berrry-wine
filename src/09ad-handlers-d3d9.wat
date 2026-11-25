@@ -21,6 +21,59 @@
   (func $d3d9_windowed_hwnd_set (param $hwnd i32)
     (i32.atomic.store offset=32 (global.get $DX_PROCESS_STATE) (local.get $hwnd)))
 
+  ;; D3D8 and D3D9 share device/resource records and snapshot descriptors.
+  ;; Serialize synchronous API execution, including the host's owned capture.
+  ;; Never spin: a competing Worker can be waiting for a page-side host call.
+  ;; Release on handler return, even when it parks for renderer completion;
+  ;; queued commands already own their inputs by then. This is not a GPU fence.
+  (global $d3d_state_depth (mut i32) (i32.const 0))
+  (func (export "d3d_state_guard_held") (result i32)
+    (i32.gt_u (global.get $d3d_state_depth) (i32.const 0)))
+  (func $d3d_state_try_enter (result i32)
+    (if (i32.eqz (global.get $d3d_state_depth)) (then (loop $claim
+      (if (i32.atomic.rmw.cmpxchg offset=36 (global.get $DX_PROCESS_STATE)
+            (i32.const 0) (i32.const 1)) (then
+        ;; A nested synchronous callback cannot unwind to the slice driver.
+        ;; Worker imports wait locally, keeping this native stack intact; the
+        ;; page import refuses to block and retains the runnable retry path.
+        (if (global.get $sync_msg_depth) (then
+          (br_if $claim (call $host_gpu_gl_call (i32.const 0x30018)
+            (region.addr $DX_PROCESS_STATE 36) (i32.const 1)))))
+        (call $io_block (i32.const 0))
+        ;; Plain runnable yield, not reason 1 (a handle wait with saved
+        ;; wait parameters). Keep io_block's retry EIP/stack and yield flag.
+        (global.set $yield_reason (i32.const 0))
+        (return (i32.const 0)))))))
+    (call $d3d_state_acquired)
+    (i32.const 1))
+  ;; Host exports have no API frame to retry. Refuse a foreign lock without
+  ;; io_block, an EIP redirect, yield/step changes, or a nested host wait.
+  (func $d3d_state_try_enter_host (result i32)
+    (if (i32.eqz (global.get $d3d_state_depth)) (then
+      (if (i32.atomic.rmw.cmpxchg offset=36 (global.get $DX_PROCESS_STATE)
+            (i32.const 0) (i32.const 1)) (then (return (i32.const 0))))))
+    (call $d3d_state_acquired)
+    (i32.const 1))
+  ;; A lazy back-buffer settle (09a8gv) from a guest memory access: no API
+  ;; frame to retry, so wait for a foreign holder instead of io_block.
+  (func $d3d_state_enter_blocking
+    (if (i32.eqz (global.get $d3d_state_depth)) (then
+      (loop $retry
+        (if (i32.atomic.rmw.cmpxchg offset=36 (global.get $DX_PROCESS_STATE) (i32.const 0) (i32.const 1)) (then
+          (drop (memory.atomic.wait32 (region.addr $DX_PROCESS_STATE 36) (i32.const 1) (i64.const 1000000)))
+          (br $retry))))))
+    (call $d3d_state_acquired))
+  (func $d3d_state_acquired
+    (if (i32.eqz (global.get $d3d_state_depth)) (then (call $d9g_state_load)))
+    (global.set $d3d_state_depth (i32.add (global.get $d3d_state_depth) (i32.const 1))))
+  (func $d3d_state_leave
+    (global.set $d3d_state_depth (i32.sub (global.get $d3d_state_depth) (i32.const 1)))
+    (if (i32.eqz (global.get $d3d_state_depth))
+      (then
+        (call $d9g_state_save)
+        (i32.atomic.store offset=36 (global.get $DX_PROCESS_STATE) (i32.const 0))
+        (drop (memory.atomic.notify (region.addr $DX_PROCESS_STATE 36) (i32.const -1))))))
+
   ;; True while a windowed D3D9 device is the thing presenting to this window,
   ;; i.e. the surface handed to $dx_present holds CLIENT-relative pixels.
   ;; $dx_present's windowed path was written for DirectDraw, where the primary
@@ -77,15 +130,17 @@
     ;; stages 0..3 and owns every byte of it. A computed offset is invisible to
     ;; a grep for the literal, so check that helper before claiming a gap.
     ;; +25596 texture generation: $d3d9_texture_create_kind bumps it for every
-    ;; texture this device creates, so lib/d3d9-host.js can tell a mip record
+    ;; texture this device creates, so a renderer can tell a mip record
     ;; address that may now name a new texture from one that cannot.
     ;; +25600 actual backbuffer storage format, separate from display mode.
     ;; +25604 D3D8 pixel-shader handle list; +25608 monotonic handle counter.
     ;; +25612 D3D8 vertex-program/declaration handle list.
     ;; +25616 copied MultiplyTransform input, owned by this device.
-    (local.set $state (call $heap_alloc (i32.const 25680)))
+    ;; +25680 CreateDevice BehaviorFlags, +25684 SetSoftwareVertexProcessing
+    ;; (a mixed device's current mode); both survive Reset.
+    (local.set $state (call $heap_alloc (i32.const 25688)))
     (if (i32.eqz (local.get $state)) (then (return (i32.const 0))))
-    (call $zero_memory (call $g2w (local.get $state)) (i32.const 25680))
+    (call $zero_memory (call $g2w (local.get $state)) (i32.const 25688))
     (call $gs32 (i32.add (local.get $state) (i32.const 21780)) (global.get $current_thread_id))
     (loop $texture_stages
       (local.set $sampler (i32.add (call $g2w (local.get $state))
@@ -391,7 +446,7 @@
 
   (func $d3d9_shader_create (param $this i32) (param $code i32) (param $out i32) (param $version i32)
     (local $state i32) (local $length i32) (local $shader i32) (local $wa i32)
-    (local $ir i32) (local $words i32) (local $retained i32) (local $ir_bytes i32)
+    (local $ir i32) (local $words i32) (local $retained i32) (local $ir_bytes i32) (local $profile i32)
     (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086C))
     (if (i32.eqz (local.get $out)) (then (return)))
     (call $gs32 (local.get $out) (i32.const 0))
@@ -447,10 +502,9 @@
       (return)))
     ;; The software executor compiles this IR again at draw time, and a draw
     ;; error latches its command queue for good. Refuse here instead, while
-    ;; the guest can still see D3DERR_INVALIDCALL. Bit 0x800 is reported only
-    ;; by that executor; -1 (no D3D9 bridge) is masked out by the sign bit.
-    (if (i32.eq (i32.and (call $host_gpu_gl_call (i32.const 0x30017) (i32.const 0) (i32.const 0))
-          (i32.const 0x80000800)) (i32.const 0x800)) (then
+    ;; the guest can still see D3DERR_INVALIDCALL.
+    (local.set $profile (call $d3d9_caps_profile))
+    (if (call $d3d9_caps_software (local.get $profile)) (then
       (local.set $retained (call $d3d_shader_vm_compile (local.get $ir)))
       (if (i32.eqz (local.get $retained)) (then
         (call $d3d_shader_ir_free (local.get $ir)) (call $heap_free (local.get $shader))
@@ -557,7 +611,6 @@
       (i32.eq (load.field DxObject refcount (call $dx_from_this (local.get $device))) (i32.const 1))) (then
       (local.set $stack (i32.load offset=16 (global.get $reg_base)))
       (call $handle_IDirect3DDevice9_Release (local.get $device) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))
-      (if (global.get $d3d_render_token) (then (return)))
       (i32.store offset=16 (global.get $reg_base) (local.get $stack))
       (if (i32.load offset=0 (global.get $reg_base)) (then
         (i32.store offset=0 (global.get $reg_base) (i32.const 1)) (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8))) (return)))
@@ -606,8 +659,13 @@
 
   ;; ── IDirect3D9 — 17 methods ─────────────
   ;; IDirect3D9_QueryInterface — 3 args (incl. this)
+  ;; IUnknown and IID_IDirect3D9 {81BDCBCA-64D4-426D-AE8D-AD0147F4275C} only:
+  ;; this is not a Direct3D9Ex, so IID_IDirect3D9Ex gets E_NOINTERFACE.
   (func $handle_IDirect3D9_QueryInterface (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (call $crash_unimplemented (local.get $name_ptr))
+    (i32.store offset=0 (global.get $reg_base) (call $dx_query_interface_single
+      (local.get $arg0) (local.get $arg1) (local.get $arg2)
+      (i32.const 0x81BDCBCA) (i32.const 0x426D64D4)
+      (i32.const 0x01AD8DAE) (i32.const 0x5C27F447)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))))
 
   ;; IDirect3D9_RegisterSoftwareDevice — 2 args (incl. this)
@@ -629,7 +687,7 @@
 
   ;; Backend-specific software precision contract. +25600 stores BB format.
   (func $d3d9_rgb565_supported (result i32)
-    (i32.eq (call $host_gpu_gl_call (i32.const 0x30017) (i32.const 0) (i32.const 23)) (i32.const 1)))
+    (call $d3d9_caps_software (call $d3d9_caps_profile)))
   (func $d3d9_color_bytes (param $format i32) (result i32)
     (select (i32.const 2) (i32.const 4) (i32.eq (local.get $format) (i32.const 23))))
   (func $d3d9_backbuffer_format (param $device i32) (result i32)
@@ -875,8 +933,8 @@
   ;; Programmable profile is opt-in while game integration remains incomplete.
   ;; The host enables it only after a real shader/texture/indexed draw pixel
   ;; probe succeeds. Headless/non-opted-in hosts retain zero shader caps.
-  (func $d3d9_fill_caps (param $dest i32) (result i32)
-    (local $wa i32)
+  (func $d3d9_fill_caps (param $dest i32) (param $swvp i32) (result i32)
+    (local $wa i32) (local $profile i32)
     (if (i32.eqz (local.get $dest)) (then (return (i32.const 0x8876086C))))
     ;; D3DCAPS9 is 304 bytes, so it crosses a guest page boundary from most
     ;; addresses, and two adjacent sparse pages need not be adjacent in WASM
@@ -891,12 +949,21 @@
     (i32.store offset=108 (local.get $wa) (i32.const 1)) ;; MaxAnisotropy (no anisotropic filtering)
     (i32.store offset=232 (local.get $wa) (i32.const 1)) ;; NumberOfAdaptersInGroup
     (i32.store offset=240 (local.get $wa) (i32.const 1)) ;; NumSimultaneousRTs
-    (if (i32.eq (call $host_gpu_gl_call (i32.const 0x30005) (i32.const 0) (i32.const 0)) (i32.const 1)) (then
+    (local.set $profile (call $d3d9_caps_profile))
+    ;; Fixed-function vertex blending lowers on the ring (09akg d9ms, past
+    ;; the 22-entry shader palette on the CPU: d9cpu) whatever the profile;
+    ;; MaxVertexBlendMatrices 4;
+    ;; MaxVertexBlendMatrixIndex 255 for software vertex processing (the
+    ;; D3D9 limit), else 21, the palette the hardware-style path holds.
+    (if (i32.ne (i32.and (global.get $d9g_caps) (global.get $GPS_CAP_VALID)) (i32.const 0)) (then
+      (i32.store offset=168 (local.get $wa) (i32.const 4))
+      (i32.store offset=172 (local.get $wa) (select (i32.const 255) (i32.const 21) (local.get $swvp)))))
+    (if (i32.and (local.get $profile) (i32.const 1)) (then
       (i32.store offset=28 (local.get $wa) (i32.const 0x80000)) ;; hardware rasterization
       ;; BLENDOP is real in the software executor; the WebGL executor still
       ;; supports ADD only. Never advertise another backend's operations.
       (i32.store offset=32 (local.get $wa)
-        (i32.and (call $host_gpu_gl_call (i32.const 0x30017) (i32.const 0) (i32.const 0)) (i32.const 0x800)))
+        (select (i32.const 0x800) (i32.const 0) (call $d3d9_caps_software (local.get $profile))))
       (i32.store offset=40 (local.get $wa) (i32.const 255)) ;; depth comparisons
       (i32.store offset=44 (local.get $wa) (i32.const 0x7ff)) ;; source blend factors
       (i32.store offset=48 (local.get $wa) (i32.const 0x3ff)) ;; destination blend factors
@@ -934,7 +1001,7 @@
   (func $handle_IDirect3D9_GetDeviceCaps (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (if (i32.or (local.get $arg1) (i32.ne (local.get $arg2) (i32.const 1)))
       (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086C)))
-      (else (i32.store offset=0 (global.get $reg_base) (call $d3d9_fill_caps (local.get $arg3)))))
+      (else (i32.store offset=0 (global.get $reg_base) (call $d3d9_fill_caps (local.get $arg3) (i32.const 0)))))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 20))))
 
   ;; IDirect3D9_GetAdapterMonitor — 2 args (incl. this)
@@ -977,6 +1044,10 @@
       (if (i32.eqz (local.get $format)) (then (local.set $format (i32.const 22))))))
     (if (i32.or (i32.eqz (call $d3d9_color_target_format (local.get $format)))
       (i32.or (local.get $arg1) (i32.ne (local.get $arg2) (i32.const 1))))
+      (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086a)) (return)))
+    ;; No executor drains the D3D9 ring (09akg): nothing can render, so there
+    ;; is no device -- D3DERR_NOTAVAILABLE, the no-3D-hardware answer.
+    (if (i32.eqz (call $d3d9_executor_ok))
       (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086a)) (return)))
     (if (local.get $pp) (then
       (if (i32.or (call $gl32 (i32.add (local.get $pp) (i32.const 16)))
@@ -1035,10 +1106,11 @@
           (select (local.get $hwnd) (i32.const 0) (local.get $windowed)))
         (store.field DxObject misc1
           (call $dx_from_this (call $gl32 (local.get $ppDev))) (local.get $program))
-        (call $d3d9_trace_world (call $gl32 (local.get $ppDev)) (i32.const 12)
-          (i32.add (call $g2w (local.get $program)) (i32.const 2708))
-          (i32.add (call $g2w (local.get $program)) (i32.const 2708)) (local.get $program)
-          (i32.add (local.get $program) (i32.const 2708)))
+        ;; BehaviorFlags; a SOFTWARE_VERTEXPROCESSING (0x20) device runs in
+        ;; software mode, a MIXED one starts in hardware mode.
+        (call $gs32 (i32.add (local.get $program) (i32.const 25680)) (local.get $arg4))
+        (call $gs32 (i32.add (local.get $program) (i32.const 25684))
+          (i32.ne (i32.and (local.get $arg4) (i32.const 0x20)) (i32.const 0)))
         (if (local.get $pp) (then
           (if (call $gl32 (i32.add (local.get $pp) (i32.const 36))) (then
             (call $gs32 (i32.add (local.get $depth_surface) (i32.const 8)) (call $gl32 (local.get $ppDev)))
@@ -1118,8 +1190,16 @@
 
   ;; ── IDirect3DDevice9 — 119 methods ─────────────
   ;; IDirect3DDevice9_QueryInterface — 3 args (incl. this)
+  ;; IUnknown and IID_IDirect3DDevice9 {D0223B96-BF7A-43FD-92BD-A43B0D82B9EB}
+  ;; only. D3DX9_43 asks every device for IID_IDirect3DDevice9Ex
+  ;; {B18B10CE-2649-405A-870F-95F777D4313A} before it creates a texture (to
+  ;; pick D3DPOOL_DEFAULT-with-shared-handle paths); a plain device answers
+  ;; E_NOINTERFACE and D3DX falls back to the ordinary pools.
   (func $handle_IDirect3DDevice9_QueryInterface (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (call $crash_unimplemented (local.get $name_ptr))
+    (i32.store offset=0 (global.get $reg_base) (call $dx_query_interface_single
+      (local.get $arg0) (local.get $arg1) (local.get $arg2)
+      (i32.const 0xD0223B96) (i32.const 0x43FDBF7A)
+      (i32.const 0x3BA4BD92) (i32.const 0xEBB9820D)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))))
 
   ;; IDirect3DDevice9_Release — 1 args (incl. this)
@@ -1131,16 +1211,8 @@
     (local.set $rc (i32.sub (load.field DxObject refcount (local.get $entry)) (i32.const 1)))
     (if (i32.le_s (local.get $rc) (i32.const 0))
       (then
-        (local.set $result (if (result i32) (global.get $d3d_render_token)
-          (then (call $d3d_render_poll))
-          (else (call $host_gpu_gl_call (i32.const 0x30004) (i32.const 0) (local.get $arg0)))))
-        (if (call $d3d_render_park (local.get $result) (i32.const 0)) (then (return)))
-        ;; A failed ownership handoff is not permission to free storage still
-        ;; reachable by a renderer. Keep the native owner for explicit recovery.
-        (if (i32.ne (local.get $result) (i32.const 1)) (then
-          (i32.store offset=0 (global.get $reg_base) (load.field DxObject refcount (local.get $entry)))
-          (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
-          (return)))
+        ;; The ring's targets for this device go with it (09akg).
+        (call $d9g_reset (local.get $arg0))
         (if (load.field DxObject misc1 (local.get $entry)) (then
           (call $d3d9_lights_free (call $gl32 (i32.add (load.field DxObject misc1 (local.get $entry)) (i32.const 21996))))
           (call $d3d9_color_unbind (call $gl32 (i32.add (load.field DxObject misc1 (local.get $entry)) (i32.const 22020))))
@@ -1227,7 +1299,12 @@
 
   ;; IDirect3DDevice9_GetDeviceCaps — 2 args (incl. this)
   (func $handle_IDirect3DDevice9_GetDeviceCaps (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (i32.store offset=0 (global.get $reg_base) (call $d3d9_fill_caps (local.get $arg1)))
+    (local $state i32)
+    (local.set $state (call $d3d9_program_state (local.get $arg0)))
+    (i32.store offset=0 (global.get $reg_base) (call $d3d9_fill_caps (local.get $arg1)
+      (if (result i32) (local.get $state)
+        (then (i32.ne (call $gl32 (i32.add (local.get $state) (i32.const 25684))) (i32.const 0)))
+        (else (i32.const 0)))))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12))))
 
   ;; IDirect3DDevice9_GetDisplayMode — 3 args (incl. this)
@@ -1305,37 +1382,28 @@
   ;; IDirect3DDevice9_Reset — 2 args (incl. this)
   (func $handle_IDirect3DDevice9_Reset (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (call $d3d9_reset (local.get $arg0) (local.get $arg1))
-    (if (global.get $d3d_render_token) (then (return)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12))))
 
   ;; IDirect3DDevice9_Present(this, pSourceRect, pDestRect,
   ;;                          hDestWindowOverride, pDirtyRegion) — 5 args.
   ;; The render target is the surface the app drew into; push it to the
-  ;; window's back-canvas. Sub-rect presents are not modelled — we always
-  ;; present the whole target.
+  ;; window's back-canvas. On the ring, $d9g_present honours the source and
+  ;; destination rects (stretching a windowed back buffer onto its client
+  ;; area); the DIB-only path below still presents the whole target.
   (func $handle_IDirect3DDevice9_Present (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $rt i32) (local $desc i32) (local $result i32)
+    (local $rt i32)
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24)))
     (local.set $rt (call $d3ddev_rt_entry (local.get $arg0)))
-    (if (i32.and (i32.eqz (global.get $d3d_render_token))
-      (i32.ne (i32.and (load.field DxObject flags (local.get $rt)) (i32.const 0x40000000)) (i32.const 0)))
+    (if (i32.ne (i32.and (load.field DxObject flags (local.get $rt)) (i32.const 0x40000000)) (i32.const 0))
       (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086c)) (return)))
-    (block $issue
-    (if (global.get $d3d_render_token) (then
-      (local.set $result (call $d3d_render_poll)) (br $issue)))
-    (local.set $desc (call $d3d9_gpu_descriptor (local.get $arg0)))
-    (if (local.get $desc) (then
-      ;; Present-only packet word: the broker's instance is not the guest
-      ;; owner and cannot read this invocation's synchronous-send depth.
-      (i32.store offset=60 (local.get $desc) (global.get $sync_msg_depth))
-      (local.set $result (call $host_gpu_gl_call (i32.const 0x30002) (local.get $desc) (i32.const 0))))))
-    (if (call $d3d_render_park (local.get $result) (i32.const 24)) (then (return)))
-    ;; Past the park, this call completes whichever way it presents.
+    ;; The ring presents (09akg); a device without program state has only
+    ;; its DIB.
+    (if (call $d3d9_gpu_descriptor (local.get $arg0)) (then
+      (drop (call $d9g_present (local.get $arg0) (local.get $arg1) (local.get $arg2)))
+      (call $present_frame_end)
+      (i32.store offset=0 (global.get $reg_base) (i32.const 0))
+      (return)))
     (call $present_frame_end)
-      (if (local.get $result) (then
-        (i32.store offset=0 (global.get $reg_base) (select (i32.const 0) (i32.const 0x8876086C)
-          (i32.eq (local.get $result) (i32.const 1)))) (return)))
-    (local.set $rt (call $d3ddev_rt_entry (local.get $arg0)))
     (if (local.get $rt) (then (call $dx_present (local.get $rt))))
     (i32.store offset=0 (global.get $reg_base) (i32.const 0)))
 
@@ -1479,7 +1547,6 @@
   ;; IDirect3DDevice9_UpdateSurface — 5 args (incl. this)
   (func $handle_IDirect3DDevice9_UpdateSurface (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (call $d3d9_update_surface (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $arg3) (local.get $arg4))
-    (if (global.get $d3d_render_token) (then (return)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24))))
 
   ;; IDirect3DDevice9_UpdateTexture — 3 args (incl. this)
@@ -1490,7 +1557,6 @@
   ;; IDirect3DDevice9_GetRenderTargetData — 3 args (incl. this)
   (func $handle_IDirect3DDevice9_GetRenderTargetData (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (call $d3d9_color_copy (local.get $arg0) (local.get $arg1) (local.get $arg2))
-    (if (global.get $d3d_render_token) (then (return)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))))
 
   ;; IDirect3DDevice9_GetFrontBufferData — 3 args (incl. this)
@@ -1502,13 +1568,11 @@
   (func $handle_IDirect3DDevice9_StretchRect (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (call $d3d9_color_stretch (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $arg3)
       (local.get $arg4) (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24))) (local.get $name_ptr))
-    (if (global.get $d3d_render_token) (then (return)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28))))
 
   ;; IDirect3DDevice9_ColorFill — 4 args (incl. this)
   (func $handle_IDirect3DDevice9_ColorFill (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (call $d3d9_color_fill (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $arg3))
-    (if (global.get $d3d_render_token) (then (return)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 20))))
 
   ;; IDirect3DDevice9_CreateOffscreenPlainSurface — 7 args (incl. this)
@@ -1576,75 +1640,26 @@
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8))))
 
   ;; IDirect3DDevice9_Clear(this, Count, pRects, Flags, Color, Z, Stencil) —
-  ;; 7 args. Backend snapshots rectangles/Z and applies viewport clipping.
-  ;; Legacy no-backend mode supports only a whole-target color clear.
+  ;; 7 args. The ring producer (09akg) lowers rectangles/Z/stencil and
+  ;; applies viewport and scissor clipping.
   (func $handle_IDirect3DDevice9_Clear (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $rt i32) (local $dib i32) (local $w i32) (local $h i32)
-    (local $pitch i32) (local $x i32) (local $y i32) (local $rowbase i32)
-    (local $desc i32) (local $program i32) (local $z i32) (local $stencil i32) (local $result i32)
+    (local $desc i32) (local $z i32) (local $stencil i32)
     (local.set $z (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24))))
     (local.set $stencil (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28))))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 32)))
-    (block $issue
-    (if (global.get $d3d_render_token) (then
-      (local.set $result (call $d3d_render_poll)) (br $issue)))
-    (i32.store offset=0 (global.get $reg_base) (i32.const 0))
-    (local.set $program (call $d3d9_program_state (local.get $arg0)))
-    (if (local.get $program) (then
-      (if (call $d3d9_bound_dc_held (local.get $arg0))
-        (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086c)) (return)))
-      (local.set $desc (call $d3d9_gpu_descriptor (local.get $arg0)))
-      (if (local.get $desc) (then
-        (i32.store offset=44 (local.get $desc) (local.get $arg3))
-        (i32.store offset=48 (local.get $desc) (local.get $arg4))
-        (i32.store offset=52 (local.get $desc) (local.get $z))
-        (i32.store offset=24 (local.get $desc) (local.get $stencil))
-        (i32.store offset=56 (local.get $desc) (local.get $arg1))
-        (i32.store offset=60 (local.get $desc) (local.get $arg2))
-        (local.set $result (call $host_gpu_gl_call (i32.const 0x30003) (local.get $desc) (i32.const 0)))))))
-    )
-    (if (call $d3d_render_park (local.get $result) (i32.const 32)) (then (return)))
-    (i32.store offset=0 (global.get $reg_base) (i32.const 0))
-    (if (i32.lt_s (local.get $result) (i32.const 0))
-      (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086C)) (return)))
-    ;; An owned render backend publishes canonical bytes only at Present.
-    ;; Never overwrite its rectangular result with this legacy whole fill.
-    (if (i32.gt_s (local.get $result) (i32.const 0)) (then (return)))
-    (if (i32.or (i32.ne (local.get $arg3) (i32.const 1))
-      (i32.or (local.get $arg1) (local.get $arg2)))
-      (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086C)) (return)))
-    (if (local.get $program) (then
-      (if (call $gl32 (i32.add (local.get $program) (i32.const 22020)))
-        (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086C)) (return))) ;; independent targets require the shared backend
-      (if (call $gl32 (i32.add (call $d3ddev_state (local.get $arg0)) (i32.const 952)))
-        (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086C)) (return))) ;; RS174 scissor needs a real backend
-      (if (call $gl32 (i32.add (local.get $program) (i32.const 21736)))
-        (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086C)) (return)))
-      (call $gs32 (i32.add (local.get $program) (i32.const 1688)) (local.get $arg4))))
-    (if (i32.eqz (i32.and (local.get $arg3) (i32.const 1))) (then (return)))
-    (local.set $rt (call $d3ddev_rt_entry (local.get $arg0)))
-    (if (i32.eqz (local.get $rt)) (then (return)))
-    (local.set $dib (i32.load (i32.add (local.get $rt) (i32.const 20))))
-    (if (i32.eqz (local.get $dib)) (then (return)))
-    ;; Our D3D9 render targets are always 32bpp (see $handle_IDirect3D9_CreateDevice).
-    (if (i32.ne (i32.load16_u (i32.add (local.get $rt) (i32.const 16))) (i32.const 32))
-      (then (return)))
-    (local.set $w (i32.load16_u (i32.add (local.get $rt) (i32.const 12))))
-    (local.set $h (i32.load16_u (i32.add (local.get $rt) (i32.const 14))))
-    (local.set $pitch (i32.load16_u (i32.add (local.get $rt) (i32.const 18))))
-    (local.set $y (i32.const 0))
-    (block $rows_done (loop $row
-      (br_if $rows_done (i32.ge_u (local.get $y) (local.get $h)))
-      (local.set $rowbase (i32.add (local.get $dib) (i32.mul (local.get $y) (local.get $pitch))))
-      (local.set $x (i32.const 0))
-      (block $cols_done (loop $col
-        (br_if $cols_done (i32.ge_u (local.get $x) (local.get $w)))
-        (i32.store (i32.add (local.get $rowbase) (i32.mul (local.get $x) (i32.const 4)))
-          (local.get $arg4))
-        (local.set $x (i32.add (local.get $x) (i32.const 1)))
-        (br $col)))
-      (local.set $y (i32.add (local.get $y) (i32.const 1)))
-      (br $row))))
+    (if (call $d3d9_bound_dc_held (local.get $arg0))
+      (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086c)) (return)))
+    ;; Every D3D9 device has program state (CreateDevice), so a descriptor.
+    (local.set $desc (call $d3d9_gpu_descriptor (local.get $arg0)))
+    (if (local.get $desc) (then
+      (i32.store offset=44 (local.get $desc) (local.get $arg3))
+      (i32.store offset=48 (local.get $desc) (local.get $arg4))
+      (i32.store offset=52 (local.get $desc) (local.get $z))
+      (i32.store offset=24 (local.get $desc) (local.get $stencil))
+      (i32.store offset=56 (local.get $desc) (local.get $arg1))
+      (i32.store offset=60 (local.get $desc) (local.get $arg2))))
+    (drop (call $d9g_clear_call (local.get $arg0)))
+    (i32.store offset=0 (global.get $reg_base) (i32.const 0)))
 
   ;; IDirect3DDevice9_SetTransform — 3 args (incl. this)
   (func $handle_IDirect3DDevice9_SetTransform (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
@@ -1947,13 +1962,23 @@
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12))))
 
   ;; IDirect3DDevice9_SetSoftwareVertexProcessing — 2 args (incl. this)
+  ;; Only a MIXED_VERTEXPROCESSING (0x80) device switches modes; the mode
+  ;; decides the caps GetDeviceCaps reports (MaxVertexBlendMatrixIndex).
   (func $handle_IDirect3DDevice9_SetSoftwareVertexProcessing (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $state i32)
+    (local.set $state (call $d3d9_program_state (local.get $arg0)))
+    (if (local.get $state) (then
+      (if (i32.and (call $gl32 (i32.add (local.get $state) (i32.const 25680))) (i32.const 0x80)) (then
+        (call $gs32 (i32.add (local.get $state) (i32.const 25684)) (i32.ne (local.get $arg1) (i32.const 0)))))))
     (i32.store offset=0 (global.get $reg_base) (i32.const 0))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12))))
 
   ;; IDirect3DDevice9_GetSoftwareVertexProcessing — 1 args (incl. this)
   (func $handle_IDirect3DDevice9_GetSoftwareVertexProcessing (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (i32.store offset=0 (global.get $reg_base) (i32.const 0))
+    (local $state i32)
+    (local.set $state (call $d3d9_program_state (local.get $arg0)))
+    (i32.store offset=0 (global.get $reg_base)
+      (if (result i32) (local.get $state) (then (call $gl32 (i32.add (local.get $state) (i32.const 25684)))) (else (i32.const 0))))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8))))
 
   ;; IDirect3DDevice9_SetNPatchMode — 2 args (incl. this)
@@ -1978,7 +2003,6 @@
   (func $handle_IDirect3DDevice9_DrawPrimitive (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (call $d3d9_draw_buffer (local.get $arg0) (local.get $arg1) (local.get $arg2)
       (i32.const 0) (i32.const 0) (i32.const 0) (local.get $arg3) (i32.const 0))
-    (if (global.get $d3d_render_token) (then (return)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 20))))
 
   ;; IDirect3DDevice9_DrawIndexedPrimitive — 7 args (incl. this)
@@ -1987,16 +2011,12 @@
       (local.get $arg3) (local.get $arg4)
       (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24)))
       (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28))) (i32.const 1))
-    (if (global.get $d3d_render_token) (then (return)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 32))))
 
   ;; IDirect3DDevice9_DrawPrimitiveUP — 5 args (incl. this)
   (func $handle_IDirect3DDevice9_DrawPrimitiveUP (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $state i32) (local $desc i32) (local $result i32)
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24)))
-    (block $issue
-    (if (global.get $d3d_render_token) (then
-      (local.set $result (call $d3d_render_poll)) (br $issue)))
     (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086C))
     (local.set $state (call $d3d9_program_state (local.get $arg0)))
     (if (i32.eqz (local.get $state)) (then (return)))
@@ -2009,8 +2029,7 @@
     (i32.store offset=28 (local.get $desc) (local.get $arg2))
     (i32.store offset=32 (local.get $desc) (local.get $arg3))
     (i32.store offset=36 (local.get $desc) (local.get $arg4))
-    (local.set $result (call $host_gpu_gl_call (i32.const 0x30001) (local.get $desc) (i32.const 0))))
-    (if (call $d3d_render_park (local.get $result) (i32.const 24)) (then (return)))
+    (local.set $result (call $d9g_draw_call (local.get $arg0) (i32.const 0)))
     (i32.store offset=0 (global.get $reg_base) (select (i32.const 0) (i32.const 0x8876086c) (i32.eq (local.get $result) (i32.const 1))))
     (local.set $result (i32.load offset=0 (global.get $reg_base)))
     (call $d3d9_buffer_bind (local.get $arg0) (i32.const 0) (i32.const 6) (i32.const 0) (i32.const 0) (i32.const 0))
@@ -2025,9 +2044,6 @@
     (local.set $vertices (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 32))))
     (local.set $stride (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 36))))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 40)))
-    (block $issue
-    (if (global.get $d3d_render_token) (then
-      (local.set $result (call $d3d_render_poll)) (br $issue)))
     (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086C))
     (local.set $state (call $d3d9_program_state (local.get $arg0)))
     (if (i32.eqz (local.get $state)) (then (return)))
@@ -2047,8 +2063,7 @@
     (i32.store offset=48 (local.get $desc) (local.get $format))
     (i32.store offset=52 (local.get $desc) (local.get $arg2))
     (i32.store offset=56 (local.get $desc) (local.get $arg3))
-    (local.set $result (call $host_gpu_gl_call (i32.const 0x30001) (local.get $desc) (i32.const 0))))
-    (if (call $d3d_render_park (local.get $result) (i32.const 40)) (then (return)))
+    (local.set $result (call $d9g_draw_call (local.get $arg0) (i32.const 1)))
     (i32.store offset=0 (global.get $reg_base) (select (i32.const 0) (i32.const 0x8876086c) (i32.eq (local.get $result) (i32.const 1))))
     (local.set $result (i32.load offset=0 (global.get $reg_base)))
     (call $d3d9_buffer_bind (local.get $arg0) (i32.const 0) (i32.const 6) (i32.const 0) (i32.const 0) (i32.const 0))
@@ -2433,8 +2448,11 @@
     (local.set $mip (call $d3d9_texture_mip (local.get $arg0) (local.get $arg1)))
     (if (local.get $mip) (then
       (if (i32.load offset=20 (local.get $mip)) (then
+        ;; A D3DLOCK_READONLY (0x10) lock cannot have changed the level, so it
+        ;; leaves the content identity alone: nothing is re-decoded or re-sent.
+        (if (i32.eqz (i32.and (i32.load offset=20 (local.get $mip)) (i32.const 0x10)))
+          (then (call $d3d9_texture_touch (i32.add (local.get $mip) (i32.const 28)))))
         (i32.store offset=20 (local.get $mip) (i32.const 0))
-        (i32.store offset=28 (local.get $mip) (i32.add (i32.load offset=28 (local.get $mip)) (i32.const 1)))
         (i32.store offset=0 (global.get $reg_base) (i32.const 0))))))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12))))
 
@@ -2444,7 +2462,7 @@
     ;; It never misses guest writes; dirty rectangles are not clipping bounds.
     (local $mip i32)
     (local.set $mip (call $d3d9_texture_mip (local.get $arg0) (i32.const 0)))
-    (i32.store offset=28 (local.get $mip) (i32.add (i32.load offset=28 (local.get $mip)) (i32.const 1)))
+    (call $d3d9_texture_touch (i32.add (local.get $mip) (i32.const 28)))
     (i32.store offset=0 (global.get $reg_base) (i32.const 0))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12))))
 
@@ -2489,7 +2507,6 @@
           ;; Keep the last external surface and its parent unchanged while
           ;; retirement is pending. Reentry polls without a second decrement.
           (call $handle_IDirect3DDevice9_Release (local.get $device) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))
-          (if (global.get $d3d_render_token) (then (return)))
           (if (i32.and (i32.eq (local.get $parent_refs) (i32.const 1)) (i32.ne (i32.load offset=0 (global.get $reg_base)) (i32.const 0)))
             (then (i32.store offset=0 (global.get $reg_base) (i32.const 2)) (return)))
           ;; DeviceRelease already popped the identical one-argument ABI.
@@ -2612,7 +2629,6 @@
   (func $handle_IDirect3DSurface9_LockRect (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (if (call $d3d9_is_color_surface (local.get $arg0)) (then
       (call $d3d9_color_lock (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $arg3))
-      (if (global.get $d3d_render_token) (then (return)))
       (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 20))) (return)))
     (if (call $d3d9_is_depth_surface (local.get $arg0)) (then
       (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086c))
@@ -2620,23 +2636,20 @@
     (if (call $d3d9_is_texture_surface (local.get $arg0))
       (then (call $d3d9_texture_lock (call $gl32 (i32.add (local.get $arg0) (i32.const 8)))
         (call $gl32 (i32.add (local.get $arg0) (i32.const 16))) (local.get $arg1) (local.get $arg2) (local.get $arg3)))
-      (else (call $d3d9_backbuffer_lock (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $arg3))
-        (if (global.get $d3d_render_token) (then (return)))))
+      (else (call $d3d9_backbuffer_lock (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $arg3))))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 20))))
 
   ;; IDirect3DSurface9_UnlockRect — 1 args (incl. this)
   (func $handle_IDirect3DSurface9_UnlockRect (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (if (call $d3d9_is_color_surface (local.get $arg0)) (then
       (call $d3d9_color_unlock (local.get $arg0))
-      (if (global.get $d3d_render_token) (then (return)))
       (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8))) (return)))
     (if (call $d3d9_is_depth_surface (local.get $arg0)) (then
       (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086c))
       (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8))) (return)))
     (if (call $d3d9_is_texture_surface (local.get $arg0))
       (then (call $d3d9_texture_surface_unlock (local.get $arg0)))
-      (else (call $d3d9_backbuffer_unlock (local.get $arg0))
-        (if (global.get $d3d_render_token) (then (return)))))
+      (else (call $d3d9_backbuffer_unlock (local.get $arg0))))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8))))
 
   ;; IDirect3DSurface9_GetDC(this, phdc) — same DIB-backed DC binding the
@@ -2652,14 +2665,12 @@
       (local.set $device (call $d3d9_backbuffer_owner (local.get $arg0)))
       (br_if $done (i32.eqz (local.get $device)))
       (local.set $entry (call $dx_from_this (local.get $arg0)))
-      (if (i32.eqz (global.get $d3d_render_token)) (then
-        (br_if $done (i32.eqz (i32.and (load.field DxObject flags (local.get $entry)) (i32.shl (i32.const 1) (i32.const 27)))))
-        (br_if $done (i32.and (load.field DxObject flags (local.get $entry)) (i32.const 0x40000000)))
-        ;; Reserve before readback, including while the guest is parked.
-        (store.field DxObject flags (local.get $entry)
-          (i32.or (load.field DxObject flags (local.get $entry)) (i32.const 0x60000000)))))
+      (br_if $done (i32.eqz (i32.and (load.field DxObject flags (local.get $entry)) (i32.shl (i32.const 1) (i32.const 27)))))
+      (br_if $done (i32.and (load.field DxObject flags (local.get $entry)) (i32.const 0x40000000)))
+      ;; Bit 30 holds the DC; bit 29 marks the CPU sync in progress.
+      (store.field DxObject flags (local.get $entry)
+        (i32.or (load.field DxObject flags (local.get $entry)) (i32.const 0x60000000)))
       (local.set $result (call $d3d9_backbuffer_dc_sync (local.get $device) (i32.const 0)))
-      (if (call $d3d_render_park (local.get $result) (i32.const 0)) (then (return)))
       (store.field DxObject flags (local.get $entry)
         (i32.and (load.field DxObject flags (local.get $entry)) (i32.const 0xdfffffff)))
       (local.set $hdc (i32.add (i32.const 0x200000) (call $dx_slot_of (local.get $entry))))
@@ -2689,12 +2700,10 @@
         (i32.eqz (i32.and (load.field DxObject flags (local.get $entry)) (i32.const 0x40000000)))))
       (local.set $device (call $d3d9_backbuffer_owner (local.get $arg0)))
       (br_if $done (i32.eqz (local.get $device)))
-      (if (i32.eqz (global.get $d3d_render_token)) (then
-        (br_if $done (i32.and (load.field DxObject flags (local.get $entry)) (i32.shl (i32.const 1) (i32.const 28))))
-        (store.field DxObject flags (local.get $entry)
-          (i32.or (load.field DxObject flags (local.get $entry)) (i32.shl (i32.const 1) (i32.const 28))))))
+      (br_if $done (i32.and (load.field DxObject flags (local.get $entry)) (i32.shl (i32.const 1) (i32.const 28))))
+      (store.field DxObject flags (local.get $entry)
+        (i32.or (load.field DxObject flags (local.get $entry)) (i32.shl (i32.const 1) (i32.const 28))))
       (local.set $result (call $d3d9_backbuffer_dc_sync (local.get $device) (i32.const 1)))
-      (if (call $d3d_render_park (local.get $result) (i32.const 0)) (then (return)))
       (store.field DxObject flags (local.get $entry)
         (i32.and (load.field DxObject flags (local.get $entry)) (i32.const 0xefffffff)))
       (br_if $done (i32.ne (local.get $result) (i32.const 1)))
@@ -2725,29 +2734,20 @@
     (i32.store offset=0 (global.get $reg_base) (i32.const 0)))
 
   (func $handle_IDirect3DSwapChain9_Present (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $rt i32) (local $device i32) (local $desc i32) (local $result i32)
-    (if (i32.eq (call $d3d9_backbuffer_format (local.get $arg0)) (i32.const 23)) (then
-      ;; Swap-chain wrappers share the primary device's backend identity.
-      (local.set $device (call $w2g (i32.add (global.get $COM_WRAPPERS)
-        (i32.mul (call $dx_slot_of (call $dx_from_this (local.get $arg0))) (i32.const 8)))))
-      (local.set $rt (call $d3ddev_rt_entry (local.get $device)))
-      (if (i32.and (load.field DxObject flags (local.get $rt)) (i32.const 0x40000000)) (then
-        (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086c))
-        (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28))) (return)))
-      (local.set $result (if (result i32) (global.get $d3d_render_token)
-        (then (call $d3d_render_poll))
-        (else (local.set $desc (call $d3d9_gpu_descriptor (local.get $device)))
-          (i32.store offset=60 (local.get $desc) (global.get $sync_msg_depth))
-          (call $host_gpu_gl_call (i32.const 0x30002) (local.get $desc) (i32.const 0)))))
-      (if (call $d3d_render_park (local.get $result) (i32.const 28)) (then (return)))
-      (call $present_frame_end)
-      (if (i32.eqz (local.get $result)) (then (call $dx_present (local.get $rt))))
-      (i32.store offset=0 (global.get $reg_base) (select (i32.const 0) (i32.const 0x8876086c)
-        (i32.or (i32.eqz (local.get $result)) (i32.eq (local.get $result) (i32.const 1))))) (return)))
+    (local $rt i32) (local $device i32)
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28)))
-    (local.set $rt (call $d3ddev_rt_entry (local.get $arg0)))
+    ;; Swap-chain wrappers share the primary device's backend identity.
+    (local.set $device (call $w2g (i32.add (global.get $COM_WRAPPERS)
+      (i32.mul (call $dx_slot_of (call $dx_from_this (local.get $arg0))) (i32.const 8)))))
+    (local.set $rt (call $d3ddev_rt_entry (local.get $device)))
     (if (i32.and (load.field DxObject flags (local.get $rt)) (i32.const 0x40000000))
       (then (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086c)) (return)))
+    ;; The ring presents (09akg), as IDirect3DDevice9::Present does.
+    (if (call $d3d9_gpu_descriptor (local.get $device)) (then
+      (drop (call $d9g_present (local.get $device) (local.get $arg1) (local.get $arg2)))
+      (call $present_frame_end)
+      (i32.store offset=0 (global.get $reg_base) (i32.const 0))
+      (return)))
     (if (local.get $rt) (then (call $dx_present (local.get $rt))))
     (call $present_frame_end)
     (i32.store offset=0 (global.get $reg_base) (i32.const 0)))
@@ -2837,21 +2837,4 @@
       (call $d3d9_windowed_hwnd_get))
     (call $gs32 (i32.add (local.get $arg1) (i32.const 32)) (local.get $windowed))
     (i32.store offset=0 (global.get $reg_base) (i32.const 0)))
-  ;; A suspended render API owns one opaque broker token on this WAT instance.
-  ;; Poll before rebuilding mutable descriptors or repeating post-call effects.
-  (global $d3d_render_token (mut i32) (i32.const 0))
-  (func (export "get_d3d_render_token") (result i32) (global.get $d3d_render_token))
-  (func (export "set_d3d_render_token") (param $token i32)
-    (global.set $d3d_render_token (local.get $token)))
-  (func $d3d_render_poll (result i32)
-    (local $result i32)
-    (local.set $result (call $host_gpu_gl_call (i32.const 0x30007) (i32.const 0) (global.get $d3d_render_token)))
-    (if (i32.ge_s (local.get $result) (i32.const -1))
-      (then (global.set $d3d_render_token (i32.const 0))))
-    (local.get $result))
-  (func $d3d_render_park (param $result i32) (param $unpop i32) (result i32)
-    (if (i32.ge_s (local.get $result) (i32.const -1)) (then (return (i32.const 0))))
-    (global.set $d3d_render_token (local.get $result))
-    (call $io_block (local.get $unpop))
-    (global.set $yield_reason (i32.const 16))
-    (i32.const 1))
+

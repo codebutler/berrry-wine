@@ -1,4 +1,4 @@
-// Wine-Assembly: JS host for the WASM x86 interpreter
+// Berrry Wine: JS host for the WASM x86 interpreter
 // Win98Renderer is loaded from lib/renderer.js (included via <script> in index.html)
 
 // The boot steps this host shares with the CLI harness: staging the EXE,
@@ -7,6 +7,9 @@
 const ProcessBoot = (typeof window !== 'undefined' && window.processBoot) || null;
 const HostMemUtils = (typeof window !== 'undefined' && window.memUtils) ||
   (typeof require !== 'undefined' ? require('./lib/mem-utils') : null);
+
+const createBrowserNativeInput = typeof window !== 'undefined'
+  ? window.createBrowserNativeInput : require('./lib/browser-native-input').createBrowserNativeInput;
 
 // Private provenance, populated only at the actual compile boundary. A public
 // Module or a caller-provided buffer cannot authenticate one another.
@@ -432,8 +435,13 @@ const frozenRecorder = {
     return summary;
   },
 
+  // Returns the unregister. The set is page-lifetime and each pump closes over
+  // its host's audio scope, which reaches the guest memory: a pump left behind
+  // by a closed app pinned that app's whole 512MB.
   registerPump(fn) {
-    if (typeof fn === 'function') frozenRecorder._pumps.add(fn);
+    if (typeof fn !== 'function') return () => {};
+    frozenRecorder._pumps.add(fn);
+    return () => { frozenRecorder._pumps.delete(fn); };
   },
 
   pumpAudio() {
@@ -1305,6 +1313,9 @@ class WineAssembly {
     // The tier's aggressive stack elision is opt-in: `aggressiveStack: true`
     // on an app or ?aggressive-stack (docs/uop-tier-design.md).
     this.aggressiveStack = false;
+    // Same-block self-modifying-code checkpoints (04-cache $smc_same_block) are
+    // opt-in: `smcSameBlock: true` on an app or ?smc-same-block.
+    this.smcSameBlock = false;
     // Worker threads follow the page (window.WINE_THREADS, on by default);
     // `threads: false` on an app keeps that app cooperative.
     this.threads = true;
@@ -1315,6 +1326,7 @@ class WineAssembly {
     // primary) are paced to at most this many per second; 0 = unpaced. A rate
     // cap, not vsync: see $present_pace. lib/browser-shell.js sets it.
     this.presentCap = 0;
+    this.spinParkK = null;
     // How $present_pace spends the cap: 'smooth' (default) or 'deadline'.
     this.presentPace = 'smooth';
     // What the cap paces when the app names its game step (lib/apps.js
@@ -1665,12 +1677,33 @@ class WineAssembly {
     return shared.guestTickState;
   }
 
+  // The wall time the guest clock reads. It stands still while a guest thread
+  // that may already run is still booting its Worker, and the origin slides
+  // past that interval afterwards. On Windows a resumed thread runs within a
+  // quantum; here booting it costs hundreds of ms, and a creator that times
+  // the new thread saw all of it. NFS II SE starts a multimedia-timer tick
+  // thread, gives it 10000/rate ms to tick, and otherwise tears it down and
+  // spins forever on a tick counter nothing advances.
+  _guestClockNow(st) {
+    const now = this._audioSchedulerNow();
+    const tm = this.threadManager;
+    if (tm && tm.hasBootingRunnableThread && tm.hasBootingRunnableThread()) {
+      if (!Number.isFinite(st.bootHoldAt)) st.bootHoldAt = now;
+      return st.bootHoldAt;
+    }
+    if (Number.isFinite(st.bootHoldAt)) {
+      if (Number.isFinite(st.wallStartMs)) st.wallStartMs += Math.max(0, now - st.bootHoldAt);
+      st.bootHoldAt = null;
+    }
+    return now;
+  }
+
   _beginGuestTickBatch(sharedAudio) {
     const st = this._guestTickState(sharedAudio);
     // Frozen mode charges guest time per executed step instead of reading the
     // wall — see the frozen-mode block above `class WineAssembly`.
     if (this._frozen) { st.callsInBatch = 0; return; }
-    const now = this._audioSchedulerNow();
+    const now = this._guestClockNow(st);
     if (!Number.isFinite(st.wallStartMs)) st.wallStartMs = now;
     const elapsed = Math.max(0, Math.floor(this._startupElapsed(now - st.wallStartMs)));
     st.batchMs = Math.max(Number.isFinite(st.batchMs) ? st.batchMs : 0, elapsed) & 0x7FFFFFFF;
@@ -1697,7 +1730,7 @@ class WineAssembly {
     const stride = Math.max(1, this.guestTickPollStride | 0);
     let elapsed = Number.isFinite(st.batchMs) ? st.batchMs : 0;
     if ((calls % stride) === 0) {
-      const now = this._audioSchedulerNow();
+      const now = this._guestClockNow(st);
       if (!Number.isFinite(st.wallStartMs)) st.wallStartMs = now;
       elapsed = Math.max(0, Math.floor(this._startupElapsed(now - st.wallStartMs)));
     }
@@ -1737,7 +1770,7 @@ class WineAssembly {
     const base = Math.max(Number.isFinite(st.batchMs) ? st.batchMs : 0,
       Number.isFinite(st.lastReturnedMs) ? st.lastReturnedMs : 0);
     if (this._frozen || !Number.isFinite(st.wallStartMs)) return base;
-    return Math.max(base, this._startupElapsed(this._audioSchedulerNow() - st.wallStartMs));
+    return Math.max(base, this._startupElapsed(this._guestClockNow(st) - st.wallStartMs));
   }
 
   // The real (host-advanced) guest clock, never held back by the deadline clock.
@@ -1931,17 +1964,21 @@ class WineAssembly {
     self._guestTickState(sharedAudio);
     const ctx = {
       getMemory: () => self.memory.buffer,
+      // Capture this process incarnation, not running/_stopped: imports exist
+      // before run(), and reinitializing this host creates a new process object.
+      // Detached thread contexts and retained publications share its exit edge.
+      windowLookupLifetime: self._processObject,
       cmosRtc: opts.cmosRtc,
       pitTimer: opts.pitTimer,
       pitNowMs: opts.pitNowMs,
       calendarClock: opts.calendarClock,
-      d3d9Bridge: opts.d3d9Bridge,
       d3dCommands: opts.d3dCommands,
       glideBridge: opts.glideBridge,
-      // The ?debug toolbar's shared GPU select; unset falls through to the
-      // ?d3d9-renderer query and then WebGL inside host-imports.js.
-      d3d9Backend: self.d3d9Backend ||
-        (typeof window !== 'undefined' && window.WineD3D && window.WineD3D.renderer) || null,
+      // The D3D8/9 GPU-stream executor: ?d3d9-gps= (index.html), else the
+      // ?debug toolbar's shared GPU select; unset falls through to the query
+      // and then WebGL inside host-imports.js.
+      d3d9GpsBackend: self.d3d9Backend || (typeof window !== 'undefined' && window.WineD3D &&
+        (window.WineD3D.d3d9Gps || window.WineD3D.renderer)) || null,
       glideBackend: self.d3d9Backend ||
         (typeof window !== 'undefined' && window.WineD3D && window.WineD3D.renderer) || null,
       d3d9Programmable: self.d3d9Programmable === true,
@@ -1955,12 +1992,10 @@ class WineAssembly {
         ? (shift => () => Date.now() - shift)(
           Math.floor((Date.now() - self.wallClockMs) / 86400000) * 86400000)
         : undefined,
-      createD3DRenderWorker: () => self._createD3DRenderWorker(),
       createRenderEndpoint: options => self._createRenderWorkerEndpoint(options),
-      createRenderWorker: options => self._createRenderWorkerConsumer(options),
       get sharedRenderWorkerEnabled() { return !!self.guestWorker; },
       get writerObservation() { return self._d3dimWriterObservation || null; },
-      get d3dimPublicationJoin() { return self._d3dimPublicationJoin || null; },
+      get d3dimPublicationJoin() { return self._d3dimPublicationJoin?.synchronous || self._d3dimPublicationJoin || null; },
       apiTable: self.apiTable,
       get renderer() { return self.renderer; },
       get resourceJson() { return self.resourceJson; },
@@ -2137,6 +2172,8 @@ class WineAssembly {
       };
     }
     const base = createHostImports(ctx);
+    // One per getImports() call: a Threads launch makes two import scopes.
+    (self._importMemoryReleases || (self._importMemoryReleases = [])).push(base.releaseMemoryCaches);
     ctx.sharedGdi = base.gdi;
     const h = base.host;
 
@@ -2430,7 +2467,7 @@ class WineAssembly {
     // The renderer stamps queued DirectInput edges with this same clock, so a
     // pause -- which stops _guestTickMs but not Date.now() -- cannot make an
     // edge queued before it look like it happened minutes ago.
-    if (self.renderer) self.renderer._guestNowMs = h.get_ticks;
+    if (self.renderer) self.renderer._guestNowMs = self._rendererGuestNowMs = h.get_ticks;
     // Browser-only Open/Save common-dialog hooks. has_dom returns 1 so
     // $create_open_dialog renders the Upload / Download button.
     h.has_dom = () => 1;
@@ -2788,9 +2825,14 @@ class WineAssembly {
       self.logToUI(`[CreateWindow] "${title}"`);
       const ownerInstance = ctx.instance || self.instance;
       if (self.renderer) {
+        const owners = self.renderer._pointerProcessOwners ||= new WeakMap();
+        if (ownerInstance) owners.set(ownerInstance, ctx.windowLookupLifetime);
         self.renderer.createWindow(hwnd, style, x, y, cx, cy, title, menuId, ownerInstance, self.memory);
         const win = self.renderer.windows && self.renderer.windows[hwnd];
-        if (win) win.processId = self.processId;
+        if (win) {
+          win.processId = self.processId;
+          win._lookupProcess = ctx.windowLookupLifetime;
+        }
       }
       return hwnd;
     };
@@ -2798,9 +2840,14 @@ class WineAssembly {
       if (self.verbose) console.log(`[CreateDialog] hwnd=0x${hwnd.toString(16)} parent=0x${parentHwnd.toString(16)}`);
       const ownerInstance = ctx.instance || self.instance;
       if (self.renderer) {
+        const owners = self.renderer._pointerProcessOwners ||= new WeakMap();
+        if (ownerInstance) owners.set(ownerInstance, ctx.windowLookupLifetime);
         self.renderer.createDialog(hwnd, parentHwnd, ownerInstance, self.memory);
         const win = self.renderer.windows && self.renderer.windows[hwnd];
-        if (win) win.processId = self.processId;
+        if (win) {
+          win.processId = self.processId;
+          win._lookupProcess = ctx.windowLookupLifetime;
+        }
       }
     };
 
@@ -2817,21 +2864,26 @@ class WineAssembly {
     };
 
     // --- Input ---
-    h.check_input = () => {
+    h.check_input = (...nativeContext) => {
+      ctx.guardedInput?.observe(nativeContext);
+      ctx.guardedInput?.sweep();
       if (!self.renderer) return 0;
+      // Retained main/auxiliary imports may still be polled after Stop or
+      // reinitialization. Their captured process incarnation is authoritative.
+      if (ctx.windowLookupLifetime.exited || ctx.windowLookupLifetime !== self._processObject) return 0;
       const clearInactiveInput = () => {
         self._lastInputEvent = null;
         self.renderer._activeInputEvent = null;
       };
       // Which queued events are this instance's to take. In multi-app mode
       // that is its own hwnd range; otherwise it is any window this WASM
-      // instance owns. An event with no hwnd belongs to whoever asks first.
+      // instance owns. Legacy CLI events without an owner keep first-poll routing.
       // The dequeue itself, and the async-key/repaint bookkeeping that has to
       // follow it, live in the renderer (renderer-input.js takeInput) -- this
       // used to be a second transcription of them that had already lost the
       // GetAsyncKeyState press bit.
       const ownerInstance = ctx.instance || self.instance;
-      const owns = (self._hwndBase && self._multiApp)
+      const ownsWindow = (self._hwndBase && self._multiApp)
         ? (e) => {
           if (!e || !e.hwnd) return true;
           const win = self.renderer.windows && self.renderer.windows[e.hwnd];
@@ -2853,10 +2905,25 @@ class WineAssembly {
           if (win && win.processId) return win.processId === self.processId;
           return !win || !win.wasm || win.wasm === ownerInstance;
         };
+      const owns = e => {
+        if (ctx.guardedInput && !ctx.guardedInput.owns(e)) return false;
+        if (e && e.pointerProcess) {
+          return e.pointerProcess === ctx.windowLookupLifetime && !e.pointerProcess.exited;
+        }
+        if (e && e.type === 'key') {
+          if (e.keyboardProcess) return e.keyboardProcess === ctx.windowLookupLifetime && !e.keyboardProcess.exited;
+          if (e.keyboardProcessId) return e.keyboardProcessId === self.processId;
+          if (e.keyboardOwner) return e.keyboardOwner === ownerInstance;
+        }
+        return ownsWindow(e);
+      };
       const evt = self.renderer.takeInput(owns);
       if (!evt) {
         if (self.renderer.inputQueue.length === 0) clearInactiveInput();
         return 0;
+      }
+      if (ctx.guardedInput?.dequeued(evt) === false) {
+        clearInactiveInput();return 0;
       }
       self._lastInputEvent = evt;
       self.renderer._activeInputEvent = evt;
@@ -2865,6 +2932,16 @@ class WineAssembly {
       }
       return (evt.wParam << 16) | (evt.msg & 0xFFFF);
     };
+    if (typeof window!=='undefined' && window.WINE_BROWSER_NATIVE_INPUT===true && !opts.detached) {
+      const guard=self._browserNativeInput || (self._browserNativeInput=createBrowserNativeInput(self));
+      ctx.guardedInput=guard;
+      ctx.nativeInputActor=()=>guard.snapshot();
+      Object.defineProperty(h,'browserInputScope',{value:guard});
+      h.check_input_token=()=>guard.token(self._lastInputEvent);
+      h.input_validate=(token,...values)=>guard.validate(token,values);
+      h.input_consumed=(token,tid,ptr,kind,remove,...values)=>guard.consumed(token,tid,ptr,kind,remove,values);
+      h.di_mouse_receipt=(entry,phase,sequence,word,ptr,...values)=>guard.directInput(entry,phase,sequence,word,ptr,values);
+    }
     h.check_input_lparam = () => {
       return self._lastInputEvent ? (self._lastInputEvent.lParam | 0) : 0;
     };
@@ -2936,6 +3013,8 @@ class WineAssembly {
       ? self.threadManager.initializeComApartment(reserved, flags, tid) : 0x8000FFFF;
     h.com_uninitialize_thread = (tid) => self.threadManager
       ? self.threadManager.uninitializeComApartment(tid) : 0;
+    h.com_is_initialized = (tid) => self.threadManager
+      ? self.threadManager.isComApartmentInitialized(tid) : 0;
     h.exit_thread = (c) => self.threadManager && self.threadManager.exitThread(c);
     h.get_exit_code_thread = (handle) => self.threadManager ? self.threadManager.getExitCodeThread(handle) : 0x103;
     h.terminate_thread = (handle, exitCode) => self.threadManager
@@ -3048,10 +3127,14 @@ class WineAssembly {
   // module it lives in. A raw runtime address is useless against a disassembly
   // -- every DLL is relocated -- and `module+0xVA` is the form every tool here
   // (disasm_fn, xrefs, --count, --break) already takes.
-  _exitSiteText() {
-    const ex = this.instance && this.instance.exports;
-    if (!ex || !ex.get_dbg_prev_eip) return '';
+  //
+  // With the guest main in a Worker (Threads on), this.instance is the page's
+  // idle instance and every register it reports is zero. That Worker's slice
+  // reply carries its own registers when it ended at EIP 0 (`slice.regs`), and
+  // those are the ones to print; a reply without them says so.
+  _exitSiteText(slice = null) {
     const hex = v => '0x' + ((v >>> 0).toString(16).padStart(8, '0'));
+    const ex = this.instance && this.instance.exports;
     const name = addr => {
       let best = null;
       for (const key of Object.keys(this.moduleBases || {})) {
@@ -3062,6 +3145,14 @@ class WineAssembly {
       if (!best) return hex(addr);
       return `${best.key}+${hex(addr - best.m.loadAddr + best.m.origBase)}`;
     };
+    if (slice) {
+      const g = slice.regs;
+      if (!g) return '(the guest Worker reported no registers)';
+      return `last block ${hex(g.prevEip)} (${name(g.prevEip >>> 0)})` +
+        (g.prev2Eip ? `, before it ${hex(g.prev2Eip)} (${name(g.prev2Eip >>> 0)})` : '') +
+        ['eax', 'ebx', 'ecx', 'edx', 'esi', 'edi', 'ebp', 'esp'].map(n => ` ${n}=${hex(g[n] || 0)}`).join('');
+    }
+    if (!ex || !ex.get_dbg_prev_eip) return '';
     const prev = ex.get_dbg_prev_eip() >>> 0;
     const prev2 = ex.get_dbg_prev2_eip ? ex.get_dbg_prev2_eip() >>> 0 : 0;
     // The registers as the last block left them. A NULL call is almost always
@@ -3165,6 +3256,8 @@ class WineAssembly {
     // An explicitly armed Redline launch cannot drop its admission request
     // across an await or silently continue through cooperative fallback.
     const redlineStartup = typeof window !== 'undefined' && window.WINE_REDLINE_STARTUP;
+    if (this._d3dimGpsObservation) await this._d3dimGpsObservation.cancel('process-reinitialized');
+    this._d3dimGpsObservation=null;
     this._d3dimPublicationJoin?.retire('process-reinitialized');
     if (this._processObject.exited) {
       this._processObject = { wine: this, exited: false, exitCode: 259 };
@@ -3356,6 +3449,12 @@ class WineAssembly {
     const aggressiveStack = (uop && (this.aggressiveStack === true ||
       (window.WineSuperops && window.WineSuperops.aggressiveStack === true))) ? 1 : 0;
     if (this.instance.exports.set_aggressive_stack) this.instance.exports.set_aggressive_stack(aggressiveStack);
+    // ?uop-sse: kind 34, the XMM forms in the tier (opt-in, compile-time).
+    const uopSse = (uop && window.WineSuperops && window.WineSuperops.uopSse === true) ? 1 : 0;
+    if (uopSse && this.instance.exports.set_uop_sse) this.instance.exports.set_uop_sse(1);
+    const smcSameBlock = (this.smcSameBlock === true ||
+      (window.WineSuperops && window.WineSuperops.smcSameBlock === true)) ? 1 : 0;
+    if (this.instance.exports.set_smc_same_block) this.instance.exports.set_smc_same_block(smcSameBlock);
     // Trace heads: hot heads with no back edge become forward traces
     // (07e $uc_form_trace) instead of no-backedge declines. On by default;
     // ?no-uop-trace-heads turns them off.
@@ -3380,6 +3479,8 @@ class WineAssembly {
     if (this.instance.exports.set_cpu_sse) this.instance.exports.set_cpu_sse(cpuSSE);
     const presentCap = Math.max(0, this.presentCap | 0);
     if (this.instance.exports.set_present_cap) this.instance.exports.set_present_cap(presentCap);
+    const spinParkK = Number.isInteger(this.spinParkK) ? this.spinParkK : null;
+    if (spinParkK !== null && this.instance.exports.set_spin_park_k) this.instance.exports.set_spin_park_k(spinParkK);
     const presentPaceMode = this.presentPace === 'deadline' ? 0 : 1;
     if (this.instance.exports.set_present_pace_mode) {
       this.instance.exports.set_present_pace_mode(presentPaceMode);
@@ -3427,11 +3528,10 @@ class WineAssembly {
         throw error;
       }
     }
-    // D3DIM (DX2-7) triangles on WebGL instead of the WAT software rasterizer.
-    // The executor belongs to whichever thread owns the guest instance, so the
-    // Worker builds its own (lib/guest-worker.js) and this is the cooperative
-    // case only — with a guest Worker running, this.instance executes nothing.
-    if (window.WINE_D3DIM_GPU === true && !this.guestWorker) this._startD3DIMGpu();
+    // D3DIM (DX2-7) is always GPU stream v2: the WAT producer lowers it and
+    // host-imports' gpu_stream_kick builds the bridge on the first kick, on
+    // the executor the page's GPU select names (WebGL, falling back to the
+    // software executor on a device without it).
     // In real-thread mode slot 0 owns a second WASM instance in a Worker.
     // Configure that live decoder too; the browser-thread instance above is
     // then only an ownership token and host-call mirror.
@@ -3451,6 +3551,12 @@ class WineAssembly {
       if (this.instance.exports.set_aggressive_stack) {
         await this.guestWorker.callExport('set_aggressive_stack', aggressiveStack);
       }
+      if (uopSse && this.instance.exports.set_uop_sse) {
+        await this.guestWorker.callExport('set_uop_sse', uopSse);
+      }
+      if (this.instance.exports.set_smc_same_block) {
+        await this.guestWorker.callExport('set_smc_same_block', smcSameBlock);
+      }
       if (this.instance.exports.set_uop_trace_heads) {
         await this.guestWorker.callExport('set_uop_trace_heads', uopTraceHeads);
       }
@@ -3463,6 +3569,9 @@ class WineAssembly {
       }
       if (this.instance.exports.set_present_cap) {
         await this.guestWorker.callExport('set_present_cap', presentCap);
+      }
+      if (spinParkK !== null && this.instance.exports.set_spin_park_k) {
+        await this.guestWorker.callExport('set_spin_park_k', spinParkK);
       }
       if (this.instance.exports.set_present_pace_mode) {
         await this.guestWorker.callExport('set_present_pace_mode', presentPaceMode);
@@ -3492,12 +3601,11 @@ class WineAssembly {
       // cannot quietly disagree. The rest of the options are per-thread by
       // nature: this worker's own instance, and its id.
       const wi = self.getImports(Object.assign(processSharedCtx(mainCtx), {
-        d3d9Bridge: mainCtx.d3d9Bridge,
         // Cooperative threads share the in-page WebGL D3DIM owner, calling it
         // with their own instance's exports (describe/decode scratch).
-        d3dCommands: self.d3dimGpu ? {
-          call: (...args) => self.d3dimGpu.callForExports(workerInstance?.exports, ...args),
-        } : null,
+        // D3DIM on GPU stream v2 needs no host command object: every
+        // instance produces into the one shared ring (src/09abg-d3dim-gps.wat).
+        d3dCommands: null,
         detached: true,
         instance: () => workerInstance || self.instance,
         exports: () => workerInstance ? workerInstance.exports : self.instance.exports,
@@ -3505,7 +3613,9 @@ class WineAssembly {
       }));
       wi.__setInstance = (instance) => { workerInstance = instance; };
       wi.__initializeCooperative = () => {
-        if (self.d3dimGpu) self.d3dimGpu.attachCooperative(workerInstance.exports);
+        // Siblings share the ring, so CPU barriers must be global ones.
+        self.instance.exports.d3dim_gpu_cooperative_enable();
+        workerInstance.exports.d3dim_gpu_cooperative_enable();
       };
       wi.host.memory = self.memory;
       const markAudioThread = () => {
@@ -3572,7 +3682,6 @@ class WineAssembly {
       // help context after init().
       getVfs: () => (self._helpCtx && self._helpCtx.vfs) || null,
       fillIoRead: (vfs, pending) => self._fillParkedRead(vfs, pending),
-      onRenderWait: token => self.hostCtx.waitD3DRender(token),
       hasMessage: () => !!(self.renderer && self.renderer.inputQueue && self.renderer.inputQueue.length),
       now: () => self.renderer && self.renderer._profileNow ? self.renderer._profileNow() : Date.now(),
       waitNow: () => self._guestAudioClockRawMs(self.hostCtx && self.hostCtx.sharedAudio),
@@ -3635,6 +3744,8 @@ class WineAssembly {
     this.threadManager.recordInheritedWasmGlobal('set_x87_affine_fusion', x87Fusion);
     this.threadManager.recordInheritedWasmGlobal('set_uop', uop);
     this.threadManager.recordInheritedWasmGlobal('set_aggressive_stack', aggressiveStack);
+    this.threadManager.recordInheritedWasmGlobal('set_uop_sse', uopSse);
+    this.threadManager.recordInheritedWasmGlobal('set_smc_same_block', smcSameBlock);
     this.threadManager.recordInheritedWasmGlobal('set_uop_trace_heads', uopTraceHeads);
     // The bisect mask has to reach every guest thread for the same reason the
     // fold flags do: a thread decodes in its own instance, so a mask set only
@@ -3646,6 +3757,7 @@ class WineAssembly {
     }
     this.threadManager.recordInheritedWasmGlobal('set_cpu_sse', cpuSSE);
     this.threadManager.recordInheritedWasmGlobal('set_present_cap', presentCap);
+    if (spinParkK !== null) this.threadManager.recordInheritedWasmGlobal('set_spin_park_k', spinParkK);
     this.threadManager.recordInheritedWasmGlobal('set_present_pace_mode',
       this.presentPace === 'deadline' ? 0 : 1);
 
@@ -3925,49 +4037,6 @@ class WineAssembly {
     }
   }
 
-  // Attach the D3DIM WebGL executor to the main-thread instance.
-  //
-  // It renders into its own offscreen canvas and its fence reads the result
-  // back into the guest's DIB, so the renderer keeps presenting exactly the
-  // surface it presents for the software rasterizer. Nothing else in the
-  // compositing path changes, and a device with no WebGL keeps the software
-  // path rather than failing to launch.
-  _startD3DIMGpu() {
-    if (this.d3dimGpu) return this.d3dimGpu;
-    const gpu = typeof window !== 'undefined' && window.D3DIMGpu;
-    if (!gpu || !this.instance.exports.d3dim_gpu_cooperative_enable) {
-      this.logToUI('[d3dim-gpu] lib/d3dim-gpu.js not loaded — software D3DIM');
-      return null;
-    }
-    try {
-      const self = this;
-      this.d3dimGpu = new gpu.D3DIMGpu({
-        getExports: () => self.instance.exports,
-        getMemory: () => self.memory.buffer,
-        // This executor runs on the guest main thread's own instance, so a
-        // Flip may queue its readback and swap the chain here (d3dim-gpu.js
-        // _flip); the shared render Worker keeps the synchronous Flip.
-        asyncFlip: true,
-        createCanvas: (width, height) => {
-          const canvas = document.createElement('canvas');
-          canvas.width = width; canvas.height = height;
-          return canvas;
-        },
-        onError: message => { console.error(message); self.logToUI(message); },
-      });
-      if (this.hostCtx) this.hostCtx.d3dCommands = {
-        call: (...args) => this.d3dimGpu.callForExports(this.instance.exports, ...args),
-      };
-      this.instance.exports.d3dim_gpu_enable(1);
-      this.logToUI('[d3dim-gpu] D3DIM draws on WebGL');
-      return this.d3dimGpu;
-    } catch (error) {
-      this.d3dimGpu = null;
-      this.logToUI(`[d3dim-gpu] unavailable: ${error.message} — software D3DIM`);
-      return null;
-    }
-  }
-
   // EXPERIMENTAL: run the guest's main thread in a Worker.
   //
   // Only when the page asked for it AND the document is cross-origin isolated,
@@ -4054,7 +4123,8 @@ class WineAssembly {
           window.__waTraceCategories.has('dx')) &&
           !(window.__waTraceHostNames && [...window.__waTraceHostNames].includes('dx_trace')),
         d3dRenderWorker: window.WINE_D3D_RENDER_WORKER === true,
-        d3dimGpu: window.WINE_D3DIM_GPU === true,
+        // The D3DIM executor the page's GPU select names: WebGL unless Software.
+        d3dimGpu: !(window.WineD3D && window.WineD3D.renderer === 'software'),
         d3dimLazySync: window.WINE_D3DIM_LAZY_SYNC !== false,
         sharedRenderWorker: true,
         createRenderEndpoint: options => self._createRenderWorkerEndpoint(options),
@@ -4931,24 +5001,39 @@ class WineAssembly {
       // Guest execution (DllMain runs) must happen on the thread that owns the
       // instance. registerDllResources stays here: it is host bookkeeping over
       // bytes this thread already has.
-      const register = opts.registerDllResources;
-      delete opts.registerDllResources;
       results = await this.guestWorker.loadDlls(readyConfigs, exeBytes, opts);
-      if (register) register(readyConfigs, results);
     } else {
       opts.advanceGuestTime = ms => this._advanceGuestTickMs(ms,
         this.hostCtx && this.hostCtx.sharedAudio);
       // A LoadLibraryA from inside a DllMain (UBER.DLL loading Myth's
-      // modules\TCPIP.DLL) must be serviced in place: callDllMain is
-      // synchronous. Only resident bytes qualify; anything needing a fetch
-      // falls back to the async yield path as before.
-      const onLoadLibraryYield = ex => ProcessBoot.serviceLoadLibraryYieldSync({
-        exports: ex, memoryBuffer: this.memory.buffer, resourceHost: this, log: console.log,
-        advanceGuestTime: opts.advanceGuestTime, onLoadLibraryYield,
-        findDllSync: (fileName, fullName) => this._findDllBytesSync(fileName, fullName),
-      });
-      opts.onLoadLibraryYield = onLoadLibraryYield;
-      results = _loadDlls(this.instance.exports, this.memory.buffer, exeBytes, readyConfigs, console.log, opts);
+      // modules\TCPIP.DLL), or the 16-bit companion COMCTL32's DllMain
+      // thunk-connects to, is serviced while that initializer stays parked.
+      // This page can await its lookups, so it uses the owned asynchronous
+      // loader -- the same one the guest Worker runs -- instead of a
+      // synchronous resolver that can only answer from resident bytes.
+      const _loadDllsAsync = typeof DllLoader !== 'undefined' && DllLoader.loadDllsAsync;
+      if (_loadDllsAsync) {
+        opts.onGateWait = owner => this._advanceDllCallbackOwner(owner);
+        opts.onLoadLibraryYield = async ex => {
+          await ProcessBoot.handleLoadLibraryYield({
+            onDllCallbackGateWait: owner => this._advanceDllCallbackOwner(owner),
+            exports: ex, memoryBuffer: this.memory.buffer, resourceHost: this, log: console.log,
+            advanceGuestTime: opts.advanceGuestTime,
+            findDll: (fileName, fullName) => this._findDllBytes(fileName, fullName, { exeDir: true }),
+            findDllSync: (fileName, fullName) => this._findDllBytesSync(fileName, fullName),
+          });
+          return true;
+        };
+        results = await _loadDllsAsync(this.instance.exports, this.memory.buffer, exeBytes, readyConfigs, console.log, opts);
+      } else {
+        const onLoadLibraryYield = ex => ProcessBoot.serviceLoadLibraryYieldSync({
+          exports: ex, memoryBuffer: this.memory.buffer, resourceHost: this, log: console.log,
+          advanceGuestTime: opts.advanceGuestTime, onLoadLibraryYield,
+          findDllSync: (fileName, fullName) => this._findDllBytesSync(fileName, fullName),
+        });
+        opts.onLoadLibraryYield = onLoadLibraryYield;
+        results = _loadDlls(this.instance.exports, this.memory.buffer, exeBytes, readyConfigs, console.log, opts);
+      }
     }
     // Where a `module+0xVA` probe in the browser gets its arithmetic from. The
     // original image base is only on disk: the loader copies sections, not the
@@ -5375,11 +5460,32 @@ class WineAssembly {
     if (!this.renderer || !this._hwndBase) return;
     const lo = this._hwndBase;
     const hi = lo + 0x10000;
+    const removed = new Set();
     for (const hwnd of Object.keys(this.renderer.windows)) {
       const h = Number(hwnd);
       if (h >= lo && h < hi) {
+        removed.add(this.renderer.windows[hwnd]);
         delete this.renderer.windows[hwnd];
       }
+    }
+    this._dropRendererWindowRefs(removed);
+  }
+
+  // A window record carries its app's wasm and wasmMemory, and the renderer
+  // keeps single-window pointers (_foregroundWindow, drag/hover/capture
+  // state, ...) that only the guest's own DestroyWindow clears. A stop from
+  // the shell (the phone's close button) removes the records without that, so
+  // any such field left pointing at one pinned the app's whole 512MB: heap
+  // snapshot after closing Quake III, TouchControls._renderer.
+  // _foregroundWindow.wasmMemory. Null every renderer field that holds a
+  // removed record rather than naming them.
+  _dropRendererWindowRefs(removed) {
+    const r = this.renderer;
+    if (!r || !removed || !removed.size) return;
+    for (const key of Object.keys(r)) {
+      if (key === 'windows') continue;
+      const v = r[key];
+      if (v && typeof v === 'object' && removed.has(v)) r[key] = null;
     }
   }
 
@@ -5516,7 +5622,23 @@ class WineAssembly {
   }
 
   stop(options = {}) {
+    this._d3dimGpsObservation?.cancel('process-retired');
+    this.renderer?.failCurrentDisplayCapture?.({ instance: this.instance, processId: this.processId },
+      new Error('Current display capture owner stopped'));
     this._d3dimPublicationJoin?.retire('process-retired');
+    // Drop this incarnation's queued input in place: publishers retain the
+    // queue array. A reused HWND/PID must never replay its keys or pointer edges.
+    const queue = this.renderer && this.renderer.inputQueue;
+    if (queue) {
+      let write = 0;
+      for (const event of queue) {
+        if (event && (event.keyboardProcess === this._processObject ||
+            event.pointerProcess === this._processObject)) continue;
+        queue[write++] = event;
+      }
+      queue.length = write;
+    }
+    this._lastInputEvent = null;
     if (!this._processObject.exited) {
       this._processObject.exited = true;
       this._processObject.exitCode = (this._exitCode ?? 0) >>> 0;
@@ -5548,6 +5670,20 @@ class WineAssembly {
     // close over this WineHost, and a WineHost owns a 512MB shared memory.
     // Same leak the DX rAF chain had.
     this._cancelDelayedStep();
+    // The step channel's listener captures this host, and a port with a
+    // listener stays alive while its channel is open, so an unclosed channel
+    // kept every stopped host (and, after an OpenGL app, its guest memory)
+    // reachable from the browser forever. Null, not undefined: _postStep then
+    // falls back to setTimeout rather than opening a new channel.
+    this._pendingStep = null;
+    if (this._stepListenPort) {
+      try { this._stepListenPort.onmessage = null; this._stepListenPort.close(); } catch (_) {}
+    }
+    if (this._stepPort) {
+      try { this._stepPort.close(); } catch (_) {}
+    }
+    this._stepListenPort = null;
+    this._stepPort = null;
     this._cancelVblankWait();
     this._frozenUnregister();
     this._pausedStep = null;
@@ -5587,7 +5723,9 @@ class WineAssembly {
         this._removeAppWindows();
       } else {
         this.renderer._exited = true;
+        const removed = new Set(Object.values(this.renderer.windows));
         this.renderer.windows = {};
+        this._dropRendererWindowRefs(removed);
       }
     }
     // Notify whether or not `running` was still set. The listener is
@@ -5713,7 +5851,7 @@ class WineAssembly {
             const ctx = this.hostCtx;
             // Defer invocation as well as awaiting: one synchronous close error
             // must not prevent the remaining API endpoints from retiring.
-            const retirements = ['closeGlide', 'closeD3DRender', 'closeGLRender', 'closeD3DIMRender']
+            const retirements = ['closeGlide', 'closeGLRender', 'closeD3DIMRender']
               .filter(name => ctx && typeof ctx[name] === 'function')
               .map(name => Promise.resolve().then(() => ctx[name]()));
             const results = await Promise.allSettled(retirements);
@@ -5739,7 +5877,6 @@ class WineAssembly {
           for (const error of errors) this.logToUI(`[render] cleanup reported: ${error && error.message}`);
           if (manager) await manager.stop();
           this._renderWorkerRetired = true;
-          this._d3dRenderRetired = true;
           this._renderWorkerManager = null;
           this._renderWorkerManagerReady = null;
           if (this._stopped) this._releaseGuestMemory();
@@ -5763,19 +5900,6 @@ class WineAssembly {
       catch (error) { this.logToUI(`[GL] final flush failed: ${error && error.message}`); }
       this._glCommandsRetired = true;
     }
-    const bridge = this.hostCtx && this.hostCtx.d3d9Bridge;
-    if (bridge && bridge.asyncSoftware && bridge.workerReady && !this._d3dRenderRetired) {
-      if (!this._d3dRenderRetirement) this._d3dRenderRetirement = this.hostCtx.closeD3DRender().then(() => {
-        this._d3dRenderRetired = true;
-        if (this._stopped) this._releaseGuestMemory();
-      }, error => {
-        // Do not claim native allocations were reclaimed after an orphaned
-        // worker exit. Keep the owner reachable for diagnostics/recovery.
-        this._d3dRenderRetirementError = error;
-        this.logToUI(`[render] retirement failed: ${error && error.message}`);
-      });
-      return;
-    }
     this._deleteOwnSurfacePresentations();
     const renderer = this.renderer;
     if (renderer) {
@@ -5788,13 +5912,32 @@ class WineAssembly {
       // windows left the last app to hold focus keeps its instance alive.
       if (renderer._keyboardInputWasm === this.instance) renderer._keyboardInputWasm = null;
       if (renderer._keyboardInputMemory === this.memory) renderer._keyboardInputMemory = null;
+      // The DirectInput edge clock is a closure over a getImports() scope, and
+      // that scope reaches the guest memory (dx_trace -> _dxMemoryBuffer). A
+      // Threads launch calls getImports() twice, so the hook the renderer
+      // holds is not necessarily from _hostImports: compare against the one
+      // this host last installed. Heap snapshot after a Threads-mode close:
+      // TouchControls._renderer._guestNowMs -> ... -> Memory, 512MB per app.
+      if (renderer._guestNowMs && renderer._guestNowMs === this._rendererGuestNowMs) {
+        renderer._guestNowMs = null;
+      }
     }
+    this._rendererGuestNowMs = null;
+    for (const release of this._importMemoryReleases || []) {
+      try { if (typeof release === 'function') release(); } catch (_) {}
+    }
+    this._importMemoryReleases = null;
     // The two paths a heap snapshot actually blamed after everything above
     // was already cleared: window's "unlock" audio listener -> _readVfsFile's
     // scope -> host imports -> .memory, and wineShell.stopAllApps -> a stale
     // WineAssembly -> _presentDxIfDirty -> the same host imports object.
     if (this._hostImports) this._hostImports.memory = null;
     this._hostImports = null;
+    // The whole imports object (host + gdi + ...), kept for the guest worker.
+    // The shell holds the last-launched host after it closes, and every gdi
+    // closure in here scopes the guest memory: wineShell.selectedRunSlice ->
+    // wine._mainImports.gdi.getClientOrigin -> _dxMemoryBuffer -> Memory.
+    this._mainImports = null;
     // Holds the same memory and instance plus one per worker thread.
     this.threadManager = null;
     this.guestWorker = null;
@@ -5834,10 +5977,6 @@ class WineAssembly {
     }
   }
 
-  async _createD3DRenderWorker() {
-    return this._createRenderWorkerConsumer({ api: 'neutral', backend: 'software' });
-  }
-
   _getRenderWorkerManager() {
     if (this._renderWorkerRetired || this._stopped) return Promise.reject(new Error('Render process is stopped'));
     if (this._renderWorkerManagerReady) return this._renderWorkerManagerReady;
@@ -5860,13 +5999,126 @@ class WineAssembly {
   async _createRenderWorkerEndpoint(options) {
     const manager = await this._getRenderWorkerManager();
     const endpoint = manager.createEndpoint(options);
-    await endpoint.ready;
-    return endpoint;
+    try {
+      await endpoint.ready;
+      if (options.api === 'd3dim-gps' && this._d3dimGpsObservation)
+        await this._d3dimGpsObservation.bind(endpoint);
+      return endpoint;
+    } catch (error) {
+      await endpoint.terminate();
+      throw error;
+    }
   }
 
-  async _createRenderWorkerConsumer(options) {
-    if (typeof D3DCommandStream === 'undefined') throw new Error('Render command stream is unavailable');
-    return new D3DCommandStream.WorkerConsumer(await this._createRenderWorkerEndpoint(options));
+  async prepareD3dimGpsPublicationObservation({ maxRecords = 256, boundaryTimeoutMs = 1000,
+      creationTimeoutMs = 5000 } = {}) {
+    if (this._d3dimGpsObservation || this._d3dimPublicationJoin || this._d3dimPublicationArming ||
+        this._stopped || !this.guestWorker || !this.threadManager || !this.renderer || !this.instance?.nativeInstance)
+      throw new Error('idle instrumented GPS production owner required');
+    if (!Number.isInteger(maxRecords) || maxRecords < 1 || maxRecords > 4096 ||
+        !Number.isInteger(boundaryTimeoutMs) || boundaryTimeoutMs < 1 || boundaryTimeoutMs > 5000 ||
+        !Number.isInteger(creationTimeoutMs) || creationTimeoutMs < 1 || creationTimeoutMs > 20000)
+      throw new Error('bounded GPS preparation required');
+    const guest=this.guestWorker, link=guest.link, threads=this.threadManager, instance=this.instance;
+    const memory=this.memory, renderer=this.renderer, processId=this.processId;
+    const epoch=new RenderWorker.WriterEpoch();
+    const storage=()=>new RenderWorker.SurfaceVersionJournal(new SharedArrayBuffer(maxRecords*65536),
+      new SharedArrayBuffer(4*(16+2*1024*1024)));
+    const journal=storage(), synchronousJournal=storage();
+    const ownerScope=`process:${processId}:endpoint:${link.endpointIdentity}:gps`;
+    const synchronousOwner={scope:ownerScope+':synchronous',endpointId:link.endpointIdentity,generation:link.endpointIdentity};
+    let boundary, releaseWriters, registration, admission, synchronousArm;
+    const ownerIds=new WeakMap();let nextOwnerId=0;
+    const primitive=value=>{
+      if(value==null)return null;
+      if(typeof value==='boolean')return value;
+      if(typeof value==='number')return Number.isFinite(value)?value:null;
+      if(typeof value==='string')return value.slice(0,80);
+      return typeof value;
+    };
+    const ownerId=value=>{
+      if(!value||!['object','function'].includes(typeof value))return primitive(value);
+      if(!ownerIds.has(value))ownerIds.set(value,++nextOwnerId);
+      return ownerIds.get(value);
+    };
+    const validateOwner=(requireIdleHost=false)=>{
+      let failed;
+      const rejected=(name,value)=>{if(value){failed=name;return true;}return false;};
+      // Preserve the admission guard's short circuit order and thrown errors.
+      if (rejected('stopped',this._stopped) || rejected('guest',this.guestWorker!==guest) ||
+          rejected('link',guest.link!==link) || rejected('threads',this.threadManager!==threads) ||
+          rejected('instance',this.instance!==instance) || rejected('memory',this.memory!==memory) ||
+          rejected('renderer',this.renderer!==renderer) || rejected('processId',this.processId!==processId) ||
+          rejected('hostWrites',requireIdleHost && this._d3dimHostWritesInFlight) || rejected('mainInstance',threads.mainInstance!==instance) ||
+          rejected('localExports',guest.localMainExports && guest.localMainExports()!==instance.exports) ||
+          rejected('participants',admission && !admission.sameParticipants()) ||
+          rejected('epochInvalid',Atomics.load(epoch.words,2))) {
+        let detail='';
+        try {
+          const expected={guest:ownerId(guest),link:ownerId(link),threads:ownerId(threads),
+            instance:ownerId(instance),memory:ownerId(memory),renderer:ownerId(renderer),
+            processId:primitive(processId),epoch:ownerId(epoch),endpoint:primitive(link.endpointIdentity)};
+          const actual={guest:ownerId(this.guestWorker),link:ownerId(guest.link),threads:ownerId(this.threadManager),
+            instance:ownerId(this.instance),memory:ownerId(this.memory),renderer:ownerId(this.renderer),
+            processId:primitive(this.processId),epoch:ownerId(epoch),endpoint:primitive(guest.link?.endpointIdentity),
+            hostWrites:primitive(this._d3dimHostWritesInFlight||0),epochActive:Atomics.load(epoch.words,0),
+            epochVersion:Atomics.load(epoch.words,1),epochInvalid:Atomics.load(epoch.words,2)};
+          detail=' '+JSON.stringify({failed:[failed],expected,actual});
+        } catch (_) { /* Optional diagnostics must not replace the primary rejection. */ }
+        throw new Error('GPS preparation owner retired/replaced or epoch invalid'+detail);
+      }
+    };
+    this._d3dimPublicationArming=true;
+    try {
+      if(this.running)await new Promise((resolve,reject)=>{
+        const timer=setTimeout(()=>reject(new Error('GPS preparation idle boundary timed out')),boundaryTimeoutMs);
+        boundary={continuation:null,enter:(step,delayMs)=>{
+          boundary.continuation={step,delayMs};clearTimeout(timer);resolve();
+        }};
+        this._d3dimPublicationArmBoundary=boundary;
+      });
+      releaseWriters=threads.holdWriterObservationBoundary();
+      // Attachment must precede every writer. Later endpoint binding runs
+      // inside the already observed gpu_stream_kick host call; it installs
+      // the join and grants no permission to read an active source writer.
+      admission=await guest.attachWriterObservationAtBoundary(epoch,{threads,timeoutMs:boundaryTimeoutMs,
+        validateOwner:()=>validateOwner(true)});
+      this._d3dimWriterObservation=epoch;
+      synchronousArm=await link._ask({t:'synchronousFlipObservation',action:'arm',endpointIdentity:link.endpointIdentity,
+        owner:synchronousOwner,maxRecords,journalBuffer:synchronousJournal.buffer,retainedBuffer:synchronousJournal.retainedBuffer});
+      validateOwner(true);
+      if(!epoch.snapshot())throw new Error('GPS preparation requires an idle writer boundary');
+      registration=new RenderWorker.PreparedGpsObservation({epoch,timeoutMs:creationTimeoutMs,validateOwner,
+        options:{ownerGeneration:ownerScope,maxRecords,writerEpochBuffer:epoch.buffer,
+          surfaceVersionBuffer:journal.buffer,retainedSurfaceBuffer:journal.retainedBuffer},
+        onArm:(endpoint,receipt)=>{
+          const join=new RenderWorker.SurfacePublicationJoin({epoch,journal,memory,ownerScope,renderer,
+            workerSlot:link.slot,endpointId:endpoint.id,owner:receipt.owner,observationGeneration:receipt.generation});
+          join.synchronous=new RenderWorker.SurfacePublicationJoin({epoch,journal:synchronousJournal,memory,
+            ownerScope:synchronousOwner.scope,renderer,workerSlot:link.slot,endpointId:link.endpointIdentity,
+            owner:synchronousOwner,observationGeneration:synchronousArm.generation});
+          this._d3dimPublicationJoin=join;return join;
+        },onClose:()=>link._stopping||link._stopped?undefined:link._ask({t:'synchronousFlipObservation',action:'close'})});
+      this._d3dimGpsObservation=registration;
+      registration.unsubscribe=link.onRetiring(()=>registration.cancel('guest-owner-retired'));
+      const endpoint=this.hostCtx?.getD3dimBridge?.()?.endpoint;
+      if(endpoint)await registration.bind(endpoint);
+      return registration;
+    } catch(error) {
+      epoch.invalidate();
+      if(registration)await registration.cancel(String(error));
+      else if(synchronousArm)await link._ask({t:'synchronousFlipObservation',action:'close'}).catch(()=>{});
+      throw error;
+    } finally {
+      this._d3dimPublicationArming=false;releaseWriters?.();
+      if(boundary&&this._d3dimPublicationArmBoundary===boundary){
+        this._d3dimPublicationArmBoundary=null;
+        const next=boundary.continuation;
+        if(next&&this.running&&!this._stopped&&this.guestWorker===guest&&this.instance===instance&&
+            this.threadManager===threads&&this.memory===memory&&this.renderer===renderer&&
+            this.processId===processId&&guest.link===link)this._scheduleStep(next.step,next.delayMs);
+      }
+    }
   }
 
   async armQuake2WriterObservation(options = {}) {
@@ -5883,7 +6135,7 @@ class WineAssembly {
     }});
   }
 
-  async armD3dimPublicationObservation({ maxRecords = 256, boundaryTimeoutMs = 1000 } = {}) {
+  async armD3dimPublicationObservation({ maxRecords = 256, boundaryTimeoutMs = 1000, synchronousSource = false } = {}) {
     if (this._d3dimPublicationJoin || this._d3dimPublicationArming || this._stopped ||
         !this.guestWorker || !this.renderer || !this.instance?.nativeInstance)
       throw new Error('publication observation requires an idle instrumented production process');
@@ -5909,7 +6161,7 @@ class WineAssembly {
     // Reserve admission through the render acknowledgement. A second arm must
     // not replace and invalidate the epoch the first request already installed.
     this._d3dimPublicationArming = true;
-    let boundary;
+    let boundary, releaseWriters;
     try {
       if (this.running) {
         // A live process normally has an unanswered slice. Do not attach to
@@ -5927,30 +6179,45 @@ class WineAssembly {
           this._d3dimPublicationArmBoundary = boundary;
         });
       }
-      if (this._stopped || this.guestWorker !== guest || this.threadManager !== threads ||
-          this.memory !== memory || this.processId !== processId ||
-          this.instance !== instance || this.renderer !== renderer || guest.link !== link ||
-          link._renderLegacyEndpoint !== endpoint || endpoint.closed || this._d3dimHostWritesInFlight ||
-          threads.mainInstance !== instance || (guest.localMainExports && guest.localMainExports() !== instance.exports))
-        throw new Error('owner changed before publication observation boundary');
-      this.guestWorker.setWriterObservation(epoch);
-      this.threadManager.setWriterObservation(epoch);
+      releaseWriters = threads.holdWriterObservationBoundary();
+      const validateOwner = () => {
+        if (this._stopped || this.guestWorker !== guest || this.threadManager !== threads ||
+            this.memory !== memory || this.processId !== processId ||
+            this.instance !== instance || this.renderer !== renderer || guest.link !== link ||
+            link._renderLegacyEndpoint !== endpoint || endpoint.closed || this._d3dimHostWritesInFlight ||
+            threads.mainInstance !== instance || (guest.localMainExports && guest.localMainExports() !== instance.exports))
+          throw new Error('owner changed before publication observation boundary');
+      };
+      const admission = await guest.attachWriterObservationAtBoundary(epoch, {
+        threads, timeoutMs: boundaryTimeoutMs, validateOwner });
       this._d3dimWriterObservation = epoch;
       const sourceOwner = await endpoint.producerObservation('arm', { ownerGeneration: ownerScope,
         maxRecords, writerEpochBuffer: epoch.buffer, surfaceVersionBuffer: journal.buffer,
         retainedSurfaceBuffer: journal.retainedBuffer });
+      // A separate producer and journal belong to the actual main guest
+      // Worker. Renderer records cannot claim its synchronous native swaps.
+      const synchronousJournal = synchronousSource && new RenderWorker.SurfaceVersionJournal(new SharedArrayBuffer(maxRecords * 65536),
+        new SharedArrayBuffer(4 * (16 + 2 * 1024 * 1024)));
+      const synchronousOwner = { scope: ownerScope + ':synchronous', endpointId: link.endpointIdentity,
+        generation: link.endpointIdentity };
+      const synchronousArm = synchronousSource && await link._ask({ t: 'synchronousFlipObservation', action: 'arm',
+        endpointIdentity: link.endpointIdentity, owner: synchronousOwner, maxRecords,
+        journalBuffer: synchronousJournal.buffer, retainedBuffer: synchronousJournal.retainedBuffer });
       if (this._stopped || this.guestWorker !== guest || this.threadManager !== threads ||
           this.memory !== memory || this.processId !== processId ||
           this.instance !== instance || this.renderer !== renderer || guest.link !== link ||
           link._renderLegacyEndpoint !== endpoint || endpoint.closed || threads.mainInstance !== instance ||
           (guest.localMainExports && guest.localMainExports() !== instance.exports) ||
-          !epoch.snapshot() || sourceOwner?.owner?.scope !== ownerScope ||
+          !admission.sameParticipants() || !epoch.snapshot() || sourceOwner?.owner?.scope !== ownerScope ||
           sourceOwner.owner.endpointId !== endpoint.id || !Number.isSafeInteger(sourceOwner.owner.generation) ||
           !Number.isSafeInteger(sourceOwner.generation)) throw new Error('owner changed while arming publication observation');
       const join = new RenderWorker.SurfacePublicationJoin({ epoch, journal, memory,
         ownerScope, renderer: this.renderer, workerSlot: link.slot, endpointId: endpoint.id,
         owner: sourceOwner.owner, observationGeneration: sourceOwner.generation });
       this._d3dimPublicationJoin = join;
+      if (synchronousSource) join.synchronous = new RenderWorker.SurfacePublicationJoin({ epoch, journal: synchronousJournal, memory,
+        ownerScope: synchronousOwner.scope, renderer, workerSlot: link.slot, endpointId: link.endpointIdentity,
+        owner: synchronousOwner, observationGeneration: synchronousArm.generation });
       endpoint.addEventListener('message', event => {
         if (event.data.t === 'legacy-producer-completed') join.receipt(event.data);
       });
@@ -5962,6 +6229,7 @@ class WineAssembly {
       throw error;
     } finally {
       this._d3dimPublicationArming = false;
+      releaseWriters?.();
       if (boundary && this._d3dimPublicationArmBoundary === boundary) {
         this._d3dimPublicationArmBoundary = null;
         const next = boundary.continuation;
@@ -5991,17 +6259,6 @@ class WineAssembly {
       });
     }
     return this._mainIo.poll(this.instance.exports, this._helpCtx && this._helpCtx.vfs);
-  }
-
-  _beginD3DRenderWait(token) {
-    token |= 0;
-    if (token > -2) throw new Error('invalid D3D9 render wait token');
-    if (this._d3dMainWait && this._d3dMainWait.token === token) return this._d3dMainWait;
-    const wait = {token,done:false}; this._d3dMainWait = wait;
-    wait.promise = Promise.resolve().then(() => this.hostCtx.waitD3DRender(token))
-      .catch(error => this.logToUI(`[render] ${error && error.message}`))
-      .then(() => { wait.done = true; });
-    return wait;
   }
 
   _audioSchedulerNow() {
@@ -6231,12 +6488,6 @@ class WineAssembly {
           if (self.guestWorker.link.threadSendDepth > 0)
             return { threadSendPending: true, blocks: 0, ms: 0 };
           if(self.guestWorker.link._waveOffer) return {...self._workerLastSlice,blocks:0,ms:0,waveOfferPending:true};
-          const wait = self._d3dMainWait;
-          if (wait) {
-            if (!wait.done) return Object.assign({}, self._d3dParkedSlice, {blocks:0,ms:0});
-            self._d3dMainWait = null; self._d3dParkedSlice = null;
-            await self.guestWorker.callExport('clear_yield');
-          }
           // A main thread parked on a lazy ReadFile (yield 12): its fill runs in
           // the background (see the yield-12 branch below) and only this slice
           // waits for it -- the step, the wave pump and the other threads go on.
@@ -6342,6 +6593,10 @@ class WineAssembly {
         // When the slices came back — the reference a GetMessage park's
         // timer deadline is measured from (see the yield 7 branch).
         let perfSliceDoneAt = 0;
+        const endWorkerHostStep = !serial && self.threadManager?.backend === 'worker'
+          ? self.threadManager.beginWorkerHostStep(() => self.running && !self._stopped &&
+              !self._hiddenPaused && !self._paused && !self._frozen)
+          : null;
         try {
           if (typeof window !== 'undefined' && window.WINE_THREADS_SERIAL) {
             // Diagnostic only: the same slices, one at a time. A bug that appears
@@ -6353,6 +6608,7 @@ class WineAssembly {
             [r, threadsRun] = await Promise.all([runMainThenEnd(), runThreads()]);
           }
         } finally {
+          endWorkerHostStep?.();
           perfSliceDoneAt = WineAssembly._wallNow();
           endStep();
           if (self.threadManager) self.threadManager.workerLocalSleep = null;
@@ -6447,7 +6703,7 @@ class WineAssembly {
         self._presentAtBoundary(perf);
 
         if (!r.threadSendPending && !r.eip && !r.yield) {
-          self.logToUI(`--- Program exited (worker) --- ${self._exitSiteText()}`);
+          self.logToUI(`--- Program exited (worker) --- ${self._exitSiteText(r)}`);
           self.stop({ repaint: false });
           return;
         }
@@ -6550,9 +6806,6 @@ class WineAssembly {
         } else if (r.yield === 8) {
           await self.guestWorker.callExport('clear_yield');
           try { await self.guestWorker.callExport('vlan_pump'); } catch (_) {}
-        } else if (r.yield === 16) {
-          self._d3dParkedSlice = r;
-          self._beginD3DRenderWait(r.renderToken);
         } else if (r.yield === 12) {
           // io_wait: ReadFile parked on a provider-backed VFS entry (mounted
           // zip/iso, dropped File, remote URL over Range). The brokered fs
@@ -7037,6 +7290,11 @@ class WineAssembly {
 
   // Where every run loop used to present: the end of a completed slice.
   _presentAtBoundary(perf) {
+    // A current-display ticket armed while an otherwise clean Worker slice
+    // was executing needs no new frame. Service it at this ordinary unheld
+    // boundary, using live host queues (including shared DirectDraw damage).
+    // Do not let a closing host certify its retained display.
+    this._serviceCurrentDisplayCapture();
     if (typeof requestAnimationFrame !== 'function') {
       const r = this.renderer;
       if (r && r._workerPublicationHeld && r._workerPublicationHeld()) {
@@ -7127,6 +7385,54 @@ class WineAssembly {
     return this.renderer.requestImmutableCapture(options === undefined ? undefined : {
       hwnd: options.hwnd, processId: this.processId, instance: this.instance,
     });
+  }
+
+  requestCurrentDisplayCapture(options) {
+    if (!this.renderer || !options) throw new Error('Current display capture requires a renderer and owner');
+    if (this._stopped || this.running === false) throw new Error('Current display capture owner is stopped');
+    // A reported native producer failure stays terminal for new observations,
+    // including requests made while its next guest slice is still running.
+    const producer = this.hostCtx?.getGlGpsBridge?.();
+    if (producer?.workerAsyncError) throw producer.workerAsyncError;
+    // A queued surface is not a completed display. Arm the existing capture
+    // transaction for its next ordinary unheld publication instead of refusing
+    // observation merely because the application keeps rendering. Never upload
+    // or flush here, and never read the in-flight guest-backed source.
+    const pendingHostPublication = Object.freeze({
+      dirty: !!this._dxDirty, lockDeferred: !!this._dxLockDeferred,
+      presentDue: !!this._presentFrameDue,
+    });
+    const renderer = this.renderer, instance = this.instance, processId = this.processId;
+    const ticket = renderer.requestCurrentDisplayCapture({
+      hwnd: options.hwnd, processId: this.processId, instance: this.instance,
+      pendingHostPublication,
+    });
+    // A producer may park after releasing its last writer. Reading a ticket
+    // must join that release even when no further guest slice/present occurs.
+    // This only services an already displayed, clean, unheld receipt; it
+    // neither schedules nor uploads anything. Retained complete tickets never
+    // revisit live state.
+    const service = () => {
+      if (ticket.status !== 'pending') return;
+      if (this.renderer !== renderer || this.instance !== instance || this.processId !== processId) {
+        renderer.failCurrentDisplayCapture({ instance, processId }, new Error('Current display host owner replaced'));
+        return;
+      }
+      this._serviceCurrentDisplayCapture();
+    };
+    return Object.freeze({
+      get status() { service(); return ticket.status; },
+      get error() { return ticket.error; },
+      read() { service(); return ticket.read(); },
+      cancel() { return ticket.cancel(); },
+    });
+  }
+
+  _serviceCurrentDisplayCapture() {
+    if (!this._stopped && this.running !== false && !this._presentFrameDue &&
+        !this._presentWanted() && this.renderer?.serviceCurrentDisplayCapture) {
+      this.renderer.serviceCurrentDisplayCapture();
+    }
   }
 
   // Upload the newest guest frame and composite, now. Called from the rAF,
@@ -7621,17 +7927,11 @@ class WineAssembly {
         if(!self.running) return;
         // Check if main thread is waiting
         if (self.threadManager) await self.threadManager.resolveMainThreadSend();
-        let renderWaiting = false;
-        if (self.instance.exports.get_yield_reason() === 16) {
-          const wait = self._beginD3DRenderWait(self.instance.exports.get_d3d_render_token());
-          if (wait.done) { self._d3dMainWait = null; self.instance.exports.clear_yield(); }
-          else renderWaiting = true;
-        }
         // A lazy-read park on the main thread (see _beginMainIoWait): until its
         // fill lands only the main guest thread waits; then the yield clears
         // and the same ReadFile re-enters.
         const ioWaiting = self.instance.exports.get_yield_reason() === 12 && self._pollMainIo();
-        const mainThreadWaiting = renderWaiting || ioWaiting || (self.threadManager &&
+        const mainThreadWaiting = ioWaiting || (self.threadManager &&
           (self._isMainExecutionSuspended() || self.threadManager.checkMainYield()));
         if (mainThreadWaiting) {
           mainParked = true;
@@ -7752,10 +8052,6 @@ class WineAssembly {
         }
         // Handle yield reasons
         const yieldReason = self.instance.exports.get_yield_reason();
-        if (yieldReason === 16) {
-          self._beginD3DRenderWait(self.instance.exports.get_d3d_render_token());
-          mainParked = true;
-        }
         if (yieldReason === 3) {
           await self.handleComDllLoad();
           if (self.running) { self._scheduleStep(step); }
@@ -8009,5 +8305,5 @@ for (const name of ['_loadWin16Dlls', '_stageWin16Module', 'loadDlls', 'handleCo
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { parseShellLaunchCommand, resolveShellLaunchPath, createWinExecReadiness };
+  module.exports = { parseShellLaunchCommand, resolveShellLaunchPath, createWinExecReadiness, createBrowserNativeInput };
 }

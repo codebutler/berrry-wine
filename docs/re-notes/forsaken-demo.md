@@ -2,6 +2,114 @@
 
 App id `forsaken_demo`, candidate `forsaken-demo` (registered 2026-10-11, w5).
 
+## November 21: missing-triangle report checked against the current renderer
+
+The [retained-report and native counterexample study](forsaken-missing-triangles-cause-20261121.md)
+confirms that the historical56 triangles are absent from a four-hit diagnostic,
+not demonstrated missing rasterization. Actual current immutable native render
+Workers draw all60 authored triangles, indexed and nonindexed; truncated4/59
+negative controls detect exactly56/one missing. The existing source/output
+separation regression also passes. No new renderer defect or runtime patch is
+proved, and no new original run was justified. The broader old whitening
+interval and ordinary Quit13 remain separate unresolved questions.
+
+## November 12: combat white viewport and joined state trace
+
+Current original combat on module`04c53419…` shows living movement and player
+damage/respawns, followed by a persistent white viewport on both recorded
+renderer owners. The [1645 WebGL trace](forsaken-paused-worker-20261112.md),
+commit `eec039872`, observes a complete state chain for the first retained
+post-corridor sampled-pixel transition to white. Live state before enqueue,
+owned and published packets, replay source/workspace and description all agree
+on additive ONE/ONE. Opaque restores reach live memory, then later natural
+writes enable additive state again before that draw. This excludes a state
+snapshot/replay mismatch for the joined witness; it does not establish why
+the guest writes those values or prove the intended rendering.
+
+Root independently rehashed326 recovered outputs, checked ten full PNGs and
+19 within-capture binding fields, inspected the corridor/respawn/white frames,
+and recomputed the190-drain analysis. All40263 observed next-boundary state
+readbacks match their requested values. There are no recorded boundary gaps,
+drops, errors or state mismatches. Startup CPU drops,15 ground-sample caps
+and two unjoined tail replay keys remain explicit. The sampled white transition
+precedes primary keydown; the later full-white frame follows primary/respawn,
+so no input-cause attribution follows. No rendering patch is justified.
+
+The observer's separate paused-worker startup failure is repaired in run-local
+helpers, with actual Chrome CPU/GPU bootstrap, encoder byte-identity and negative
+controls. That repair enables observation; it does not repair the white scene.
+Actual Chrome/browser/outer and local lifecycle waits/EOFs pass, and the box
+stops normally.
+
+The [1715 original-command trace](forsaken-native-additive-origin-20261112.md),
+commit `a51eacd69`, then matches all33723 observed state applications to
+explicit original Execute-buffer commands. The
+[1735 selector trace](forsaken-guest-state-selection-20261112.md), commit
+`9bae6e181`, shows that the original x87 compare deliberately selects the
+additive buffer when its float differs from zero. Root independently recomputed
+620 selected and1142 equal-restoration calls: CPU condition bits, branch,
+arguments and actual handle agree with zero mismatches. Static writers and
+vertex-color consumers support a death/respawn fade; live writer timing and
+intended visual duration remain unproved.
+
+Root checked297 recovered hashes, eleven full PNGs,19 identity fields and
+eight independently released trusted input pairs. The first retained sampled
+white draw precedes the first observed selector call and uses a different
+texture from the selected scene; preserve these as separate witnesses.
+Startup CPU drops,29 ground-sample caps and three unjoined tail keys preclude
+a global-first-white claim. Actual Chrome/browser and lifecycle waits pass;
+a separate unified wrapper exit143 remains unexplained. The box stops normally.
+Next: original texture provenance, uploaded/sampled texels and ordered prior
+target contents for one retained draw. No blend override or runtime patch is
+justified by the current evidence.
+
+The [1805 retained-texture analysis](forsaken-texture-target-provenance-20261112.md),
+commit `aae90a9d0`, identifies `SMLEXPL.PPM` at all16 retained native RGB565
+coordinates and matches the four triangles' atlas rectangles to `smlexpl.off`.
+The immediate preceding opaque draw supplies the sampled destination color;
+the target is not already white. Root independently recomputed the70-input,
+nine-source-pin analysis. These are sampled content and immediate ordering
+proofs, not a complete DIB/upload or live loader-copy proof. The inherited
+observer retains at most four covering triangles out of60 submitted, and
+ideal four-hit arithmetic is not an actual GPU fragment oracle. Next: complete
+coverage, actual sampling and depth context for one natural submission. No
+new original execution or runtime patch occurred in1805.
+
+The [1815 complete-draw study](forsaken-complete-fragment-coverage-20261112.md),
+commit `793bbfd56`, captures a different natural draw:14 triangles,42 vertices
+and the complete131072-byte uploaded texture, identical to the decoded cache.
+Actual pinned GL sampling and per-triangle native565 stores preserve its
+already-white incoming pixel under all16384 conservative depth outcomes.
+This explains that submission; individual depth visibility remains unknown.
+Root independently recomputed the complete analysis, checked868 sealed hashes,
+577 recovered paths,19 full PNGs/identity fields and13 trusted balanced key pairs,
+and inspected the native room and bright combat frame. Remote parents and
+durable manager/watchdogs close normally; the initial local caller143 owner
+join remains unknown. No renderer defect is proved.
+
+The historical onset still lacks56 of60 triangles: a retained count180 is not
+the full5760 vertex bytes. Ideal four-triangle arithmetic also omits native565
+rounding between triangles. Next: an unsaturated incoming pixel that naturally
+turns white, or its preceding whitening submission, with complete coverage,
+uploaded texture and unchanged target/depth context. A saturated later draw
+does not qualify the earlier transition.
+
+The [1845 unsaturated transition](forsaken-unsaturated-whitening-20261112.md),
+commit `c458e7c51`, then captures a complete fresh28-triangle submission and its
+full uploaded texture. Original color changes115,65,33 →231,146,66 →white match
+actual GL sampling and native565 rounding in every step. The changes prove
+triangles1 and3 passed depth; triangle13 arrives after saturation and remains
+ambiguous, with either outcome preserving white. Root independently recomputed
+the analysis with zero mismatches and checked881 sealed hashes,498 recovered
+paths and20 complete PNGs/19 fields. The retry retains12 trusted balanced input
+edges; the first attempt lacks a final global native-input export. Its3500ms
+request was refused before DOWN by the2000ms cap. Both boxes stop normally and
+their new local lifecycle waits pass. No renderer patch is justified by this
+fresh explained transition. Historical missing56 triangles and the broader
+old white interval remain unresolved; no global-first-white or input-cause
+attribution follows. The final fresh combat frame remains a readable room.
+Earlier paired evidence and limits: [combat and owner observations](forsaken-owner-enemy-20261112.md).
+
 ## Source and licence
 
 - archive.org item `FORSAKEN_201610`, `FORSAKEN.zip`: 42,762,069 bytes, SHA-1

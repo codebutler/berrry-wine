@@ -467,8 +467,91 @@
     (local $img i32) (local $img_w i32) (local $img_h i32) (local $img_x i32) (local $img_y i32)
     (local $parent i32)
     (local $click_on_focus_loss i32)
+    (local $click_generation i64)
 
     (local.set $state (call $wnd_get_state_ptr (local.get $hwnd)))
+
+    ;; BM_CLICK (Microsoft): deliver mouse DOWN/UP through the public window
+    ;; procedure so subclasses and the existing native activation path see
+    ;; the same transitions and parent BN_CLICKED. Bounded to native enabled
+    ;; push/default-push, checkbox/autocheckbox, three-state/auto-three-state
+    ;; and radio/autoradio controls (Microsoft WIN32.HLP, 1992-1994).
+    ;; No inactive-dialog policy: callers activate their dialog as documented.
+    (if (i32.eq (local.get $msg) (i32.const 0x00F5))
+      (then
+        (if (i32.or (i32.eqz (local.get $state))
+                    (i32.eqz (call $wnd_lookup_live (local.get $hwnd))))
+          (then (return (i32.const 0))))
+        (local.set $kind (i32.and (call $wnd_get_style (local.get $hwnd)) (i32.const 15)))
+        (if (i32.or
+              (i32.ne (i32.and (call $wnd_get_style (local.get $hwnd)) (i32.const 134217728)) (i32.const 0))
+              (i32.and (i32.gt_u (local.get $kind) (i32.const 6))
+                       (i32.ne (local.get $kind) (i32.const 9))))
+          (then (return (i32.const 0))))
+        (local.set $state_w (call $g2w (local.get $state)))
+        ;; Private bit11 owns this invocation across guest callbacks. A
+        ;; recursive BM_CLICK on this same button must not duplicate DOWN/UP.
+        (if (i32.and (call $btn_flags (local.get $state_w)) (i32.const 0x800))
+          (then (return (i32.const 0))))
+        (local.set $click_generation (call $wnd_lookup_generation (local.get $hwnd)))
+        (call $btn_set_flags (local.get $state_w)
+          (i32.or (call $btn_flags (local.get $state_w)) (i32.const 0x800)))
+        (block $click_done
+          ;; Resolve focus before entering the native DOWN handler, whose
+          ;; physical-input path assumes its state survives SetFocus. Focus
+          ;; callbacks may destroy this target or choose another focus winner.
+          (call $set_focus (local.get $hwnd))
+          (br_if $click_done
+            (i32.or (i32.ne (global.get $focus_hwnd) (local.get $hwnd))
+              (i32.or (i32.eqz (call $wnd_lookup_live (local.get $hwnd)))
+                (i32.or
+                  (i64.ne (call $wnd_lookup_generation (local.get $hwnd)) (local.get $click_generation))
+                  (i32.ne (call $wnd_get_state_ptr (local.get $hwnd)) (local.get $state))))))
+          (drop (call $wnd_send_message (local.get $hwnd)
+            (i32.const 0x0201) (i32.const 1) (i32.const 0)))
+          ;; DOWN can destroy/recreate the target. Never send UP or touch the
+          ;; retained state unless both the window lifetime and state survive.
+          (br_if $click_done (i32.or (i32.eqz (call $wnd_lookup_live (local.get $hwnd)))
+              (i32.or
+                (i64.ne (call $wnd_lookup_generation (local.get $hwnd)) (local.get $click_generation))
+                (i32.ne (call $wnd_get_state_ptr (local.get $hwnd)) (local.get $state)))))
+          (drop (call $wnd_send_message (local.get $hwnd)
+            (i32.const 0x0202) (i32.const 0) (i32.const 0))))
+        ;; UP/BN_CLICKED can reenter or destroy the control too.
+        (if (i32.and (call $wnd_lookup_live (local.get $hwnd))
+              (i32.and
+                (i64.eq (call $wnd_lookup_generation (local.get $hwnd)) (local.get $click_generation))
+                (i32.eq (call $wnd_get_state_ptr (local.get $hwnd)) (local.get $state))))
+          (then
+            (call $btn_set_flags (local.get $state_w)
+              (i32.and (call $btn_flags (local.get $state_w)) (i32.const -2049)))))
+        (return (i32.const 0))))
+
+    ;; BM_SETSTYLE: bounded native push/default-push transitions. Preserve
+    ;; unrelated style bits and all state except the default-border flag.
+    ;; This does not select a dialog default ID or touch sibling controls.
+    (if (i32.eq (local.get $msg) (i32.const 0x00F4))
+      (then
+        (local.set $kind (i32.and (call $wnd_get_style (local.get $hwnd)) (i32.const 15)))
+        (if (i32.and (i32.lt_u (local.get $kind) (i32.const 2))
+                    (i32.lt_u (local.get $wParam) (i32.const 2)))
+          (then
+            (drop (call $wnd_set_style (local.get $hwnd)
+              (i32.or (i32.and (call $wnd_get_style (local.get $hwnd)) (i32.const -16))
+                      (local.get $wParam))))
+            (if (local.get $state)
+              (then
+                (local.set $state_w (call $g2w (local.get $state)))
+                (call $btn_set_flags (local.get $state_w)
+                  (i32.or (i32.and (call $btn_flags (local.get $state_w)) (i32.const -5))
+                          (i32.shl (local.get $wParam) (i32.const 2))))))
+            ;; Only LOWORD(lParam) is the redraw BOOL (Microsoft contract).
+            (if (i32.and (local.get $lParam) (i32.const 0xFFFF))
+              (then
+                (call $invalidate_hwnd (local.get $hwnd))
+                (drop (call $wnd_send_message (local.get $hwnd)
+                  (i32.const 0x000F) (i32.const 0) (i32.const 0)))))))
+        (return (i32.const 0))))
 
     ;; WM_GETDLGCODE: report the actual button style, not the temporary
     ;; focused/default border paint flag. No input or check state is changed.
@@ -496,19 +579,31 @@
       (then
         (call $button_cancel_press (local.get $hwnd))
         (if (i32.and (i32.eq (local.get $msg) (i32.const 0x001F))
-              (i32.eq (global.get $capture_hwnd) (local.get $hwnd)))
+              (i32.eq (call $capture_live) (local.get $hwnd)))
           (then (drop (call $capture_replace (i32.const 0)))))
         (return (i32.const 0))))
 
-    ;; EDIT scrollbars are standard non-client strips. Messages sent through
+    ;; Hidden NC work is consumed by the message scan. Re-arm the caption at
+    ;; exposure so text changed while hidden is painted on its first show.
+    (if (i32.and
+          (i32.and (i32.eq (local.get $msg) (i32.const 0x0018))
+                   (i32.ne (local.get $wParam) (i32.const 0)))
+          (i32.eq (i32.and (call $wnd_get_style (local.get $hwnd))
+                           (i32.const 0x00C00000)) (i32.const 0x00C00000)))
+      (then (call $nc_flags_set (local.get $hwnd) (i32.const 1))))
+
+    ;; BUTTON captions and scrollbars are standard non-client areas. Messages sent through
     ;; the control dispatcher do not pass through DefWindowProc automatically,
     ;; so paint the border and both scrollbar styles here instead of leaving
     ;; their backing-surface pixels black.
     (if (i32.and
           (i32.eq (local.get $msg) (i32.const 0x0085)) ;; WM_NCPAINT
-          (i32.ne
-            (i32.and (call $wnd_get_style (local.get $hwnd)) (i32.const 0x00300000))
-            (i32.const 0)))
+          (i32.or
+            (i32.eq (i32.and (call $wnd_get_style (local.get $hwnd))
+                             (i32.const 0x00C00000)) (i32.const 0x00C00000))
+            (i32.ne
+              (i32.and (call $wnd_get_style (local.get $hwnd)) (i32.const 0x00300000))
+              (i32.const 0))))
       (then
         (call $defwndproc_do_ncpaint (local.get $hwnd))
         (return (i32.const 0))))
@@ -613,7 +708,7 @@
             (if (i32.ne (call $wnd_get_state_ptr (local.get $hwnd)) (local.get $state))
               (then (return (i32.const 0))))))
         (call $button_cancel_press (local.get $hwnd))
-        (if (i32.eq (global.get $capture_hwnd) (local.get $hwnd))
+        (if (i32.eq (call $capture_live) (local.get $hwnd))
           (then (drop (call $capture_replace (i32.const 0)))))
         (if (i32.and (i32.ne (local.get $click_on_focus_loss) (i32.const 0))
               (i32.eq (call $wnd_get_state_ptr (local.get $hwnd)) (local.get $state)))
@@ -669,7 +764,7 @@
         (if (i32.ne (local.get $wParam) (i32.const 9))
           (then
             (call $button_cancel_press (local.get $hwnd))
-            (if (i32.eq (global.get $capture_hwnd) (local.get $hwnd))
+            (if (i32.eq (call $capture_live) (local.get $hwnd))
               (then (drop (call $capture_replace (i32.const 0)))))))
         (return (i32.const 0))))
 
@@ -689,6 +784,23 @@
                 (call $btn_set_text_ptr (local.get $state_w)
                   (call $ctrl_text_dup (local.get $lParam) (local.get $text_len)))
                 (call $btn_set_text_len (local.get $state_w) (local.get $text_len))))
+            ;; A BUTTON may also have a standard nonclient caption. Keep its
+            ;; title store and host publication in sync with the owned text,
+            ;; including direct WM_SETTEXT / CallWindowProc and empty strings.
+            (call $title_table_set (local.get $hwnd)
+              (call $g2w (call $btn_text_ptr (local.get $state_w)))
+              (call $btn_text_len (local.get $state_w)))
+            (call $host_set_window_text (local.get $hwnd)
+              (select (call $g2w (call $btn_text_ptr (local.get $state_w)))
+                (i32.const 0) (call $btn_text_ptr (local.get $state_w))))
+            (if (i32.eq (i32.and (call $wnd_get_style (local.get $hwnd))
+                                (i32.const 0x00C00000)) (i32.const 0x00C00000))
+              (then
+                (call $nc_flags_set (local.get $hwnd) (i32.const 1))
+                ;; Hidden children share the parent's surface; retain damage
+                ;; for exposure without painting their hidden caption now.
+                (if (call $wnd_is_effectively_visible (local.get $hwnd))
+                  (then (call $defwndproc_do_ncpaint (local.get $hwnd))))))
             (if (i32.and (call $wnd_get_style (local.get $hwnd)) (i32.const 0x10000000))
               (then (call $invalidate_hwnd (local.get $hwnd))))
             (return (i32.const 1)))) ;; TRUE
@@ -748,7 +860,7 @@
                 (select (i32.const 0x201) (i32.const 0x601)
                   (i32.eq (local.get $msg) (i32.const 0x0100))))) ;; tracking + origin + pressed
             (call $btn_set_flags (local.get $state_w) (local.get $flags))
-            (global.set $capture_hwnd (local.get $hwnd))
+            (call $capture_store (local.get $hwnd))
             ;; BS_OWNERDRAW: ask parent to repaint via WM_DRAWITEM. Other
             ;; kinds rely on WM_PAINT → button_wndproc drawing the bevel.
             (if (i32.eq (i32.and (call $wnd_get_style (local.get $hwnd)) (i32.const 0x0F))
@@ -836,8 +948,8 @@
               (then (return (i32.const 0))))
             ;; Retire tracking and appearance together.
             (local.set $flags (i32.and (local.get $flags) (i32.const -1538)))
-            (if (i32.eq (global.get $capture_hwnd) (local.get $hwnd))
-              (then (global.set $capture_hwnd (i32.const 0))))
+            (if (i32.eq (call $capture_live) (local.get $hwnd))
+              (then (call $capture_store (i32.const 0))))
             ;; Captured UP reaches this control even outside its client rect.
             ;; Negative signed coordinates compare above the bounds unsigned;
             ;; right/bottom edges are excluded. Cancel before auto-toggle or
@@ -946,6 +1058,56 @@
                             (i32.const 2) (i32.const 2)
                             (i32.sub (local.get $w) (i32.const 2))
                             (i32.sub (local.get $h) (i32.const 2))))))
+                (return (i32.const 0))))))
+
+        ;; ---- Icon button (BS_ICON 0x40, IMAGE_ICON 1) ----
+        ;; Microsoft KB Q131500 (Windows95) and MFC 1997 pp143-144:
+        ;; the associated icon is centered, clipped if oversized, and moves
+        ;; down/right when pressed. Keep the stored handle borrowed, just as
+        ;; BM_SETIMAGE already does for bitmaps; no copy or destruction here.
+        (if (i32.and
+              (i32.ne (i32.and (call $wnd_get_style (local.get $hwnd))
+                        (i32.const 0x0040)) (i32.const 0))
+              (i32.eq (call $btn_image_type (local.get $state_w)) (i32.const 1)))
+          (then
+            (local.set $img (call $btn_image_handle (local.get $state_w)))
+            (if (local.get $img)
+              (then
+                (drop (call $gdi_native_fill_rect (local.get $hdc)
+                  (i32.const 0) (i32.const 0) (local.get $w) (local.get $h)
+                  (i32.const 0x30011)))
+                (drop (call $gdi_native_draw_edge (local.get $hdc)
+                  (i32.const 0) (i32.const 0) (local.get $w) (local.get $h)
+                  (select (i32.const 0x0A) (i32.const 0x05)
+                    (i32.and (local.get $flags) (i32.const 1))) (i32.const 0x0F)))
+                ;; Resource handles use DrawIcon's 32px metric; constructed
+                ;; ICONINFO handles retain their actual bitmap dimensions.
+                (local.set $img_w (i32.const 32))
+                (local.set $img_h (i32.const 32))
+                (local.set $brush (call $cursor_record (local.get $img)))
+                (if (local.get $brush)
+                  (then
+                    (local.set $img_w (call $cursor_width (local.get $brush)))
+                    (local.set $img_h (call $cursor_height (local.get $brush)))))
+                ;; Signed origins preserve both sides of an oversized icon;
+                ;; the control DC clips rather than scaling or pinning it.
+                (local.set $img_x (i32.div_s
+                  (i32.sub (local.get $w) (local.get $img_w)) (i32.const 2)))
+                (local.set $img_y (i32.div_s
+                  (i32.sub (local.get $h) (local.get $img_h)) (i32.const 2)))
+                (if (i32.and (local.get $flags) (i32.const 1))
+                  (then
+                    (local.set $img_x (i32.add (local.get $img_x) (i32.const 1)))
+                    (local.set $img_y (i32.add (local.get $img_y) (i32.const 1)))))
+                (drop (call $icon_draw_handle (local.get $img) (local.get $hdc)
+                  (local.get $img_x) (local.get $img_y)
+                  (local.get $img_w) (local.get $img_h) (global.get $DI_NORMAL)))
+                (if (i32.and (local.get $flags) (i32.const 0x08))
+                  (then
+                    (drop (call $gdi_native_draw_focus_rect (local.get $hdc)
+                      (i32.const 4) (i32.const 4)
+                      (i32.sub (local.get $w) (i32.const 4))
+                      (i32.sub (local.get $h) (i32.const 4))))))
                 (return (i32.const 0))))))
 
         ;; ---- Push button (kinds 0, 1) ----
@@ -1239,14 +1401,23 @@
         (return (i32.const 0))))
 
     ;; ---------- BM_SETIMAGE (0x00F7) ----------
-    ;; wParam=image type (IMAGE_BITMAP=0), lParam=image handle. Return previous.
+    ;; wParam=image type, lParam=image handle. Return previous.
+    ;; Add only documented nonNULL IMAGE_ICON associations. NULL and other
+    ;; unsupported cases retain their existing behavior and lifetime logic.
     (if (i32.eq (local.get $msg) (i32.const 0x00F7))
       (then
         (if (local.get $state)
           (then
             (local.set $state_w (call $g2w (local.get $state)))
             (local.set $img (call $btn_image_handle (local.get $state_w)))
-            (if (i32.eq (local.get $wParam) (i32.const 0))
+            (if (i32.or (i32.eq (local.get $wParam) (i32.const 0))
+                  (i32.and
+                    (i32.and (i32.eq (local.get $wParam) (i32.const 1))
+                      (i32.ne (i32.and (call $wnd_get_style (local.get $hwnd))
+                        (i32.const 0x0040)) (i32.const 0)))
+                    (i32.or
+                      (i32.ne (call $cursor_record (local.get $lParam)) (i32.const 0))
+                      (i32.ne (call $icon_table_record (local.get $lParam)) (i32.const 0)))))
               (then
                 (call $btn_set_image (local.get $state_w) (local.get $wParam) (local.get $lParam))
                 (call $invalidate_hwnd (local.get $hwnd))))
@@ -1332,8 +1503,35 @@
     (local $full_style i32) (local $bitmap i32) (local $bitmap_w i32)
     (local $bitmap_h i32) (local $bitmap_dc i32) (local $bitmap_owned i32)
     (local $bitmap_x i32) (local $bitmap_y i32)
+    (local $parent_color_brush i32) (local $color_parent i32)
 
     (local.set $state (call $wnd_get_state_ptr (local.get $hwnd)))
+
+    ;; Microsoft WIN32.HLP (1992-94), Static / Default Message Processing:
+    ;; WM_ERASEBKGND returns TRUE. The existing WM_PAINT path fills the
+    ;; label background; acknowledge here without drawing or scheduling paint.
+    ;; Qualified only for live, enabled, visible ANSI Win32 SS_LEFT labels
+    ;; with a supplied DC. Other static styles and ABIs keep their old path.
+    (if (i32.and (i32.eq (local.get $msg) (i32.const 0x0014))
+          (i32.and (i32.ne (local.get $state) (i32.const 0))
+            (i32.and (i32.ne (local.get $wParam) (i32.const 0))
+              (i32.and (i32.eqz (global.get $is_win16))
+                (i32.and (i32.eqz (call $wnd_unicode_get (local.get $hwnd)))
+                  (i32.and (call $wnd_is_effectively_visible (local.get $hwnd))
+                    (i32.eqz (i32.and (call $wnd_get_style (local.get $hwnd))
+                                      (i32.const 0x0800FFFF)))))))))
+      (then (return (i32.const 1))))
+
+    ;; Microsoft WIN32.HLP (1992-94), Static / Default Message Processing:
+    ;; WM_GETDLGCODE returns DLGC_STATIC, with no additional input flags.
+    ;; Bound this response to ordinary ANSI Win32 SS_LEFT text labels.
+    (if (i32.and
+          (i32.eq (local.get $msg) (i32.const 0x0087))
+          (i32.and (i32.eqz (global.get $is_win16))
+            (i32.and (i32.eqz (call $wnd_unicode_get (local.get $hwnd)))
+              (i32.eqz (i32.and (call $wnd_get_style (local.get $hwnd))
+                                (i32.const 0xFFFF))))))
+      (then (return (i32.const 0x0100)))) ;; DLGC_STATIC
 
     ;; ---------- WM_SETFOCUS (0x0007) / WM_KILLFOCUS (0x0008) ----------
     ;; Statics aren't tabstops, but if focus lands here (e.g. an app calls
@@ -1398,6 +1596,24 @@
                 (call $static_set_text_ptr (local.get $state_w)
                   (call $ctrl_text_dup (local.get $lParam) (local.get $text_len)))
                 (call $static_set_text_len (local.get $state_w) (local.get $text_len))))
+            ;; STATIC can be a captioned window (including a top-level wizard).
+            ;; Its client text and USER's nonclient title must change together:
+            ;; invalidating only the client leaves subsequent frame paints reading
+            ;; the creation-time title. Use the owned copy, also for empty text.
+            (call $title_table_set (local.get $hwnd)
+              (call $g2w (call $static_text_ptr (local.get $state_w)))
+              (call $static_text_len (local.get $state_w)))
+            (call $host_set_window_text (local.get $hwnd)
+              (select (call $g2w (call $static_text_ptr (local.get $state_w)))
+                (i32.const 0) (call $static_text_ptr (local.get $state_w))))
+            (if (i32.eq (i32.and (call $wnd_get_style (local.get $hwnd))
+                                (i32.const 0x00C00000)) (i32.const 0x00C00000))
+              (then
+                (call $nc_flags_set (local.get $hwnd) (i32.const 1))
+                ;; Hidden children share their parent's surface. Keep their NC
+                ;; damage pending until exposure instead of stamping hidden pixels.
+                (if (call $wnd_is_effectively_visible (local.get $hwnd))
+                  (then (call $defwndproc_do_ncpaint (local.get $hwnd))))))
             (if (i32.and (call $wnd_get_style (local.get $hwnd)) (i32.const 0x10000000))
               (then (call $invalidate_hwnd (local.get $hwnd))))
             (return (i32.const 1))))
@@ -1506,11 +1722,6 @@
     (if (i32.eq (local.get $msg) (i32.const 0x000F))
       (then
         (if (i32.eqz (local.get $state)) (then (return (i32.const 0))))
-        ;; NSIS installer branding label. It is decorative, and with the
-        ;; emulator's current font metrics it collides with the wizard
-        ;; buttons; suppress it instead of painting unreadable overlap.
-        (if (i32.eq (call $ctrl_table_get_id (local.get $hwnd)) (i32.const 1028))
-          (then (return (i32.const 0))))
         (local.set $state_w (call $g2w (local.get $state)))
         (local.set $hdc (i32.add (local.get $hwnd) (i32.const 0x40000)))
         ;; Geometry from CONTROL_GEOM (parent has already painted the
@@ -1543,6 +1754,53 @@
             (call $static_send_drawitem (local.get $hwnd) (local.get $hdc)
               (local.get $ctrl_id) (local.get $w) (local.get $h))
             (return (i32.const 0))))
+        ;; WIN32.HLP (1992-94), topics 170/493/3753 (Chicago: Yes):
+        ;; before drawing, the parent receives the STATIC's HDC and HWND,
+        ;; can set its text/background colors, and returns the background brush.
+        ;; Topics 490/492/493 include SS_LEFTNOWORDWRAP text statics; 492/1954
+        ;; restrict SS_SIMPLE, which remains excluded. Qualified here for
+        ;; enabled visible ANSI Win32 SS_LEFT/SS_CENTER/SS_RIGHT/LEFTNOWORDWRAP.
+        ;; Never enter guest code from the idle host shadow or another thread.
+        (local.set $color_parent (call $wnd_get_parent (local.get $hwnd)))
+        (if (i32.and
+              (i32.eqz (i32.or (global.get $is_win16) (global.get $host_shadow)))
+              (i32.and (i32.eqz (call $wnd_unicode_get (local.get $hwnd)))
+                (i32.and
+                  (i32.and
+                    (i32.eq (call $wnd_get_style (local.get $hwnd)) (local.get $full_style))
+                    (i32.and
+                      (i32.or
+                        (i32.le_u (local.get $style) (i32.const 2))
+                        (i32.eq (local.get $style) (i32.const 0x0C)))
+                      (i32.eqz (i32.and (local.get $full_style) (i32.const 0x0800FFE0)))))
+                  (i32.and (i32.eqz (local.get $ex))
+                    (i32.and (call $wnd_is_effectively_visible (local.get $hwnd))
+                      (i32.and (i32.ne (local.get $color_parent) (i32.const 0))
+                        (i32.and
+                          (i32.eq (call $wnd_get_thread (local.get $hwnd)) (global.get $current_thread_id))
+                          (i32.eq (call $wnd_get_thread (local.get $color_parent)) (global.get $current_thread_id)))))))))
+          (then
+            (drop (call $gdi_native_select_object (local.get $hdc)
+              (select (call $static_font (local.get $state_w)) (i32.const 0x30021)
+                (i32.ne (call $static_font (local.get $state_w)) (i32.const 0)))))
+            (drop (call $gdi_native_set_bk_mode (local.get $hdc) (i32.const 2)))
+            (local.set $parent_color_brush (call $wnd_send_message
+              (local.get $color_parent) (i32.const 0x0138)
+              (local.get $hdc) (local.get $hwnd)))
+            ;; The callback may destroy/recreate or alter the control. Reject
+            ;; incomplete sends and stale state before dereferencing it again.
+            (if (i32.or (i32.eqz (global.get $wnd_send_completed))
+                  (i32.or
+                    (i32.ne (call $wnd_get_state_ptr (local.get $hwnd)) (local.get $state))
+                    (i32.or
+                      (i32.ne (call $wnd_get_parent (local.get $hwnd)) (local.get $color_parent))
+                      (i32.or
+                        (i32.ne (call $wnd_get_style (local.get $hwnd)) (local.get $full_style))
+                        (i32.or
+                          (i32.ne (call $ctrl_get_wh_packed (local.get $hwnd)) (local.get $sz))
+                          (i32.eqz (call $wnd_is_effectively_visible (local.get $hwnd))))))))
+              (then (return (i32.const 0))))
+            (local.set $state_w (call $g2w (call $wnd_get_state_ptr (local.get $hwnd))))))
         ;; Default text rect = full client.
         (local.set $tx_l (i32.const 0))
         (local.set $tx_t (i32.const 0))
@@ -1572,11 +1830,15 @@
             ;; rect and do not render label text.
             (local.set $brush (i32.const 0))
             (if (i32.eq (local.get $style) (i32.const 4))
-              (then (local.set $brush (i32.const 0x30014)))) ;; BLACK_BRUSH
+              ;; Microsoft Q125684 (1995-09-29): Windows95 COLOR_3DDKSHADOW.
+              (then (local.set $brush (call $gdi_system_brush (i32.const 21)))))
             (if (i32.eq (local.get $style) (i32.const 5))
-              (then (local.set $brush (i32.const 0x30012)))) ;; GRAY_BRUSH
+              ;; Microsoft Q125684 (1995-09-29): Windows95 SS_GRAYRECT
+              ;; fills with COLOR_3DSHADOW (16), not the prior screen color.
+              (then (local.set $brush (call $gdi_system_brush (i32.const 16)))))
             (if (i32.eq (local.get $style) (i32.const 6))
-              (then (local.set $brush (i32.const 0x30010)))) ;; WHITE_BRUSH
+              ;; Microsoft Q125684 (1995-09-29): Windows95 COLOR_3DHILIGHT.
+              (then (local.set $brush (call $gdi_system_brush (i32.const 20)))))
             (if (local.get $brush)
               (then
                 (drop (call $gdi_native_fill_rect (local.get $hdc)
@@ -1622,17 +1884,12 @@
                 ;; VB's bordered ThunderLabel fields use a white BackColor;
                 ;; plain captions inherit the form face.
                 (local.set $brush
-                  (select (i32.const 0x30010) (i32.const 0x30011)
-                    (i32.ne (i32.and (call $wnd_get_style (local.get $hwnd))
-                      (i32.const 0x00800000)) (i32.const 0))))
-                ;; USER asks the parent first: WM_CTLCOLORSTATIC hands it the
-                ;; paint DC (already holding the default colors) and takes back
-                ;; the brush the static erases with. Colors the parent sets on
-                ;; the DC carry into the label text below. mIRC's About box
-                ;; answers with a white brush.
-                (local.set $brush (call $ctl_color_brush
-                  (call $wnd_get_parent (local.get $hwnd)) (i32.const 0x0138)
-                  (local.get $hdc) (local.get $hwnd) (local.get $brush)))
+                  (if (result i32) (local.get $parent_color_brush)
+                    (then (local.get $parent_color_brush))
+                    (else
+                      (select (i32.const 0x30010) (i32.const 0x30011)
+                        (i32.ne (i32.and (call $wnd_get_style (local.get $hwnd))
+                          (i32.const 0x00800000)) (i32.const 0))))))
                 (drop (call $gdi_native_fill_rect (local.get $hdc)
                         (i32.const 0) (i32.const 0)
                         (local.get $w) (local.get $h)
@@ -1644,7 +1901,11 @@
         (drop (call $gdi_native_select_object (local.get $hdc)
           (select (call $static_font (local.get $state_w)) (i32.const 0x30021)
             (i32.ne (call $static_font (local.get $state_w)) (i32.const 0)))))
-        (drop (call $gdi_native_set_bk_mode (local.get $hdc) (i32.const 1)))
+        ;; A processed parent-color callback owns the DC's text colors and
+        ;; background mode. Preserve them through DrawText (including OPAQUE
+        ;; text background); the existing unhandled path stays transparent.
+        (if (i32.eqz (local.get $parent_color_brush))
+          (then (drop (call $gdi_native_set_bk_mode (local.get $hdc) (i32.const 1)))))
         ;; SS_BITMAP accepts either a dialog-template RT_BITMAP ordinal or an
         ;; HBITMAP installed with STM_SETIMAGE. Resource bitmaps are temporary
         ;; WAT GDI objects: release them after the blit so repainting a static
@@ -1832,8 +2093,32 @@
               (if (i32.or
                     (i32.le_u (local.get $style) (i32.const 2))
                     (i32.eq (local.get $style) (i32.const 0x0C)))
+                (then
+                  (local.set $fmt
+                    (i32.or (local.get $fmt) (i32.const 0x40))) ;; DT_EXPANDTABS
+                  ;; Ordinary text labels preserve every ampersand when
+                  ;; SS_NOPREFIX is set. SS_SIMPLE is qualified separately
+                  ;; below; only DrawText's flag changes.
+                  (if (i32.and (local.get $full_style) (i32.const 0x80))
+                    (then (local.set $fmt
+                      (i32.or (local.get $fmt) (i32.const 0x800))))))) ;; DT_NOPREFIX
+              ;; Microsoft Visual C++ 4, Sep1995, vol4 p2277: ampersands
+              ;; are prefixes unless SS_NOPREFIX is specified, which may
+              ;; accompany any static style. SS_SIMPLE has no intrinsic
+              ;; no-prefix exception. Qualify only enabled visible ANSI
+              ;; Win32 SIMPLE|NOPREFIX without other low-word styles or exstyle.
+              ;; Preserve its existing layout, tabs, colors and erase path.
+              (if (i32.and
+                    (i32.eq (i32.and (local.get $full_style) (i32.const 0x0800FFFF))
+                            (i32.const 0x008B))
+                    (i32.and
+                      (i32.eq (call $wnd_get_style (local.get $hwnd)) (local.get $full_style))
+                      (i32.and (i32.eqz (global.get $is_win16))
+                        (i32.and (i32.eqz (call $wnd_unicode_get (local.get $hwnd)))
+                          (i32.and (i32.eqz (local.get $ex))
+                            (call $wnd_is_effectively_visible (local.get $hwnd)))))))
                 (then (local.set $fmt
-                  (i32.or (local.get $fmt) (i32.const 0x40))))) ;; DT_EXPANDTABS
+                  (i32.or (local.get $fmt) (i32.const 0x800))))) ;; DT_NOPREFIX
               (drop (call $gdi_native_draw_text (local.get $hdc)
                       (call $g2w (call $static_text_ptr (local.get $state_w)))
                       (call $static_text_len (local.get $state_w))
@@ -2186,6 +2471,31 @@
       (then
         (call $statusbar_state_release (local.get $hwnd))
         (return (i32.const 0))))
+    ;; WM_SIZE: the SDK contract is that the parent forwards its WM_SIZE and the
+    ;; bar re-lays itself out across the parent's client width, at the bottom
+    ;; (CCS_TOP 0x1: at the top) and at its own height. CCS_NORESIZE (0x4)
+    ;; opts out. CreateStatusWindow makes the bar 0 wide at the origin, so
+    ;; without this RegEdit's bar never appears and GetEffectiveClientRect
+    ;; gives the panes the whole client area.
+    (if (i32.eq (local.get $msg) (i32.const 0x0005))
+      (then
+        (local.set $parent (call $wnd_get_parent (local.get $hwnd)))
+        (if (i32.and (i32.ne (local.get $parent) (i32.const 0))
+              (i32.eqz (i32.and (call $wnd_get_style (local.get $hwnd)) (i32.const 0x4))))
+          (then
+            (local.set $sz (call $wnd_get_client_size_packed (local.get $parent)))
+            (local.set $w (i32.and (local.get $sz) (i32.const 0xFFFF)))
+            (local.set $h (i32.shr_u (call $ctrl_get_wh_packed (local.get $hwnd)) (i32.const 16)))
+            (if (i32.eqz (local.get $h)) (then (local.set $h (i32.const 20))))
+            (drop (call $move_window_core (local.get $hwnd) (i32.const 0)
+              (i32.const 0)
+              (select (i32.const 0)
+                (i32.sub (i32.shr_u (local.get $sz) (i32.const 16)) (local.get $h))
+                (i32.and (call $wnd_get_style (local.get $hwnd)) (i32.const 0x1)))
+              (local.get $w) (local.get $h)
+              (i32.const 0x14) ;; SWP_NOZORDER|SWP_NOACTIVATE
+              (i32.const 0)))))
+        (return (i32.const 0))))
     ;; WM_SETTEXT updates the ordinary pane. SB_SETTEXTA/W retain each part's
     ;; text or owner-draw itemData; part 0xFF is MenuHelp's simple pane.
     (if (i32.or
@@ -2259,6 +2569,72 @@
           (then (call $statusbar_state_publish (local.get $hwnd) (local.get $sw)))
           (else (call $invalidate_hwnd (local.get $hwnd))))
         (return (i32.const 1))))
+    ;; SB_GETTEXTA/W and SB_GETTEXTLENGTHA/W for the retained ordinary pane
+    ;; and SB_SIMPLEID. This state represents ASCII normal text, drawing type
+    ;; zero only: LOWORD is the character count, HIWORD therefore stays zero.
+    ;; Query the requested store independently of which pane is displayed.
+    ;; No allocation, publication, invalidation or font/layout change on reads.
+    (if (i32.and
+          (i32.or (i32.eqz (local.get $wParam))
+                  (i32.eq (local.get $wParam) (i32.const 0xFF)))
+          (i32.or
+            (i32.or (i32.eq (local.get $msg) (i32.const 0x0402))
+                    (i32.eq (local.get $msg) (i32.const 0x0403)))
+            (i32.or (i32.eq (local.get $msg) (i32.const 0x040D))
+                    (i32.eq (local.get $msg) (i32.const 0x040C)))))
+      (then
+        (local.set $state (call $statusbar_state_get (local.get $hwnd) (i32.const 0)))
+        (if (local.get $state)
+          (then
+            (local.set $sw (cast ptr<StatusBarState> (call $g2w (local.get $state))))
+            (if (local.get $wParam)
+              (then
+                (local.set $text_g (call $statusbar_simple_ptr (local.get $sw)))
+                (local.set $text_len (call $statusbar_simple_len (local.get $sw))))
+              (else
+                (local.set $text_g (call $statusbar_normal_ptr (local.get $sw)))
+                (local.set $text_len (call $statusbar_normal_len (local.get $sw)))))
+            (if (local.get $text_g)
+              (then (local.set $text_w (call $g2w (local.get $text_g))))))
+          (else
+            ;; An uninitialized ordinary pane can still have its creation
+            ;; caption in TITLE_TABLE. Reading it must not attach state.
+            (if (i32.eqz (local.get $wParam))
+              (then
+                (local.set $text_w (call $title_table_get_ptr (local.get $hwnd)))
+                (local.set $text_len (call $title_table_get_len (local.get $hwnd)))))))
+        (if (i32.or (i32.eq (local.get $msg) (i32.const 0x0402))
+                    (i32.eq (local.get $msg) (i32.const 0x040D)))
+          (then
+            ;; The caller supplies room for count+1 characters; GETTEXT has
+            ;; no capacity parameter. Include exactly one A/W NUL terminator.
+            (block $status_query_done (loop $status_query_copy
+              (br_if $status_query_done (i32.ge_u (local.get $tmp_g) (local.get $text_len)))
+              (local.set $part_len (i32.load8_u (i32.add (local.get $text_w) (local.get $tmp_g))))
+              (if (i32.eq (local.get $msg) (i32.const 0x040D))
+                (then (call $gs16
+                  (i32.add (local.get $lParam) (i32.shl (local.get $tmp_g) (i32.const 1)))
+                  (local.get $part_len)))
+                (else (call $gs8 (i32.add (local.get $lParam) (local.get $tmp_g)) (local.get $part_len))))
+              (local.set $tmp_g (i32.add (local.get $tmp_g) (i32.const 1)))
+              (br $status_query_copy)))
+            (if (i32.eq (local.get $msg) (i32.const 0x040D))
+              (then (call $gs16
+                (i32.add (local.get $lParam) (i32.shl (local.get $text_len) (i32.const 1))) (i32.const 0)))
+              (else (call $gs8 (i32.add (local.get $lParam) (local.get $text_len)) (i32.const 0))))))
+        (return (local.get $text_len))))
+    ;; SB_ISSIMPLE reads the existing mode, with FALSE for unattached state.
+    ;; Its parameters are ignored; reading must not allocate or publish state.
+    (if (i32.eq (local.get $msg) (i32.const 0x040E))
+      (then
+        (local.set $state (call $statusbar_state_get (local.get $hwnd) (i32.const 0)))
+        (if (local.get $state)
+          (then
+            (return (i32.ne
+              (call $statusbar_simple_mode
+                (cast ptr<StatusBarState> (call $g2w (local.get $state))))
+              (i32.const 0)))))
+        (return (i32.const 0))))
     ;; SB_SIMPLE selects between the preserved ordinary pane and simple part.
     (if (i32.eq (local.get $msg) (i32.const 0x0409))
       (then
@@ -2669,6 +3045,9 @@
   ;; sunken progress well, and invalidates on state changes.
 
   (func $progress_wndproc (param $hwnd i32) (param $msg i32) (param $wParam i32) (param $lParam i32) (result i32)
+    (local $brush i32)
+    (local $sum i64)
+    (local $range64 i64) (local $inner_h i32) (local $fill_h i32)
     (local $hdc i32) (local $sz i32) (local $w i32) (local $h i32)
     (local $state i32) (local $sw i32) (local $old i32)
     (local $min i32) (local $max i32) (local $pos i32) (local $range i32) (local $inner_w i32) (local $fill_w i32)
@@ -2676,7 +3055,7 @@
     ;; WM_CREATE
     (if (i32.eq (local.get $msg) (i32.const 0x0001))
       (then
-        (local.set $state (call $heap_alloc (i32.const 16)))
+        (local.set $state (call $heap_alloc (i32.const 24)))
         (local.set $sw (call $g2w (local.get $state)))
         (call $prog_state_init (local.get $sw))
         (call $wnd_set_state_ptr (local.get $hwnd) (local.get $state))
@@ -2694,7 +3073,7 @@
     ;; update.
     (if (i32.eqz (local.get $state))
       (then
-        (local.set $state (call $heap_alloc (i32.const 16)))
+        (local.set $state (call $heap_alloc (i32.const 24)))
         (local.set $sw (call $g2w (local.get $state)))
         (call $prog_state_init (local.get $sw))
         (call $wnd_set_state_ptr (local.get $hwnd) (local.get $state))))
@@ -2702,6 +3081,11 @@
     ;; PBM_SETRANGE(0x0401): lParam low=min, high=max.
     (if (i32.eq (local.get $msg) (i32.const 0x0401))
       (then
+        ;; Both range setters return the LOWORD of each previous limit.
+        (local.set $old
+          (i32.or
+            (i32.and (call $prog_min (local.get $sw)) (i32.const 0xFFFF))
+            (i32.shl (call $prog_max (local.get $sw)) (i32.const 16))))
         (local.set $min (i32.shr_s (i32.shl (local.get $lParam) (i32.const 16)) (i32.const 16)))
         (local.set $max (i32.shr_s (local.get $lParam) (i32.const 16)))
         (if (i32.le_s (local.get $max) (local.get $min))
@@ -2711,7 +3095,7 @@
         (call $prog_set_pos (local.get $sw)
           (call $prog_clamp (local.get $sw) (call $prog_pos (local.get $sw))))
         (call $invalidate_hwnd (local.get $hwnd))
-        (return (i32.const 0))))
+        (return (local.get $old))))
     ;; PBM_SETPOS(0x0402): return previous position.
     (if (i32.eq (local.get $msg) (i32.const 0x0402))
       (then
@@ -2724,9 +3108,17 @@
     (if (i32.eq (local.get $msg) (i32.const 0x0403))
       (then
         (local.set $old (call $prog_pos (local.get $sw)))
+        ;; Add signed positions before clamping; i32 addition can wrap to the
+        ;; opposite boundary even though both inputs are valid signed values.
+        (local.set $sum (i64.add
+          (i64.extend_i32_s (local.get $old))
+          (i64.extend_i32_s (local.get $wParam))))
+        (if (i64.lt_s (local.get $sum) (i64.extend_i32_s (call $prog_min (local.get $sw))))
+          (then (local.set $sum (i64.extend_i32_s (call $prog_min (local.get $sw))))))
+        (if (i64.gt_s (local.get $sum) (i64.extend_i32_s (call $prog_max (local.get $sw))))
+          (then (local.set $sum (i64.extend_i32_s (call $prog_max (local.get $sw))))))
         (call $prog_set_pos (local.get $sw)
-          (call $prog_clamp (local.get $sw)
-            (i32.add (local.get $old) (local.get $wParam))))
+          (i32.wrap_i64 (local.get $sum)))
         (call $invalidate_hwnd (local.get $hwnd))
         (return (local.get $old))))
     ;; PBM_SETSTEP(0x0404), PBM_STEPIT(0x0405), PBM_SETRANGE32(0x0406).
@@ -2748,6 +3140,11 @@
         (return (local.get $old))))
     (if (i32.eq (local.get $msg) (i32.const 0x0406))
       (then
+        ;; Pack before replacing either limit, including prior 32-bit ranges.
+        (local.set $old
+          (i32.or
+            (i32.and (call $prog_min (local.get $sw)) (i32.const 0xFFFF))
+            (i32.shl (call $prog_max (local.get $sw)) (i32.const 16))))
         (local.set $min (local.get $wParam))
         (local.set $max (local.get $lParam))
         (if (i32.le_s (local.get $max) (local.get $min))
@@ -2757,7 +3154,45 @@
         (call $prog_set_pos (local.get $sw)
           (call $prog_clamp (local.get $sw) (call $prog_pos (local.get $sw))))
         (call $invalidate_hwnd (local.get $hwnd))
-        (return (i32.const 0))))
+        (return (local.get $old))))
+    ;; PBM_GETRANGE(0x0407): TRUE selects low, FALSE selects high.
+    ;; Optional PBRANGE output is two signed 32-bit limits, low then high.
+    (if (i32.eq (local.get $msg) (i32.const 0x0407))
+      (then
+        (if (local.get $lParam)
+          (then
+            (local.set $range (call $g2w (local.get $lParam)))
+            (i32.store (local.get $range) (call $prog_min (local.get $sw)))
+            (i32.store offset=4 (local.get $range) (call $prog_max (local.get $sw)))))
+        (return (if (result i32) (local.get $wParam)
+          (then (call $prog_min (local.get $sw)))
+          (else (call $prog_max (local.get $sw)))))))
+    ;; PBM_GETPOS(0x0408): return the current UINT position without repainting.
+    (if (i32.eq (local.get $msg) (i32.const 0x0408))
+      (then (return (call $prog_pos (local.get $sw)))))
+    ;; PBM_GETSTEP(0x040D): return the current signed increment (default 10).
+    ;; Query only: preserve all 32 bits without changing state or repainting.
+    (if (i32.eq (local.get $msg) (i32.const 0x040D))
+      (then (return (call $prog_step (local.get $sw)))))
+    ;; Classic PBM_SETBARCOLOR (WM_USER+9), PBM_SETBKCOLOR = CCM_SETBKCOLOR.
+    ;; Microsoft documents wParam=0, lParam=COLORREF, previous color returned,
+    ;; and CLR_DEFAULT (0xFF000000) restoring the default. Keep that sentinel
+    ;; distinct from RGB black/white and CLR_NONE. This native painter has no
+    ;; visual styles; its existing default RGBs/geometry are emulator policy.
+    ;; https://learn.microsoft.com/en-us/windows/win32/controls/pbm-setbarcolor
+    ;; https://learn.microsoft.com/en-us/windows/win32/controls/pbm-setbkcolor
+    (if (i32.eq (local.get $msg) (i32.const 0x0409))
+      (then
+        (local.set $old (call $prog_bar_color (local.get $sw)))
+        (call $prog_set_bar_color (local.get $sw) (local.get $lParam))
+        (call $invalidate_hwnd (local.get $hwnd))
+        (return (local.get $old))))
+    (if (i32.eq (local.get $msg) (i32.const 0x2001))
+      (then
+        (local.set $old (call $prog_bk_color (local.get $sw)))
+        (call $prog_set_bk_color (local.get $sw) (local.get $lParam))
+        (call $invalidate_hwnd (local.get $hwnd))
+        (return (local.get $old))))
     ;; WM_PAINT
     (if (i32.eq (local.get $msg) (i32.const 0x000F))
       (then
@@ -2768,29 +3203,78 @@
         (if (i32.and (i32.gt_s (local.get $w) (i32.const 0))
                      (i32.gt_s (local.get $h) (i32.const 0)))
           (then
+            (local.set $brush (i32.const 0x30010)) ;; existing WHITE_BRUSH
+            (if (i32.ne (call $prog_bk_color (local.get $sw)) (i32.const 0xFF000000))
+              (then (local.set $brush (call $gdi_native_create_solid_brush
+                (call $prog_bk_color (local.get $sw))))))
             (drop (call $gdi_native_fill_rect (local.get $hdc)
                     (i32.const 0) (i32.const 0)
                     (local.get $w) (local.get $h)
-                    (i32.const 0x30010))) ;; WHITE_BRUSH
+                    (local.get $brush)))
+            (if (i32.ne (call $prog_bk_color (local.get $sw)) (i32.const 0xFF000000))
+              (then (drop (call $gdi_native_delete_object (local.get $brush)))))
+            (local.set $brush (i32.const 14)) ;; existing COLOR_HIGHLIGHT brush
+            (if (i32.ne (call $prog_bar_color (local.get $sw)) (i32.const 0xFF000000))
+              (then (local.set $brush (call $gdi_native_create_solid_brush
+                (call $prog_bar_color (local.get $sw))))))
             (local.set $min (call $prog_min (local.get $sw)))
             (local.set $max (call $prog_max (local.get $sw)))
             (local.set $pos (call $prog_clamp (local.get $sw) (call $prog_pos (local.get $sw))))
-            (local.set $range (i32.sub (local.get $max) (local.get $min)))
-            (local.set $inner_w (i32.sub (local.get $w) (i32.const 4)))
-            (if (i32.and (i32.gt_s (local.get $range) (i32.const 0))
-                         (i32.gt_s (local.get $inner_w) (i32.const 0)))
+            ;; PBS_VERTICAL: bottom-to-top, using the existing emulator well,
+            ;; highlight and 2px inset (not a Windows pixel oracle).
+            (if (i32.and (call $wnd_get_style (local.get $hwnd)) (i32.const 0x0004))
               (then
-                (local.set $fill_w
-                  (i32.div_s
-                    (i32.mul (i32.sub (local.get $pos) (local.get $min)) (local.get $inner_w))
-                    (local.get $range)))
+                ;; Widen BEFORE subtracting: signed32 limits can span 2^32-1.
+                ;; Packed dimensions are at most 65535, so the product fits i64.
+                (local.set $range64 (i64.sub
+                  (i64.extend_i32_s (local.get $max))
+                  (i64.extend_i32_s (local.get $min))))
+                (local.set $inner_h (i32.sub (local.get $h) (i32.const 4)))
+                (if (i32.and (i64.gt_s (local.get $range64) (i64.const 0))
+                      (i32.and (i32.gt_s (local.get $w) (i32.const 4))
+                        (i32.gt_s (local.get $inner_h) (i32.const 0))))
+                  (then
+                    (local.set $fill_h (i32.wrap_i64 (i64.div_s
+                      (i64.mul
+                        (i64.sub (i64.extend_i32_s (local.get $pos))
+                          (i64.extend_i32_s (local.get $min)))
+                        (i64.extend_i32_s (local.get $inner_h)))
+                      (local.get $range64))))
+                    (if (i32.gt_s (local.get $fill_h) (i32.const 0))
+                      (then
+                        (drop (call $gdi_native_fill_rect (local.get $hdc)
+                          (i32.const 2)
+                          (i32.sub (i32.sub (local.get $h) (i32.const 2)) (local.get $fill_h))
+                          (i32.sub (local.get $w) (i32.const 2))
+                          (i32.sub (local.get $h) (i32.const 2))
+                          (local.get $brush))))))))
+              (else
+            ;; Signed32 limits span up to 2^32-1. Widen each operand before
+            ;; subtraction and multiplication; packed widths keep the product in i64.
+            (local.set $range64 (i64.sub
+              (i64.extend_i32_s (local.get $max))
+              (i64.extend_i32_s (local.get $min))))
+            (local.set $inner_w (i32.sub (local.get $w) (i32.const 4)))
+            (if (i32.and (i64.gt_s (local.get $range64) (i64.const 0))
+                  (i32.and (i32.gt_s (local.get $inner_w) (i32.const 0))
+                    (i32.gt_s (local.get $h) (i32.const 4))))
+              (then
+                (local.set $fill_w (i32.wrap_i64 (i64.div_s
+                  (i64.mul
+                    (i64.sub (i64.extend_i32_s (local.get $pos))
+                      (i64.extend_i32_s (local.get $min)))
+                    (i64.extend_i32_s (local.get $inner_w)))
+                  (local.get $range64))))
                 (if (i32.gt_s (local.get $fill_w) (i32.const 0))
                   (then
                     (drop (call $gdi_native_fill_rect (local.get $hdc)
                       (i32.const 2) (i32.const 2)
                       (i32.add (i32.const 2) (local.get $fill_w))
                       (i32.sub (local.get $h) (i32.const 2))
-                      (i32.const 14))))))) ;; COLOR_HIGHLIGHT
+                      (local.get $brush)))))))
+              ))
+            (if (i32.ne (call $prog_bar_color (local.get $sw)) (i32.const 0xFF000000))
+              (then (drop (call $gdi_native_delete_object (local.get $brush)))))
             (drop (call $gdi_native_draw_edge (local.get $hdc)
                     (i32.const 0) (i32.const 0)
                     (local.get $w) (local.get $h)

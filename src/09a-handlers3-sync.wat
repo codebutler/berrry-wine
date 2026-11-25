@@ -74,14 +74,49 @@
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8))) (return)
   )
 
+  ;; GetKeyState is the key state as of the last input message this thread
+  ;; removed from its queue, not the state of the device now. For the mouse
+  ;; buttons that state is exactly the MK_* flags of the last hardware mouse
+  ;; message retrieved: a WM_LBUTTONDOWN carries MK_LBUTTON, its WM_LBUTTONUP
+  ;; does not. A program that is busy when the user clicks retrieves the
+  ;; down after the device is already up, and USER still reports the button
+  ;; down while it handles that message. VB6 asks GetKeyState(VK_LBUTTON)
+  ;; when a control sees WM_LBUTTONDOWN and only captures the mouse (and so
+  ;; only raises Click on the up) when it reads down: every tool button in
+  ;; SimCity 2001, whose timer redraw keeps it busy, ignored quick clicks.
+  ;; Per instance, so per guest thread like USER's per-queue state.
+  (global $input_sync_mk (mut i32) (i32.const 0))
+
+  ;; Called where a hardware input message is removed from the queue.
+  (func $input_sync_note (param $msg i32) (param $wparam i32)
+    (if (i32.and (i32.ge_u (local.get $msg) (i32.const 0x0200))
+                 (i32.le_u (local.get $msg) (i32.const 0x020D)))
+      (then (global.set $input_sync_mk
+        (i32.and (local.get $wparam) (i32.const 0x73))))))
+
+  ;; MK_* bit for a mouse-button VK, or 0 for any other key.
+  (func $input_sync_vk_mk (param $vk i32) (result i32)
+    (if (i32.eq (local.get $vk) (i32.const 1)) (then (return (i32.const 0x01))))
+    (if (i32.eq (local.get $vk) (i32.const 2)) (then (return (i32.const 0x02))))
+    (if (i32.eq (local.get $vk) (i32.const 4)) (then (return (i32.const 0x10))))
+    (if (i32.eq (local.get $vk) (i32.const 5)) (then (return (i32.const 0x20))))
+    (if (i32.eq (local.get $vk) (i32.const 6)) (then (return (i32.const 0x40))))
+    (i32.const 0))
+
   ;; 302: GetKeyState(nVirtKey) → SHORT — 1 arg stdcall
   (func $handle_GetKeyState (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     ;; Return the current high-bit down state without consuming
     ;; GetAsyncKeyState's one-shot press latch. Toggle-key low bits are not
-    ;; tracked yet.
-    (i32.store offset=0 (global.get $reg_base) (i32.and
-        (call $host_get_key_down_state (local.get $arg0))
-        (i32.const 0x8000)))
+    ;; tracked yet. Keyboard keys still read the device; mouse buttons are
+    ;; also down while the last retrieved mouse message says so (above).
+    (i32.store offset=0 (global.get $reg_base) (i32.or
+        (i32.and
+          (call $host_get_key_down_state (local.get $arg0))
+          (i32.const 0x8000))
+        (select (i32.const 0x8000) (i32.const 0)
+          (i32.ne (i32.and (global.get $input_sync_mk)
+                    (call $input_sync_vk_mk (local.get $arg0)))
+                  (i32.const 0)))))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
   )
 
@@ -115,88 +150,149 @@
   ;; characters come from.
   (func $handle_ToAsciiEx
     (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $ks i32) (local $ch i32)
+    (local $vk i32) (local $ks i32) (local $out i32) (local $shift i32) (local $ch i32) (local $nul_success i32)
+    (local.set $vk (local.get $arg0))
     (local.set $ks (call $g2w (local.get $arg2)))
-    (if (i32.eqz (i32.and (local.get $arg1) (i32.const 0x8000)))
+    ;; A released key (uScanCode's high bit) produces no character: PuTTY runs
+    ;; WM_KEYUP through the same ToAsciiEx call as WM_KEYDOWN.
+    (if (i32.and (local.get $arg1) (i32.const 0x8000))
       (then
-        (local.set $ch (call $us_layout_char (local.get $arg0)
-          (i32.ne (i32.and (i32.load8_u (i32.add (local.get $ks) (i32.const 0x10))) (i32.const 0x80)) (i32.const 0))
-          (i32.and (i32.load8_u (i32.add (local.get $ks) (i32.const 0x14))) (i32.const 1))
-          (i32.and
-            (i32.ne (i32.and (i32.load8_u (i32.add (local.get $ks) (i32.const 0x11))) (i32.const 0x80)) (i32.const 0))
-            (i32.eqz (i32.and (i32.load8_u (i32.add (local.get $ks) (i32.const 0x12))) (i32.const 0x80))))))))
-    (if (local.get $ch)
-      (then (i32.store16 (call $g2w (local.get $arg3)) (local.get $ch))))
-    (i32.store offset=0 (global.get $reg_base) (i32.ne (local.get $ch) (i32.const 0)))
+        (i32.store offset=0 (global.get $reg_base) (i32.const 0))
+        (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28)))
+        (return)))
+    (local.set $out (call $g2w (local.get $arg3)))
+    (local.set $shift (i32.and (i32.load8_u (i32.add (local.get $ks) (i32.const 0x10))) (i32.const 0x80)))
+    (local.set $ch (i32.const 0))
+    ;; US A-Z: Shift XOR the Caps Lock toggle bit selects uppercase.
+    (if (i32.and (i32.ge_u (local.get $vk) (i32.const 0x41)) (i32.le_u (local.get $vk) (i32.const 0x5A)))
+      (then (local.set $ch
+        (select (local.get $vk) (i32.add (local.get $vk) (i32.const 0x20))
+          (i32.xor (i32.ne (local.get $shift) (i32.const 0))
+            (i32.and (i32.load8_u offset=0x14 (local.get $ks)) (i32.const 1)))))
+        ;; US Ctrl+A..Z are 0x01..0x1A regardless of Shift/Caps.
+        ;; Only the down bit counts; leave Ctrl+Alt/AltGr unchanged.
+        (if (i32.and
+          (i32.ne (i32.and (i32.load8_u offset=0x11 (local.get $ks)) (i32.const 0x80)) (i32.const 0))
+          (i32.eqz (i32.and (i32.load8_u offset=0x12 (local.get $ks)) (i32.const 0x80))))
+          (then (local.set $ch (i32.sub (local.get $vk) (i32.const 0x40)))))))
+    ;; US number row: 0..9 shift to )!@#$%^&*(; Caps Lock has no effect.
+    (if (i32.eqz (local.get $ch))
+      (then (if (i32.and (i32.ge_u (local.get $vk) (i32.const 0x30)) (i32.le_u (local.get $vk) (i32.const 0x39)))
+        (then
+          (local.set $ch (local.get $vk))
+          (if (local.get $shift)
+            (then
+              (if (i32.eq (local.get $vk) (i32.const 0x30)) (then (local.set $ch (i32.const 0x29)))) ;; )
+              (if (i32.eq (local.get $vk) (i32.const 0x31)) (then (local.set $ch (i32.const 0x21)))) ;; !
+              (if (i32.eq (local.get $vk) (i32.const 0x32)) (then (local.set $ch (i32.const 0x40)))) ;; @
+              (if (i32.eq (local.get $vk) (i32.const 0x33)) (then (local.set $ch (i32.const 0x23)))) ;; #
+              (if (i32.eq (local.get $vk) (i32.const 0x34)) (then (local.set $ch (i32.const 0x24)))) ;; $
+              (if (i32.eq (local.get $vk) (i32.const 0x35)) (then (local.set $ch (i32.const 0x25)))) ;; %
+              (if (i32.eq (local.get $vk) (i32.const 0x36)) (then (local.set $ch (i32.const 0x5E)))) ;; ^
+              (if (i32.eq (local.get $vk) (i32.const 0x37)) (then (local.set $ch (i32.const 0x26)))) ;; &
+              (if (i32.eq (local.get $vk) (i32.const 0x38)) (then (local.set $ch (i32.const 0x2A)))) ;; *
+              (if (i32.eq (local.get $vk) (i32.const 0x39)) (then (local.set $ch (i32.const 0x28)))))))))) ;; (
+    ;; Supplied US keypad VKs: digits plain only; decimal plain/Shift.
+    ;; Caps/NumLock do not alter literals. Preserve Ctrl/Alt no-translation.
+    (if (i32.eqz (i32.and
+      (i32.or (i32.load8_u offset=0x11 (local.get $ks)) (i32.load8_u offset=0x12 (local.get $ks)))
+      (i32.const 0x80)))
+      (then
+        (if (i32.and (i32.eqz (local.get $shift))
+          (i32.and (i32.ge_u (local.get $vk) (i32.const 0x60)) (i32.le_u (local.get $vk) (i32.const 0x69))))
+          (then (local.set $ch (i32.sub (local.get $vk) (i32.const 0x30)))))
+        (if (i32.eq (local.get $vk) (i32.const 0x6E)) (then (local.set $ch (i32.const 0x2E))))))
+    ;; US keypad operators are literal under both Shift and Caps Lock.
+    (if (i32.eq (local.get $vk) (i32.const 0x6A)) (then (local.set $ch (i32.const 0x2A)))) ;; *
+    (if (i32.eq (local.get $vk) (i32.const 0x6B)) (then (local.set $ch (i32.const 0x2B)))) ;; +
+    (if (i32.eq (local.get $vk) (i32.const 0x6D)) (then (local.set $ch (i32.const 0x2D)))) ;; -
+    (if (i32.eq (local.get $vk) (i32.const 0x6F)) (then (local.set $ch (i32.const 0x2F)))) ;; /
+    ;; US ANSI OEM punctuation, unshifted/shifted. No dead keys in this layout.
+    (if (i32.eq (local.get $vk) (i32.const 0xBA)) (then (local.set $ch (select (i32.const 0x3A) (i32.const 0x3B) (local.get $shift))))) ;; ; :
+    (if (i32.eq (local.get $vk) (i32.const 0xBB)) (then (local.set $ch (select (i32.const 0x2B) (i32.const 0x3D) (local.get $shift))))) ;; = +
+    (if (i32.eq (local.get $vk) (i32.const 0xBC)) (then (local.set $ch (select (i32.const 0x3C) (i32.const 0x2C) (local.get $shift))))) ;; , <
+    (if (i32.eq (local.get $vk) (i32.const 0xBD)) (then (local.set $ch (select (i32.const 0x5F) (i32.const 0x2D) (local.get $shift))))) ;; - _
+    (if (i32.eq (local.get $vk) (i32.const 0xBE)) (then (local.set $ch (select (i32.const 0x3E) (i32.const 0x2E) (local.get $shift))))) ;; . >
+    (if (i32.eq (local.get $vk) (i32.const 0xBF)) (then (local.set $ch (select (i32.const 0x3F) (i32.const 0x2F) (local.get $shift))))) ;; / ?
+    (if (i32.eq (local.get $vk) (i32.const 0xC0)) (then (local.set $ch (select (i32.const 0x7E) (i32.const 0x60) (local.get $shift))))) ;; ` ~
+    (if (i32.eq (local.get $vk) (i32.const 0xDB)) (then (local.set $ch (select (i32.const 0x7B) (i32.const 0x5B) (local.get $shift))))) ;; [ {
+    (if (i32.eq (local.get $vk) (i32.const 0xDC)) (then (local.set $ch (select (i32.const 0x7C) (i32.const 0x5C) (local.get $shift))))) ;; backslash |
+    (if (i32.eq (local.get $vk) (i32.const 0xDD)) (then (local.set $ch (select (i32.const 0x7D) (i32.const 0x5D) (local.get $shift))))) ;; ] }
+    (if (i32.eq (local.get $vk) (i32.const 0xDE)) (then (local.set $ch (select (i32.const 0x22) (i32.const 0x27) (local.get $shift))))) ;; ' "
+    ;; US OEM_102 ordinary backslash/pipe; Caps Lock has no effect.
+    ;; Preserve existing Ctrl/Alt compatibility; only down bits count.
+    (if (i32.and (i32.eq (local.get $vk) (i32.const 0xE2))
+      (i32.eqz (i32.and
+        (i32.or (i32.load8_u offset=0x11 (local.get $ks)) (i32.load8_u offset=0x12 (local.get $ks)))
+        (i32.const 0x80))))
+      (then (local.set $ch (select (i32.const 0x7C) (i32.const 0x5C) (local.get $shift)))))
+    ;; US unshifted Ctrl+OEM_102 is FS (literal US sample column 2).
+    (if (i32.and (i32.eq (local.get $vk) (i32.const 0xE2))
+      (i32.and (i32.eqz (local.get $shift))
+        (i32.and
+          (i32.ne (i32.and (i32.load8_u offset=0x11 (local.get $ks)) (i32.const 0x80)) (i32.const 0))
+          (i32.eqz (i32.and (i32.load8_u offset=0x12 (local.get $ks)) (i32.const 0x80))))))
+      (then (local.set $ch (i32.const 0x1C))))
+    ;; US unshifted Ctrl+[ / Ctrl+backslash / Ctrl+] are ESC / FS / GS.
+    ;; Preserve Shift+Ctrl and Ctrl+Alt compatibility; only down bits count.
+    (if (i32.and
+      (i32.and (i32.ge_u (local.get $vk) (i32.const 0xDB)) (i32.le_u (local.get $vk) (i32.const 0xDD)))
+      (i32.and (i32.eqz (local.get $shift))
+        (i32.and
+          (i32.ne (i32.and (i32.load8_u offset=0x11 (local.get $ks)) (i32.const 0x80)) (i32.const 0))
+          (i32.eqz (i32.and (i32.load8_u offset=0x12 (local.get $ks)) (i32.const 0x80))))))
+      (then (local.set $ch (i32.sub (local.get $vk) (i32.const 0xC0)))))
+    ;; US VK_CANCEL is ETX in plain/Shift/unshifted Ctrl columns; Caps invariant.
+    (if (i32.and (i32.eq (local.get $vk) (i32.const 0x03))
+      (i32.and
+        (i32.eqz (i32.and (i32.load8_u offset=0x12 (local.get $ks)) (i32.const 0x80)))
+        (i32.or (i32.eqz (local.get $shift))
+          (i32.eqz (i32.and (i32.load8_u offset=0x11 (local.get $ks)) (i32.const 0x80))))))
+      (then (local.set $ch (i32.const 0x03))))
+    ;; Space=0x20, Enter=0x0D, Esc=0x1B, Tab=0x09, Back=0x08
+    (if (i32.eqz (local.get $ch))
+      (then
+        (if (i32.eq (local.get $vk) (i32.const 0x20)) (then (local.set $ch (i32.const 0x20))))
+        (if (i32.eq (local.get $vk) (i32.const 0x0D))
+          (then
+            (local.set $ch (i32.const 0x0D))
+            ;; US unshifted Ctrl+Enter is LF; preserve Shift/Alt compatibility.
+            (if (i32.and (i32.eqz (local.get $shift))
+              (i32.and
+                (i32.ne (i32.and (i32.load8_u offset=0x11 (local.get $ks)) (i32.const 0x80)) (i32.const 0))
+                (i32.eqz (i32.and (i32.load8_u offset=0x12 (local.get $ks)) (i32.const 0x80)))))
+              (then (local.set $ch (i32.const 0x0A))))))
+        (if (i32.eq (local.get $vk) (i32.const 0x1B)) (then (local.set $ch (i32.const 0x1B))))
+        (if (i32.eq (local.get $vk) (i32.const 0x09)) (then (local.set $ch (i32.const 0x09))))
+        (if (i32.eq (local.get $vk) (i32.const 0x08))
+          (then
+            (local.set $ch (i32.const 0x08))
+            ;; US unshifted Ctrl+Backspace is DEL; preserve Shift/Alt compatibility.
+            (if (i32.and (i32.eqz (local.get $shift))
+              (i32.and
+                (i32.ne (i32.and (i32.load8_u offset=0x11 (local.get $ks)) (i32.const 0x80)) (i32.const 0))
+                (i32.eqz (i32.and (i32.load8_u offset=0x12 (local.get $ks)) (i32.const 0x80)))))
+              (then (local.set $ch (i32.const 0x7F))))))))
+    ;; US aVkToWch4 column 3: Ctrl+Shift+2/6/minus are NUL/RS/US.
+    ;; NUL is one translated character, distinct from absent translation.
+    (if (i32.and
+      (i32.and
+        (i32.ne (local.get $shift) (i32.const 0))
+        (i32.ne (i32.and (i32.load8_u offset=0x11 (local.get $ks)) (i32.const 0x80)) (i32.const 0)))
+      (i32.eqz (i32.and (i32.load8_u offset=0x12 (local.get $ks)) (i32.const 0x80))))
+      (then
+        (if (i32.eq (local.get $vk) (i32.const 0x32))
+          (then (local.set $ch (i32.const 0)) (local.set $nul_success (i32.const 1))))
+        (if (i32.eq (local.get $vk) (i32.const 0x36)) (then (local.set $ch (i32.const 0x1E))))
+        (if (i32.eq (local.get $vk) (i32.const 0xBD)) (then (local.set $ch (i32.const 0x1F))))))
+    (if (i32.or (i32.ne (local.get $ch) (i32.const 0)) (local.get $nul_success))
+      (then
+        (i32.store16 (local.get $out) (local.get $ch))
+        (i32.store offset=0 (global.get $reg_base) (i32.const 1)))
+      (else (i32.store offset=0 (global.get $reg_base) (i32.const 0))))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28)))
   )
 
-  ;; Byte $i of the 16-byte little-endian string $lo..$hi.
-  (func $byte_of_i64_pair (param $lo i64) (param $hi i64) (param $i i32) (result i32)
-    (i32.and
-      (i32.wrap_i64 (i64.shr_u
-        (select (local.get $hi) (local.get $lo) (i32.ge_u (local.get $i) (i32.const 8)))
-        (i64.extend_i32_u (i32.shl (i32.and (local.get $i) (i32.const 7)) (i32.const 3)))))
-      (i32.const 0xFF)))
-
-  ;; The US layout's character for a virtual key, 0 for none.
-  (func $us_layout_char (param $vk i32) (param $shift i32) (param $caps i32) (param $ctrl i32) (result i32)
-    (local $i i32)
-    ;; Letters: Shift and Caps Lock cancel; Ctrl gives the control code.
-    (if (i32.and (i32.ge_u (local.get $vk) (i32.const 0x41)) (i32.le_u (local.get $vk) (i32.const 0x5A)))
-      (then
-        (if (local.get $ctrl) (then (return (i32.sub (local.get $vk) (i32.const 0x40)))))
-        (return (select (local.get $vk) (i32.add (local.get $vk) (i32.const 0x20))
-          (i32.xor (local.get $shift) (local.get $caps))))))
-    (if (local.get $ctrl)
-      (then
-        (if (i32.eq (local.get $vk) (i32.const 0xDB)) (then (return (i32.const 0x1B))))  ;; Ctrl+[
-        (if (i32.eq (local.get $vk) (i32.const 0xDC)) (then (return (i32.const 0x1C))))  ;; Ctrl+\
-        (if (i32.eq (local.get $vk) (i32.const 0xDD)) (then (return (i32.const 0x1D))))  ;; Ctrl+]
-        (if (i32.eq (local.get $vk) (i32.const 0x0D)) (then (return (i32.const 0x0A))))  ;; Ctrl+Enter
-        (if (i32.eq (local.get $vk) (i32.const 0x08)) (then (return (i32.const 0x7F))))  ;; Ctrl+Back
-        (if (i32.eq (local.get $vk) (i32.const 0x20)) (then (return (i32.const 0x20))))
-        (return (i32.const 0))))
-    ;; Top-row digits and their shifted symbols.
-    (if (i32.and (i32.ge_u (local.get $vk) (i32.const 0x30)) (i32.le_u (local.get $vk) (i32.const 0x39)))
-      (then
-        (if (i32.eqz (local.get $shift)) (then (return (local.get $vk))))
-        ;; ) ! @ # $ % ^ & * (
-        (return (call $byte_of_i64_pair
-          (i64.const 0x265E252423402129) (i64.const 0x282A)
-          (i32.sub (local.get $vk) (i32.const 0x30))))))
-    ;; Numeric keypad (Num Lock on).
-    (if (i32.and (i32.ge_u (local.get $vk) (i32.const 0x60)) (i32.le_u (local.get $vk) (i32.const 0x69)))
-      (then (return (i32.sub (local.get $vk) (i32.const 0x30)))))
-    (if (i32.eq (local.get $vk) (i32.const 0x6A)) (then (return (i32.const 0x2A))))  ;; *
-    (if (i32.eq (local.get $vk) (i32.const 0x6B)) (then (return (i32.const 0x2B))))  ;; +
-    (if (i32.eq (local.get $vk) (i32.const 0x6D)) (then (return (i32.const 0x2D))))  ;; -
-    (if (i32.eq (local.get $vk) (i32.const 0x6E)) (then (return (i32.const 0x2E))))  ;; .
-    (if (i32.eq (local.get $vk) (i32.const 0x6F)) (then (return (i32.const 0x2F))))  ;; /
-    ;; VK_OEM_1 ; : .. VK_OEM_3 ` ~ and VK_OEM_4 [ { .. VK_OEM_7 ' "
-    (if (i32.and (i32.ge_u (local.get $vk) (i32.const 0xBA)) (i32.le_u (local.get $vk) (i32.const 0xC0)))
-      (then (local.set $i (i32.sub (local.get $vk) (i32.const 0xBA)))
-        ;; ;:  =+  ,<  -_  .>  /?  `~  as unshifted/shifted pairs
-        (return (call $byte_of_i64_pair
-          (i64.const 0x5F2D3C2C2B3D3A3B) (i64.const 0x7E603F2F3E2E)
-          (i32.add (i32.shl (local.get $i) (i32.const 1)) (local.get $shift))))))
-    (if (i32.and (i32.ge_u (local.get $vk) (i32.const 0xDB)) (i32.le_u (local.get $vk) (i32.const 0xDE)))
-      (then (local.set $i (i32.sub (local.get $vk) (i32.const 0xDB)))
-        ;; [{  \|  ]}  '"
-        (return (call $byte_of_i64_pair
-          (i64.const 0x22277D5D7C5C7B5B) (i64.const 0)
-          (i32.add (i32.shl (local.get $i) (i32.const 1)) (local.get $shift))))))
-    (if (i32.eq (local.get $vk) (i32.const 0x20)) (then (return (i32.const 0x20))))
-    (if (i32.eq (local.get $vk) (i32.const 0x0D)) (then (return (i32.const 0x0D))))
-    (if (i32.eq (local.get $vk) (i32.const 0x1B)) (then (return (i32.const 0x1B))))
-    (if (i32.eq (local.get $vk) (i32.const 0x09)) (then (return (i32.const 0x09))))
-    (if (i32.eq (local.get $vk) (i32.const 0x08)) (then (return (i32.const 0x08))))
-    (i32.const 0))
-
-  ;; ToAscii(uVirtKey, uScanCode, lpKeyState, lpChar, uFlags) → int.
-  ;; The non-Ex entry point uses the same current keyboard layout and output
-  ;; contract. Delegate to the tested translator, then correct its six-argument
-  ;; stdcall pop to this API's five-argument frame.
   (func $handle_ToAscii
     (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (call $handle_ToAsciiEx
@@ -219,6 +315,19 @@
       (local.get $arg0) (local.get $arg1) (local.get $arg2)
       (local.get $arg3) (local.get $arg4) (local.get $name_ptr)))
 
+  ;; ToUnicodeEx adds an explicit layout to ToUnicode's supported US subset.
+  ;; No additional layout or state model: share translation and no-output paths,
+  ;; then restore the entry frame and apply seven-argument cleanup (32 bytes).
+  (func $handle_ToUnicodeEx
+    (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $entry_esp i32)
+    (local.set $entry_esp (i32.load offset=16 (global.get $reg_base)))
+    (call $handle_ToUnicode
+      (local.get $arg0) (local.get $arg1) (local.get $arg2)
+      (local.get $arg3) (local.get $arg4) (local.get $name_ptr))
+    (i32.store offset=16 (global.get $reg_base) (local.get $entry_esp))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 32))))
+
   ;; GetKeyboardState(LPBYTE lpKeyState[256]) → BOOL — 1 arg stdcall.
   ;; SDL polls this every frame to build its keyboard snapshot. Snapshot the
   ;; complete table in one host call: in a guest Worker, calling the scalar
@@ -226,7 +335,46 @@
   ;; The host still uses the non-consuming physical/down-state view, preserving
   ;; GetAsyncKeyState's separate one-shot low press bit.
   (func $handle_GetKeyboardState (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (i32.store offset=0 (global.get $reg_base) (call $host_get_keyboard_state (call $g2w (local.get $arg0))))
+    (local $allocation i32) (local $stage i32) (local $result i32) (local $i i32)
+    (if (local.get $arg0)
+      (then
+        ;; Keep this allocation live through the host RPC and scatter. Locals
+        ;; survive host reentry; heap arenas/free lists belong to each instance,
+        ;; with distinct chunks claimed by heap_low_reserve's shared CAS.
+        (local.set $allocation (call $heap_alloc (i32.const 511)))
+        (if (i32.eqz (local.get $allocation))
+          (then
+            (global.set $last_error (i32.const 8)) ;; ERROR_NOT_ENOUGH_MEMORY
+            (i32.store (global.get $reg_base) (i32.const 0))
+            (i32.store offset=16 (global.get $reg_base)
+              (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
+            (return)))
+        ;; A 256-aligned 256-byte span lies wholly in one guest page, even
+        ;; when the allocation itself crosses separately backed sparse pages.
+        (local.set $stage (call $g2w
+          (i32.and (i32.add (local.get $allocation) (i32.const 255)) (i32.const -256))))
+        ;; The current host can fail after writing a prefix. Seed the stage
+        ;; so copying it back also preserves the untouched destination suffix.
+        (block $gathered (loop $gather
+          (br_if $gathered (i32.ge_u (local.get $i) (i32.const 256)))
+          (i32.store8 (i32.add (local.get $stage) (local.get $i))
+            (call $gl8 (i32.add (local.get $arg0) (local.get $i))))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br $gather))))
+      ;; Preserve the existing NULL translation/host behavior.
+      (else (local.set $stage (call $g2w (local.get $arg0)))))
+    (local.set $result (call $host_get_keyboard_state (local.get $stage)))
+    (if (local.get $allocation)
+      (then
+        (local.set $i (i32.const 0))
+        (block $scattered (loop $scatter
+          (br_if $scattered (i32.ge_u (local.get $i) (i32.const 256)))
+          (call $gs8 (i32.add (local.get $arg0) (local.get $i))
+            (i32.load8_u (i32.add (local.get $stage) (local.get $i))))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br $scatter)))
+        (call $heap_free (local.get $allocation))))
+    (i32.store offset=0 (global.get $reg_base) (local.get $result))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
   )
 
@@ -235,14 +383,8 @@
   ;; toggle bits remain intentionally unmodeled. The host setter updates the
   ;; same async-key backing consumed by subsequent keyboard-state queries.
   (func $handle_SetKeyboardState (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $state i32) (local $i i32)
+    (local $i i32)
     (if (i32.eqz (local.get $arg0))
-      (then
-        (i32.store offset=0 (global.get $reg_base) (i32.const 0))
-        (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
-        (return)))
-    (local.set $state (call $g2w_affine_span (local.get $arg0) (i32.const 256)))
-    (if (i32.eq (local.get $state) (global.get $NULL_SENTINEL))
       (then
         (i32.store offset=0 (global.get $reg_base) (i32.const 0))
         (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
@@ -250,7 +392,7 @@
     (block $done (loop $keys
       (br_if $done (i32.ge_u (local.get $i) (i32.const 256)))
       (call $host_set_key_down_state (local.get $i)
-        (i32.and (i32.load8_u (i32.add (local.get $state) (local.get $i)))
+        (i32.and (call $gl8 (i32.add (local.get $arg0) (local.get $i)))
                  (i32.const 0x80)))
       (local.set $i (i32.add (local.get $i) (i32.const 1)))
       (br $keys)))
@@ -429,7 +571,7 @@
   ;; caller passed, and is echoed back as lpszClassName.
   (func $system_class_describe (param $name_key i32) (param $name_guest i32)
         (param $out_guest i32) (param $hinstance i32) (result i32)
-    (local $class i32) (local $out i32)
+    (local $class i32)
     ;; Both spellings resolve here. USER classes also accept atoms, while the
     ;; implemented common-control classes registered by InitCommonControls are
     ;; string-only; both expose the existing WAT wndproc markers.
@@ -460,34 +602,38 @@
       (then
         (local.set $class (call $comctl_class_ctrl_id (local.get $name_key)))))
     (if (i32.eqz (local.get $class)) (then (return (i32.const 0))))
-    (local.set $out (call $g2w (local.get $out_guest)))
     ;; CS_VREDRAW|CS_HREDRAW|CS_DBLCLKS|CS_GLOBALCLASS, as USER registers these.
     ;; VCL masks the DC bits off and forces CS_PARENTDC regardless of what it is
     ;; told. CS_GLOBALCLASS is what makes them visible to every process, which
     ;; is precisely the property an app is confirming when it asks.
-    (i32.store (local.get $out) (i32.const 0x400B))
-    (i32.store offset=4 (local.get $out)
+    ;; Guest fields may straddle pages with nonadjacent physical backing.
+    (call $gs32 (local.get $out_guest) (i32.const 0x400B))
+    (call $gs32 (i32.add (local.get $out_guest) (i32.const 4))
       (i32.or (global.get $WNDPROC_SYSCLASS) (local.get $class)))
-    (i32.store offset=8 (local.get $out) (i32.const 0))   ;; cbClsExtra
-    (i32.store offset=12 (local.get $out) (i32.const 0))  ;; cbWndExtra
-    (i32.store offset=16 (local.get $out) (local.get $hinstance))
-    (i32.store offset=20 (local.get $out) (i32.const 0))  ;; hIcon
-    (i32.store offset=24 (local.get $out) (i32.const 0))  ;; hCursor
-    (i32.store offset=28 (local.get $out) (i32.const 0))  ;; hbrBackground
-    (i32.store offset=32 (local.get $out) (i32.const 0))  ;; lpszMenuName
-    (i32.store offset=36 (local.get $out) (local.get $name_guest))
+    (call $gs32 (i32.add (local.get $out_guest) (i32.const 8)) (i32.const 0))   ;; cbClsExtra
+    (call $gs32 (i32.add (local.get $out_guest) (i32.const 12)) (i32.const 0))  ;; cbWndExtra
+    (call $gs32 (i32.add (local.get $out_guest) (i32.const 16)) (local.get $hinstance))
+    (call $gs32 (i32.add (local.get $out_guest) (i32.const 20)) (i32.const 0))  ;; hIcon
+    (call $gs32 (i32.add (local.get $out_guest) (i32.const 24)) (i32.const 0))  ;; hCursor
+    (call $gs32 (i32.add (local.get $out_guest) (i32.const 28)) (i32.const 0))  ;; hbrBackground
+    (call $gs32 (i32.add (local.get $out_guest) (i32.const 32)) (i32.const 0))  ;; lpszMenuName
+    (call $gs32 (i32.add (local.get $out_guest) (i32.const 36)) (local.get $name_guest))
     (i32.const 1))
 
   (func $handle_GetClassInfoA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     ;; GetClassInfoA(hInstance, lpClassName, lpWndClass) → BOOL
     ;; Look up class in our class table; if found, copy saved WNDCLASS to output
-    (local $slot i32) (local $src i32)
-    (local.set $slot (call $class_find_slot (call $g2w (local.get $arg1))))
+    (local $slot i32) (local $src i32) (local $i i32)
+    (local.set $slot (call $class_find_slot (call $class_name_key (local.get $arg1))))
     (if (i32.ge_s (local.get $slot) (i32.const 0))
       (then
-        ;; Found — copy 40-byte WNDCLASS from class record to output buffer
+        ;; Class records are internal; the guest output need not be affine.
         (local.set $src (call $class_wndclass_addr (local.get $slot)))
-        (call $memcpy (call $g2w (local.get $arg2)) (local.get $src) (i32.const 40))
+        (loop $copy_class
+          (call $gs32 (i32.add (local.get $arg2) (local.get $i))
+            (i32.load (i32.add (local.get $src) (local.get $i))))
+          (local.set $i (i32.add (local.get $i) (i32.const 4)))
+          (br_if $copy_class (i32.lt_u (local.get $i) (i32.const 40))))
         (i32.store offset=0 (global.get $reg_base) (i32.const 1))
         (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))
         (return)))
@@ -506,13 +652,17 @@
 
   ;; 306: GetClassInfoW(hInstance, lpClassName, lpWndClass)
   (func $handle_GetClassInfoW (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $slot i32) (local $src i32) (local $key i32)
+    (local $slot i32) (local $src i32) (local $i i32) (local $key i32)
     (local.set $key (call $class_wide_name_key (local.get $arg1)))
     (local.set $slot (call $class_find_slot (local.get $key)))
     (if (i32.ge_s (local.get $slot) (i32.const 0))
       (then
         (local.set $src (call $class_wndclass_addr (local.get $slot)))
-        (call $memcpy (call $g2w (local.get $arg2)) (local.get $src) (i32.const 40))
+        (loop $copy_class
+          (call $gs32 (i32.add (local.get $arg2) (local.get $i))
+            (i32.load (i32.add (local.get $src) (local.get $i))))
+          (local.set $i (i32.add (local.get $i) (i32.const 4)))
+          (br_if $copy_class (i32.lt_u (local.get $i) (i32.const 40))))
         (i32.store offset=0 (global.get $reg_base) (i32.const 1))
         (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))
         (return)))
@@ -534,7 +684,7 @@
   ;; and hIconSm appended. $wide selects the class-name lookup spelling.
   (func $get_class_info_ex (param $hinstance i32) (param $name_guest i32)
                            (param $out_guest i32) (param $wide i32) (result i32)
-    (local $key i32) (local $slot i32) (local $src i32) (local $out i32)
+    (local $key i32) (local $slot i32) (local $src i32) (local $i i32)
     (if (i32.or (i32.eqz (local.get $name_guest)) (i32.eqz (local.get $out_guest)))
       (then (return (i32.const 0))))
     (local.set $key
@@ -542,20 +692,23 @@
         (then (call $class_wide_name_key (local.get $name_guest)))
         (else (call $class_name_key (local.get $name_guest)))))
     (local.set $slot (call $class_find_slot (local.get $key)))
-    (local.set $out (call $g2w (local.get $out_guest)))
     (if (i32.ge_s (local.get $slot) (i32.const 0))
       (then
         (local.set $src (call $class_wndclass_addr (local.get $slot)))
-        (call $memcpy (i32.add (local.get $out) (i32.const 4))
-          (local.get $src) (i32.const 40)))
+        (loop $copy_class
+          (call $gs32 (i32.add (i32.add (local.get $out_guest) (i32.const 4)) (local.get $i))
+            (i32.load (i32.add (local.get $src) (local.get $i))))
+          (local.set $i (i32.add (local.get $i) (i32.const 4)))
+          (br_if $copy_class (i32.lt_u (local.get $i) (i32.const 40)))))
       (else
         (if (i32.eqz (call $system_class_describe
               (local.get $key) (local.get $name_guest)
               (i32.add (local.get $out_guest) (i32.const 4)) (local.get $hinstance)))
           (then (return (i32.const 0))))))
-    (i32.store (local.get $out) (i32.const 48))
+    (call $gs32 (local.get $out_guest) (i32.const 48))
     ;; WNDCLASSEX.hIcon is at +24 after the four-byte cbSize prefix.
-    (i32.store offset=44 (local.get $out) (i32.load offset=24 (local.get $out)))
+    (call $gs32 (i32.add (local.get $out_guest) (i32.const 44))
+      (call $gl32 (i32.add (local.get $out_guest) (i32.const 24))))
     (i32.const 1))
 
   (func $handle_GetClassInfoExA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
@@ -927,6 +1080,11 @@ nW — STUB: unimplemented
   ;; +0C=OwningThread, +10=LockSemaphore, +14=SpinCount.
   (func $critical_section_init (param $arg0 i32) (param $spin i32)
     (local $cs i32)
+    ;; Shared sections are initialized in one authority transaction. Never put
+    ;; authority pointers in the process-private WASM cleanup registry.
+    (if (call $shared_heap_address (local.get $arg0)) (then
+      (drop (call $shared_cs_call (i32.const 20) (local.get $arg0) (global.get $current_thread_id) (local.get $spin)))
+      (return)))
     (local.set $cs (call $g2w (local.get $arg0)))
     ;; Zero the struct then set LockCount = -1 (unlocked)
     (i32.store (local.get $cs) (i32.const 0))            ;; DebugInfo
@@ -1008,6 +1166,7 @@ nW — STUB: unimplemented
   ;; ended inside a section, and callers report it.
   (func $cs_release_owned (param $owner i32) (result i32)
     (local $i i32) (local $cs i32) (local $n i32)
+    (local.set $n (call $shared_cs_call (i32.const 27) (i32.const 0) (local.get $owner) (i32.const 0)))
     (block $done
       (loop $scan
         (br_if $done (i32.ge_u (local.get $i) (global.get $CS_TABLE_ENTRIES)))
@@ -1095,6 +1254,24 @@ nW — STUB: unimplemented
   (func $handle_EnterCriticalSection (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $cs i32) (local $me i32) (local $prev i32) (local $spin i32)
     (local $owner i32) (local $round i32)
+    (if (call $shared_heap_address (local.get $arg0)) (then
+      (local.set $prev (call $shared_cs_call (i32.const 22) (local.get $arg0) (global.get $current_thread_id)
+        (if (result i32) (i32.and (i32.ne (global.get $cs_park_pending) (i32.const 0))
+            (i32.eq (global.get $cs_wait_addr) (local.get $arg0)))
+          (then (global.get $cs_wait_owner)) (else (i32.const 0)))))
+      (if (i32.ne (local.get $prev) (i32.const 1)) (then
+        ;; The generation is retained in the parked frame diagnostics. A retry
+        ;; cannot silently acquire a deleted/reinitialized section at this VA.
+        (call $cs_block (local.get $arg0) (local.get $prev)) (return)))
+      (if (global.get $cs_park_pending) (then
+        (if (i32.ne (i32.load offset=16 (global.get $reg_base)) (global.get $cs_park_esp)) (then
+          (global.set $cs_resume_esp_delta (i32.sub (i32.load offset=16 (global.get $reg_base)) (global.get $cs_park_esp)))))
+        (global.set $cs_park_pending (i32.const 0))))
+      (global.set $cs_wait_addr (i32.const 0))
+      (global.set $cs_wait_owner (i32.const 0))
+      (global.set $handler_set_eip (i32.const 0))
+      (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
+      (return)))
     (local.set $cs (call $g2w (local.get $arg0)))
     (local.set $me (global.get $current_thread_id))
     ;; Contended from inside a synchronous wndproc: parking is not available.
@@ -1194,6 +1371,9 @@ nW — STUB: unimplemented
   ;; immediate FALSE and never parks the calling guest thread.
   (func $handle_TryEnterCriticalSection (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $cs i32) (local $me i32) (local $prev i32)
+    (if (call $shared_heap_address (local.get $arg0)) (then
+      (call $toolhelp_return (call $shared_cs_call (i32.const 23) (local.get $arg0) (global.get $current_thread_id) (i32.const 0)) (i32.const 1))
+      (return)))
     (local.set $cs (call $g2w (local.get $arg0)))
     (local.set $me (global.get $current_thread_id))
     (if (call $cs_owner_aligned (local.get $cs))
@@ -1237,6 +1417,10 @@ nW — STUB: unimplemented
   ;; 332: LeaveCriticalSection(lpCriticalSection)
   (func $handle_LeaveCriticalSection (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $cs i32) (local $rec i32)
+    (if (call $shared_heap_address (local.get $arg0)) (then
+      (drop (call $shared_cs_call (i32.const 24) (local.get $arg0) (global.get $current_thread_id) (i32.const 0)))
+      (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
+      (return)))
     (local.set $cs (call $g2w (local.get $arg0)))
     (call $cs_unaligned_lock (local.get $cs))
     ;; A non-owner Leave is invalid and must not mutate the section. The former
@@ -1272,6 +1456,10 @@ nW — STUB: unimplemented
   ;; 333: DeleteCriticalSection(lpCriticalSection)
   (func $handle_DeleteCriticalSection (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $cs i32)
+    (if (call $shared_heap_address (local.get $arg0)) (then
+      (drop (call $shared_cs_call (i32.const 25) (local.get $arg0) (global.get $current_thread_id) (i32.const 0)))
+      (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
+      (return)))
     (local.set $cs (call $g2w (local.get $arg0)))
     (i32.store (local.get $cs) (i32.const 0))
     (i32.store offset=4 (local.get $cs) (i32.const -1))
@@ -1284,6 +1472,20 @@ nW — STUB: unimplemented
     (call $cs_unregister (local.get $cs))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
   )
+
+  ;; Process-shared operations retain authority-owned generations, owner and
+  ;; wait queue. The six public words are projections of that state, never a
+  ;; second independently consumable lock in this process's linear memory.
+  (func $shared_cs_call (param $op i32) (param $address i32) (param $tid i32) (param $generation i32) (result i32)
+    (call $host_shared_heap (local.get $op) (local.get $address) (local.get $tid) (local.get $generation) (call $current_process_id)))
+
+  (func $handle_MakeCriticalSectionGlobal (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    ;; A private pointer cannot be promoted into shared bytes by changing its
+    ;; numeric identity. Win9x callers must allocate the section in HEAP_SHARED.
+    (if (i32.eqz (call $shared_heap_address (local.get $arg0))) (then
+      (call $crash_unimplemented (local.get $name_ptr)) (return)))
+    (drop (call $shared_cs_call (i32.const 21) (local.get $arg0) (global.get $current_thread_id) (i32.const 0)))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8))))
 
   ;; 334: GetCurrentThread — 0 args, return pseudo-handle 0xFFFFFFFE (-2)
   (func $handle_GetCurrentThread (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)

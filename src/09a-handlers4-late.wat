@@ -127,8 +127,8 @@
   ;; it displaced, so returning a fabricated 0 tells every caller it is the
   ;; first one and loses the filter the previous caller had installed.
   (func $handle_SetUnhandledExceptionFilter (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (i32.store offset=0 (global.get $reg_base) (global.get $unhandled_exception_filter))
-    (global.set $unhandled_exception_filter (local.get $arg0))
+    (i32.store offset=0 (global.get $reg_base)
+      (i32.atomic.rmw.xchg (global.get $TOP_EXCEPTION_FILTER) (local.get $arg0)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
   )
 
@@ -443,7 +443,7 @@
 
 rushOrgEx(hdc, x, y, lppt) — canonical WAT-owned brush origin.
   (func $handle_SetBrushOrgEx (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $wa i32) (local $old_x i32) (local $old_y i32) (local $aux i32)
+    (local $old_x i32) (local $old_y i32) (local $aux i32)
     (local.set $aux (call $gdi_dc_aux_entry (local.get $arg0) (i32.const 1)))
     (if (i32.eqz (local.get $aux))
       (then
@@ -454,9 +454,8 @@ rushOrgEx(hdc, x, y, lppt) — canonical WAT-owned brush origin.
     (local.set $old_y (call $gdi_dc_aux_get (local.get $arg0) (i32.const 12) (i32.const 0)))
     (if (local.get $arg3)
       (then
-        (local.set $wa (call $g2w (local.get $arg3)))
-        (store.field Point x (local.get $wa) (local.get $old_x))
-        (store.field Point y (local.get $wa) (local.get $old_y))
+        (call $gs32 (local.get $arg3) (local.get $old_x))
+        (call $gs32 (i32.add (local.get $arg3) (i32.const 4)) (local.get $old_y))
       )
     )
     (drop (call $gdi_dc_aux_set (local.get $arg0) (i32.const 8)
@@ -967,6 +966,17 @@ rushOrgEx(hdc, x, y, lppt) — canonical WAT-owned brush origin.
                 (then (i32.const 900))
                 (else (i32.const 0))))))))
         (return (i32.const 1))))
+    ;; SPI_GETMOUSEHOVERWIDTH/HEIGHT/TIME (0x62/0x64/0x66): the rectangle and
+    ;; delay TrackMouseEvent's TME_HOVER uses (09a5 $tme_*), one source.
+    (if (i32.ge_s (call $tme_spi_value (local.get $arg0)) (i32.const 0))
+      (then
+        (if (i32.eqz (local.get $arg2)) (then (return (i32.const 0))))
+        (local.set $buf
+          (call $g2w_affine_span (local.get $arg2) (i32.const 4)))
+        (if (i32.eq (local.get $buf) (global.get $NULL_SENTINEL))
+          (then (return (i32.const 0))))
+        (i32.store (local.get $buf) (call $tme_spi_value (local.get $arg0)))
+        (return (i32.const 1))))
     ;; SPI_GETNONCLIENTMETRICS = 0x29: fill NONCLIENTMETRICS struct
     ;; Win9x applications commonly pass uiParam=0 and declare the versioned
     ;; layout through NONCLIENTMETRICS.cbSize. Newer callers also pass the size
@@ -1098,14 +1108,16 @@ rushOrgEx(hdc, x, y, lppt) — canonical WAT-owned brush origin.
 
   ;; 121: DrawFocusRect(hdc, lprc)
   (func $handle_DrawFocusRect (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $rc i32) (local $desc i32)
-    (local.set $rc (call $g2w (local.get $arg1)))
+    (local $desc i32)
     (local.set $desc (global.get $GDI_LINE_DESC))
     (if (call $gdi_surface_descriptor (local.get $arg0) (local.get $desc))
       (then (i32.store offset=0 (global.get $reg_base) (call $gdi_focus_rect_desc
         (local.get $arg0) (local.get $desc)
-        (load.field Rect left (local.get $rc)) (load.field.memarg Rect top (local.get $rc))
-        (load.field.memarg Rect right (local.get $rc)) (load.field.memarg Rect bottom (local.get $rc)))))
+        ;; Adjacent guest pages need not have adjacent backing storage.
+        (call $gl32 (i32.add (local.get $arg1) (offset-of Rect left)))
+        (call $gl32 (i32.add (local.get $arg1) (offset-of Rect top)))
+        (call $gl32 (i32.add (local.get $arg1) (offset-of Rect right)))
+        (call $gl32 (i32.add (local.get $arg1) (offset-of Rect bottom))))))
       (else (i32.store offset=0 (global.get $reg_base) (i32.const 0))))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))  ;; ret + 2 args
   )
@@ -1383,6 +1395,14 @@ rushOrgEx(hdc, x, y, lppt) — canonical WAT-owned brush origin.
   ;; mouse motion; DOSBox therefore left its DOS cursor frozen over every game
   ;; after changing video mode from hwnd 0x10001 to hwnd 0x10005.
   (func $handle_WindowFromPoint (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (i32.store offset=0 (global.get $reg_base)
+      (call $wnd_window_from_point (local.get $arg0) (local.get $arg1)))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
+  )
+
+  ;; The window USER finds at screen point (arg0, arg1), or 0. Shared by
+  ;; WindowFromPoint and the TrackMouseEvent leave check (09a5).
+  (func $wnd_window_from_point (param $arg0 i32) (param $arg1 i32) (result i32)
     (local $slot i32) (local $hwnd i32) (local $best i32)
     (local $z i32) (local $best_z i32)
     (local $x i32) (local $y i32) (local $w i32) (local $h i32)
@@ -1421,9 +1441,7 @@ rushOrgEx(hdc, x, y, lppt) — canonical WAT-owned brush origin.
       (then
         (local.set $deep (call $wnd_child_from_point_deep
           (local.get $best) (local.get $arg0) (local.get $arg1)))))
-    (i32.store offset=0 (global.get $reg_base) (select (local.get $deep) (local.get $best) (local.get $deep)))
-    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
-  )
+    (select (local.get $deep) (local.get $best) (local.get $deep)))
 
   ;; 403: IsRectEmpty — STUB: unimplemented
   ;; IsRectEmpty(lpRect=arg0) → BOOL. Empty iff right<=left OR bottom<=top.
@@ -1477,8 +1495,8 @@ rushOrgEx(hdc, x, y, lppt) — canonical WAT-owned brush origin.
   ;; Change this thread queue's active top-level and synchronously deliver the
   ;; documented WM_ACTIVATE pair. Deactivation sees the old active HWND;
   ;; publication occurs before the new window's activation callback. If it picks
-  ;; a descendant focus itself, preserve that choice; otherwise DefWindowProc's
-  ;; default is represented by moving focus to the activated top-level.
+  ;; focus itself (including NULL), preserve that choice. DefWindowProc owns
+  ;; WM_ACTIVATE's default focus handling, inside the notification.
   ;; Queue-instance generation advances only when a different HWND is
   ;; published. This catches nested A->C->A without cancelling on SetActive(A).
   (global $active_transition_serial (mut i32) (i32.const 0))
@@ -1493,7 +1511,7 @@ rushOrgEx(hdc, x, y, lppt) — canonical WAT-owned brush origin.
   ;; The cause belongs to this invocation, not a global: a mouse activation
   ;; callback may call SetActiveWindow, whose nested notification is WA_ACTIVE.
   (func $active_window_transition_reason (param $target i32) (param $reason i32) (result i32)
-    (local $previous i32) (local $old_focus i32) (local $serial i32) (local $focus_serial i32)
+    (local $previous i32) (local $old_focus i32) (local $serial i32)
     (local.set $previous (global.get $active_hwnd))
     (if (i32.and
           (i32.ne (local.get $previous) (i32.const 0))
@@ -1541,40 +1559,15 @@ rushOrgEx(hdc, x, y, lppt) — canonical WAT-owned brush origin.
           (i32.ne (global.get $active_hwnd) (local.get $target)))
       (then (return (local.get $previous))))
 
-    ;; WM_ACTIVATE's default procedure assigns focus only when the window is
-    ;; not minimized. Respect an application-selected child focus established
-    ;; by the activation callback itself.
+    ;; Do not repeat DefWindowProc's focus policy after WM_ACTIVATE returns.
+    ;; A handled notification may deliberately keep another focus or NULL;
+    ;; even SetFocus(NULL) while already NULL must survive. Publication serials
+    ;; cannot distinguish that same-value choice from no focus call at all.
+    ;; Default processing already validates disabled/foreign/dead targets in
+    ;; focus_set_core and preserves reentrant focus notification winners.
     (local.set $old_focus (global.get $focus_hwnd))
-    (if (i32.and
-          (i32.and
-            (i32.ne (local.get $target) (i32.const 0))
-            (i32.eq (global.get $active_hwnd) (local.get $target)))
-          (i32.and
-            (i32.ge_s (call $wnd_table_find (local.get $target)) (i32.const 0))
-            (i32.eqz (call $wnd_min_get (local.get $target)))))
+    (if (i32.eqz (local.get $target))
       (then
-        (if (i32.or
-              (i32.eqz (local.get $old_focus))
-              (i32.ne (call $wnd_top_level (local.get $old_focus)) (local.get $target)))
-          (then
-            (drop (call $focus_publish (local.get $target)))
-            (local.set $focus_serial (global.get $focus_transition_serial))
-            (if (i32.and
-                  (i32.ne (local.get $old_focus) (i32.const 0))
-                  (i32.ge_s (call $wnd_table_find (local.get $old_focus)) (i32.const 0)))
-              (then
-                (drop (call $wnd_send_message
-                  (local.get $old_focus) (i32.const 0x0008) ;; WM_KILLFOCUS
-                  (local.get $target) (i32.const 0)))))
-            (if (i32.or
-                  (i32.ne (global.get $active_transition_serial) (local.get $serial))
-                  (i32.or (i32.ne (global.get $active_hwnd) (local.get $target))
-                    (i32.eqz (call $focus_transfer_current (local.get $target) (local.get $focus_serial)))))
-              (then (return (local.get $previous))))
-            (drop (call $wnd_send_message
-              (local.get $target) (i32.const 0x0007) ;; WM_SETFOCUS
-              (local.get $old_focus) (i32.const 0))))))
-      (else
         ;; Clearing this thread's active window also releases focus belonging
         ;; to the window being deactivated.
         (if (i32.and
@@ -1683,18 +1676,29 @@ rushOrgEx(hdc, x, y, lppt) — canonical WAT-owned brush origin.
 
 SetColorAdjustment — validate and copy complete per-DC state.
   (func $handle_SetColorAdjustment (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (i32.store offset=0 (global.get $reg_base) (call $gdi_color_adjustment_set
-      (local.get $arg0)
-      (if (result i32) (local.get $arg1)
-        (then (call $g2w (local.get $arg1))) (else (i32.const 0)))))
+    (local $buffer i32) (local $result i32)
+    ;; Transport exactly one COLORADJUSTMENT; the helper keeps its physical ABI.
+    (if (local.get $arg1)
+      (then (local.set $buffer (call $guest_span_in (local.get $arg1) (i32.const 24)))))
+    (local.set $result (call $gdi_color_adjustment_set
+      (local.get $arg0) (local.get $buffer)))
+    (call $guest_span_release (local.get $buffer) (i32.const 24))
+    (i32.store offset=0 (global.get $reg_base) (local.get $result))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
   )
 
   (func $handle_GetColorAdjustment (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (i32.store offset=0 (global.get $reg_base) (call $gdi_color_adjustment_get
-      (local.get $arg0)
-      (if (result i32) (local.get $arg1)
-        (then (call $g2w (local.get $arg1))) (else (i32.const 0)))))
+    (local $buffer i32) (local $result i32)
+    ;; Transport exactly one COLORADJUSTMENT; the helper keeps its physical ABI.
+    (if (i32.and (i32.ne (local.get $arg0) (i32.const 0))
+          (i32.ne (local.get $arg1) (i32.const 0)))
+      (then (local.set $buffer (call $guest_span_in (local.get $arg1) (i32.const 24)))))
+    (local.set $result (call $gdi_color_adjustment_get
+      (local.get $arg0) (local.get $buffer)))
+    (if (local.get $result)
+      (then (call $guest_span_writeback (local.get $arg1) (local.get $buffer) (i32.const 24)))
+      (else (call $guest_span_release (local.get $buffer) (i32.const 24))))
+    (i32.store offset=0 (global.get $reg_base) (local.get $result))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
   )
 
@@ -1736,8 +1740,7 @@ SetColorAdjustment — validate and copy complete per-DC state.
   (func $handle_GetTextFaceW (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (i32.store offset=0 (global.get $reg_base) (call $gdi_font_write_text_face
       (local.get $arg0) (local.get $arg1)
-      (if (result i32) (local.get $arg2)
-        (then (call $g2w (local.get $arg2))) (else (i32.const 0)))
+      (local.get $arg2)
       (i32.const 1)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))
   )
@@ -2112,6 +2115,8 @@ SetColorAdjustment — validate and copy complete per-DC state.
     ;; Our heap stores block size (including 4-byte header) at [ptr-4]
     ;; Only valid for pointers in our heap range; return -1 for unknown pointers
     (local $size i32)
+    (if (call $shared_heap_handle (local.get $arg0)) (then
+      (call $toolhelp_return (call $shared_heap_api (i32.const 6) (local.get $arg0) (local.get $arg1) (local.get $arg2) (i32.const 0)) (i32.const 3)) (return)))
     (if (i32.eqz (call $heap_api_handle_valid (local.get $arg0)))
       (then
         (global.set $last_error (i32.const 6)) ;; ERROR_INVALID_HANDLE

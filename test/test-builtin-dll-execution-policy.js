@@ -36,7 +36,8 @@ function fixture() {
     'handle_GetModuleHandleA_locked', 'handle_GetProcAddress_pinned', 'dll_name_match',
     'tolower', 'str_eq', 'freelib_mark_loaded', 'dll_synthetic_reference',
     'resolve_static_module_ordinal', 'gl_dynamic_api_unsupported'];
-  for (const n of ['static_sys_dll_names', 'loadlib_builtin_only', 'loadlib_name_is_qualified'])
+  for (const n of ['static_sys_dll_names', 'loadlib_builtin_only', 'loadlib_name_is_qualified',
+    'loadlib_emulated_when_absent'])
     if (sources.some(s=>s.includes('(func $' + n + ' '))) names.push(n);
   let body = names.map(extract).join('\n');
   // Fixture-local layout, not a copy of any engine-allocated address.
@@ -188,7 +189,7 @@ async function main() {
     assert(h && e.yielded()===0,name+' without a file is the builtin module');
     assert(!handles.has(h),name+' distinct identity'); handles.add(h);
   }
-  for (const name of ['msvcrt.dll','d3drm.dll','ole32.dll','comctl32.dll','oleaut32.dll','shell32.dll','shlwapi.dll','dsetup.dll','vendor.dll']) {
+  for (const name of ['msvcrt.dll','d3drm.dll','ole32.dll','oleaut32.dll','shell32.dll','shlwapi.dll','dsetup.dll','vendor.dll']) {
     vfs.files.set('c:\\'+name,{data:original,attrs:0x20});
     e.load(write(name),0); assert.equal(e.yielded(),5,name+' keeps native mapping route');
   }

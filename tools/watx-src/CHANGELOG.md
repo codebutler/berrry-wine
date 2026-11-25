@@ -1,3 +1,56 @@
+## 2026-11-25 — merge upstream main over the region `(bitmap (count N))` clause
+
+The upstream merge brings the opt-in pass-1 facts (2026-11-21) together with
+this tree's region `(bitmap (count N))` clause and law-as-extent regions. The
+two touch disjoint parts of `compiler-codegen.js`; the merged file is both
+changes, with no edit of its own.
+
+Manifest-sha256: 762661ff225a6ead22410a846758eb42b01d32e2ab9f94b696596a4bdb13faf1
+
+## 2026-11-21 — opt-in pass-1 facts (`compile(..., { facts: true })`)
+
+`compile()` takes a new option, `facts`, and when it is set returns
+`result.facts`: what the compile already resolved, as plain JSON-able data —
+the lowered declaration records (`layout-lowered` without its derived
+`fieldByName` map, `enum-lowered` with `members` as an object, `union-lowered`,
+`view-lowered`), the region report, the memory, imports, the export section in
+order with resolved targets and signatures, defined functions with their index
+and signature, the global index space with each initializer's resolved value,
+and the active data segments. Nothing in it is host-specific; a host uses it to
+answer declaration-only questions without parsing and expanding the closure a
+second time (this tree: docs/watx-facts.md, tools/watx-facts.js).
+
+`compiler-codegen.js` keeps a reference to the export section's entry list
+(`emittedExports`) and builds `facts` from state the sections already computed,
+after the binary is finished. `compiler.js` adds `watxCompileFacts()` and
+attaches its result. No language form, syntax, diagnostic or emission path
+changed; without the option the result object is the same as before (no
+`facts` key is set).
+
+Evidence: `test/watx-compiler-facts.test.js` compiles one module with and
+without `facts` and requires identical binaries, checks every fact category
+against the instantiated module, and asserts the facts are plain data. On this
+tree, with facts on for the tail compile, `build/wine-assembly.wasm` is still
+`9bdd13d9aed7018353006c3a0953d069bd9892d1480f8e9a6878b27a1a6d614f` and
+`build/wine-assembly.compat.wasm` still
+`d5321b188970e4ab9ca17df06bc3241e1bd057af7d18b0c020360df759791280`, the
+origin/main bytes (e83c6221c).
+
+Manifest-sha256: 8d70e799517252e56bc0717eaa22294da814ae307ec2792a78513c1b06a7e46d
+
+## 2026-11-18 — preserve Node source Buffer bytes during comment decoding
+
+`tools/watx.js` passes Node Buffers to the byte-to-text helper through a plain
+Uint8Array view with the same offset and length. The compiler's lazy comment
+copy then uses Uint8Array.slice rather than Buffer.slice, which aliases caller
+storage. ROCKROLL's source hash audit exposed the mutation after compilation.
+The vendored parser and normalization algorithm are unchanged; ASCII sources
+still avoid the lazy copy. The production test now verifies Buffer and typed
+array immutability, bounded Buffer views, and original UTF-8 fallback after a
+non-ASCII comment, alongside emitted-module equivalence.
+
+Manifest-sha256: 05b1f8dfeb6d4e70b0d187bc937216a735fdba72843cf4a721b4c0391173fe22
+
 ## 2026-10-30 — build-scoped lexical scan reuse
 
 Recover the lexical mechanism from stranded chains01/05 (candidate

@@ -99,17 +99,16 @@
   ;; (the two codecs, decode only). The ADPCM tags list no standard formats
   ;; because acmFormatDetails describes PCM only.
   (func $acm_format_tag_details (param $paftd i32) (param $fdw i32) (param $wide i32) (result i32)
-    (local $wa i32) (local $query i32) (local $index i32) (local $tag i32) (local $len i32)
+    (local $query i32) (local $index i32) (local $tag i32) (local $len i32)
     (if (i32.eqz (local.get $paftd))
       (then (return (i32.const 0x00000057))))     ;; MMSYSERR_INVALPARAM
-    (local.set $wa (call $g2w (local.get $paftd)))
     (local.set $query (i32.and (local.get $fdw) (i32.const 0x0000000F)))
     (local.set $index (i32.const -1))
     (if (i32.eqz (local.get $query))              ;; ACM_FORMATTAGDETAILSF_INDEX
-      (then (local.set $index (i32.load offset=4 (local.get $wa)))))
+      (then (local.set $index (call $gl32 (i32.add (local.get $paftd) (i32.const 4))))))
     (if (i32.eq (local.get $query) (i32.const 1)) ;; ACM_FORMATTAGDETAILSF_FORMATTAG
       (then
-        (local.set $tag (i32.load offset=8 (local.get $wa)))
+        (local.set $tag (call $gl32 (i32.add (local.get $paftd) (i32.const 8))))
         (if (i32.eq (local.get $tag) (i32.const 1)) (then (local.set $index (i32.const 0))))
         (if (i32.eq (local.get $tag) (i32.const 2)) (then (local.set $index (i32.const 1))))
         (if (i32.eq (local.get $tag) (i32.const 0x11)) (then (local.set $index (i32.const 2))))))
@@ -117,37 +116,37 @@
       (then (return (i32.const 512))))            ;; ACMERR_NOTPOSSIBLE
     ;; Keep the caller's cbStruct — it declares the size it allocated. The
     ;; name field is 48 chars, so a wide one runs to +24+96.
-    (call $zero_memory (i32.add (local.get $wa) (i32.const 4))
+    (call $guest_memset (i32.add (local.get $paftd) (i32.const 4)) (i32.const 0)
       (select (i32.const 116) (i32.const 68) (local.get $wide)))
-    (i32.store offset=4 (local.get $wa) (local.get $index))
+    (call $gs32 (i32.add (local.get $paftd) (i32.const 4)) (local.get $index))
     (if (i32.eqz (local.get $index))
       (then
-        (i32.store offset=8  (local.get $wa) (i32.const 1))    ;; WAVE_FORMAT_PCM
-        (i32.store offset=12 (local.get $wa) (i32.const 16))   ;; PCM WAVEFORMATEX
-        (i32.store offset=16 (local.get $wa) (i32.const 0x04)) ;; SUPPORTF_CONVERTER
+        (call $gs32 (i32.add (local.get $paftd) (i32.const 8)) (i32.const 1))    ;; WAVE_FORMAT_PCM
+        (call $gs32 (i32.add (local.get $paftd) (i32.const 12)) (i32.const 16))   ;; PCM WAVEFORMATEX
+        (call $gs32 (i32.add (local.get $paftd) (i32.const 16)) (i32.const 0x04)) ;; SUPPORTF_CONVERTER
         ;; 4 sample rates x 8/16 bit x mono/stereo, the set waveOutGetDevCaps
         ;; below reports as supported.
-        (i32.store offset=20 (local.get $wa) (i32.const 16))
-        (i32.store offset=24 (local.get $wa) (i32.const 0x004D4350))  ;; "PCM\0"
+        (call $gs32 (i32.add (local.get $paftd) (i32.const 20)) (i32.const 16))
+        (call $gs32 (i32.add (local.get $paftd) (i32.const 24)) (i32.const 0x004D4350))  ;; "PCM\0"
         (local.set $len (i32.const 3))))
     (if (i32.eq (local.get $index) (i32.const 1))
       (then
-        (i32.store offset=8  (local.get $wa) (i32.const 2))    ;; WAVE_FORMAT_ADPCM
-        (i32.store offset=12 (local.get $wa) (i32.const 50))   ;; with 7 coefficient pairs
-        (i32.store offset=16 (local.get $wa) (i32.const 0x01)) ;; SUPPORTF_CODEC
-        (i32.store offset=24 (local.get $wa) (i32.const 0x7263694D))  ;; "Micr"
-        (i32.store offset=28 (local.get $wa) (i32.const 0x666F736F))  ;; "osof"
-        (i32.store offset=32 (local.get $wa) (i32.const 0x44412074))  ;; "t AD"
-        (i32.store offset=36 (local.get $wa) (i32.const 0x004D4350))  ;; "PCM\0"
+        (call $gs32 (i32.add (local.get $paftd) (i32.const 8)) (i32.const 2))    ;; WAVE_FORMAT_ADPCM
+        (call $gs32 (i32.add (local.get $paftd) (i32.const 12)) (i32.const 50))   ;; with 7 coefficient pairs
+        (call $gs32 (i32.add (local.get $paftd) (i32.const 16)) (i32.const 0x01)) ;; SUPPORTF_CODEC
+        (call $gs32 (i32.add (local.get $paftd) (i32.const 24)) (i32.const 0x7263694D))  ;; "Micr"
+        (call $gs32 (i32.add (local.get $paftd) (i32.const 28)) (i32.const 0x666F736F))  ;; "osof"
+        (call $gs32 (i32.add (local.get $paftd) (i32.const 32)) (i32.const 0x44412074))  ;; "t AD"
+        (call $gs32 (i32.add (local.get $paftd) (i32.const 36)) (i32.const 0x004D4350))  ;; "PCM\0"
         (local.set $len (i32.const 15))))
     (if (i32.eq (local.get $index) (i32.const 2))
       (then
-        (i32.store offset=8  (local.get $wa) (i32.const 0x11)) ;; WAVE_FORMAT_IMA_ADPCM
-        (i32.store offset=12 (local.get $wa) (i32.const 20))   ;; + wSamplesPerBlock
-        (i32.store offset=16 (local.get $wa) (i32.const 0x01)) ;; SUPPORTF_CODEC
-        (i32.store offset=24 (local.get $wa) (i32.const 0x20414D49))  ;; "IMA "
-        (i32.store offset=28 (local.get $wa) (i32.const 0x43504441))  ;; "ADPC"
-        (i32.store offset=32 (local.get $wa) (i32.const 0x0000004D))  ;; "M\0"
+        (call $gs32 (i32.add (local.get $paftd) (i32.const 8)) (i32.const 0x11)) ;; WAVE_FORMAT_IMA_ADPCM
+        (call $gs32 (i32.add (local.get $paftd) (i32.const 12)) (i32.const 20))   ;; + wSamplesPerBlock
+        (call $gs32 (i32.add (local.get $paftd) (i32.const 16)) (i32.const 0x01)) ;; SUPPORTF_CODEC
+        (call $gs32 (i32.add (local.get $paftd) (i32.const 24)) (i32.const 0x20414D49))  ;; "IMA "
+        (call $gs32 (i32.add (local.get $paftd) (i32.const 28)) (i32.const 0x43504441))  ;; "ADPC"
+        (call $gs32 (i32.add (local.get $paftd) (i32.const 32)) (i32.const 0x0000004D))  ;; "M\0"
         (local.set $len (i32.const 9))))
     (if (local.get $wide)
       (then (call $acm_widen_in_place
@@ -255,19 +254,18 @@
   ;; the caller already put a WAVEFORMATEX in pwfx and wants it named. Both
   ;; write szFormat, which is the part an app puts in front of a user.
   (func $acm_format_details (param $pafd i32) (param $fdw i32) (param $wide i32) (result i32)
-    (local $wa i32) (local $query i32) (local $index i32)
+    (local $query i32) (local $index i32)
     (local $pwfx i32) (local $cbwfx i32) (local $rate i32) (local $bits i32) (local $ch i32)
     (if (i32.eqz (local.get $pafd))
       (then (return (i32.const 0x00000057))))     ;; MMSYSERR_INVALPARAM
-    (local.set $wa (call $g2w (local.get $pafd)))
     (local.set $query (i32.and (local.get $fdw) (i32.const 0x0000000F)))
-    (local.set $index (i32.load offset=4 (local.get $wa)))
-    (local.set $pwfx (i32.load offset=16 (local.get $wa)))
-    (local.set $cbwfx (i32.load offset=20 (local.get $wa)))
+    (local.set $index (call $gl32 (i32.add (local.get $pafd) (i32.const 4))))
+    (local.set $pwfx (call $gl32 (i32.add (local.get $pafd) (i32.const 16))))
+    (local.set $cbwfx (call $gl32 (i32.add (local.get $pafd) (i32.const 20))))
     ;; PCM is the only tag; tag 0 (WAVE_FORMAT_UNKNOWN) means "any".
     (if (i32.and
-          (i32.ne (i32.load offset=8 (local.get $wa)) (i32.const 1))
-          (i32.ne (i32.load offset=8 (local.get $wa)) (i32.const 0)))
+          (i32.ne (call $gl32 (i32.add (local.get $pafd) (i32.const 8))) (i32.const 1))
+          (i32.ne (call $gl32 (i32.add (local.get $pafd) (i32.const 8))) (i32.const 0)))
       (then (return (i32.const 512))))            ;; ACMERR_NOTPOSSIBLE
     (if (i32.eqz (local.get $query))
       (then
@@ -279,28 +277,26 @@
         (if (i32.and (i32.ne (local.get $pwfx) (i32.const 0))
               (i32.ge_u (local.get $cbwfx) (i32.const 16)))
           (then
-            (local.set $pwfx (call $g2w (local.get $pwfx)))
-            (i32.store16 (local.get $pwfx) (i32.const 1))              ;; WAVE_FORMAT_PCM
-            (i32.store16 offset=2 (local.get $pwfx) (local.get $ch))
-            (i32.store offset=4 (local.get $pwfx) (local.get $rate))
-            (i32.store offset=8 (local.get $pwfx)                       ;; nAvgBytesPerSec
+            (call $gs16 (local.get $pwfx) (i32.const 1))              ;; WAVE_FORMAT_PCM
+            (call $gs16 (i32.add (local.get $pwfx) (i32.const 2)) (local.get $ch))
+            (call $gs32 (i32.add (local.get $pwfx) (i32.const 4)) (local.get $rate))
+            (call $gs32 (i32.add (local.get $pwfx) (i32.const 8))                       ;; nAvgBytesPerSec
               (i32.mul (local.get $rate)
                 (i32.mul (local.get $ch) (i32.shr_u (local.get $bits) (i32.const 3)))))
-            (i32.store16 offset=12 (local.get $pwfx)                    ;; nBlockAlign
+            (call $gs16 (i32.add (local.get $pwfx) (i32.const 12))                    ;; nBlockAlign
               (i32.mul (local.get $ch) (i32.shr_u (local.get $bits) (i32.const 3))))
-            (i32.store16 offset=14 (local.get $pwfx) (local.get $bits))
+            (call $gs16 (i32.add (local.get $pwfx) (i32.const 14)) (local.get $bits))
             (if (i32.ge_u (local.get $cbwfx) (i32.const 18))
-              (then (i32.store16 offset=16 (local.get $pwfx) (i32.const 0))))))
-        (i32.store offset=8 (local.get $wa) (i32.const 1)))
+              (then (call $gs16 (i32.add (local.get $pwfx) (i32.const 16)) (i32.const 0))))))
+        (call $gs32 (i32.add (local.get $pafd) (i32.const 8)) (i32.const 1)))
       (else
         ;; Name the caller's own format. Read it back rather than trusting the
         ;; index, and find the matching standard entry for the name.
         (if (i32.eqz (local.get $pwfx))
           (then (return (i32.const 0x00000057))))
-        (local.set $pwfx (call $g2w (local.get $pwfx)))
-        (local.set $rate (i32.load offset=4 (local.get $pwfx)))
-        (local.set $bits (i32.load16_u offset=14 (local.get $pwfx)))
-        (local.set $ch   (i32.load16_u offset=2 (local.get $pwfx)))
+        (local.set $rate (call $gl32 (i32.add (local.get $pwfx) (i32.const 4))))
+        (local.set $bits (call $gl16 (i32.add (local.get $pwfx) (i32.const 14))))
+        (local.set $ch   (call $gl16 (i32.add (local.get $pwfx) (i32.const 2))))
         (local.set $index
           (i32.or
             (i32.shl
@@ -316,7 +312,7 @@
                 (i32.ge_u (local.get $bits) (i32.const 16))) (i32.const 1))
               (select (i32.const 1) (i32.const 0)
                 (i32.ge_u (local.get $ch) (i32.const 2))))))))
-    (i32.store offset=12 (local.get $wa) (i32.const 0x04))   ;; SUPPORTF_CONVERTER
+    (call $gs32 (i32.add (local.get $pafd) (i32.const 12)) (i32.const 0x04))   ;; SUPPORTF_CONVERTER
     (local.set $index (call $acm_pcm_format_name
       (i32.add (local.get $pafd) (i32.const 24)) (local.get $index)))
     (if (local.get $wide)
@@ -344,36 +340,34 @@
   ;;   WFORMATTAG 0x10000  NCHANNELS 0x20000  NSAMPLESPERSEC 0x40000
   ;;   WBITSPERSAMPLE 0x80000
   (func $acm_format_suggest (param $src i32) (param $dst i32) (param $cb i32) (param $fdw i32) (result i32)
-    (local $sw i32) (local $dw i32) (local $ch i32) (local $rate i32) (local $bits i32)
+    (local $ch i32) (local $rate i32) (local $bits i32)
     (if (i32.or (i32.eqz (local.get $src)) (i32.eqz (local.get $dst)))
       (then (return (i32.const 11))))                       ;; MMSYSERR_INVALPARAM
     (if (i32.lt_u (local.get $cb) (i32.const 16))
       (then (return (i32.const 11))))
-    (local.set $sw (call $g2w (local.get $src)))
-    (local.set $dw (call $g2w (local.get $dst)))
     ;; An ADPCM source: the codecs decode to 16-bit (or, pinned, 8-bit) PCM
     ;; at the source's rate and channel count, and nothing else (they do not
     ;; resample or remix). Every field the caller pins must agree with that.
     (if (call $acm_adpcm_samples_per_block (local.get $src))
       (then
-        (local.set $ch (i32.load16_u offset=2 (local.get $sw)))
-        (local.set $rate (i32.load offset=4 (local.get $sw)))
+        (local.set $ch (call $gl16 (i32.add (local.get $src) (i32.const 2))))
+        (local.set $rate (call $gl32 (i32.add (local.get $src) (i32.const 4))))
         (if (i32.or
               (i32.or
                 (i32.and (i32.ne (i32.and (local.get $fdw) (i32.const 0x10000)) (i32.const 0))
-                         (i32.ne (i32.load16_u (local.get $dw)) (i32.const 1)))
+                         (i32.ne (call $gl16 (local.get $dst)) (i32.const 1)))
                 (i32.and (i32.ne (i32.and (local.get $fdw) (i32.const 0x20000)) (i32.const 0))
-                         (i32.ne (i32.load16_u offset=2 (local.get $dw)) (local.get $ch))))
+                         (i32.ne (call $gl16 (i32.add (local.get $dst) (i32.const 2))) (local.get $ch))))
               (i32.or
                 (i32.and (i32.ne (i32.and (local.get $fdw) (i32.const 0x40000)) (i32.const 0))
-                         (i32.ne (i32.load offset=4 (local.get $dw)) (local.get $rate)))
+                         (i32.ne (call $gl32 (i32.add (local.get $dst) (i32.const 4))) (local.get $rate)))
                 (i32.and (i32.ne (i32.and (local.get $fdw) (i32.const 0x80000)) (i32.const 0))
-                         (i32.and (i32.ne (i32.load16_u offset=14 (local.get $dw)) (i32.const 16))
-                                  (i32.ne (i32.load16_u offset=14 (local.get $dw)) (i32.const 8))))))
+                         (i32.and (i32.ne (call $gl16 (i32.add (local.get $dst) (i32.const 14))) (i32.const 16))
+                                  (i32.ne (call $gl16 (i32.add (local.get $dst) (i32.const 14))) (i32.const 8))))))
           (then (return (i32.const 512))))                  ;; ACMERR_NOTPOSSIBLE
         (local.set $bits (select (i32.const 8) (i32.const 16)
           (i32.and (i32.ne (i32.and (local.get $fdw) (i32.const 0x80000)) (i32.const 0))
-                   (i32.eq (i32.load16_u offset=14 (local.get $dw)) (i32.const 8)))))
+                   (i32.eq (call $gl16 (i32.add (local.get $dst) (i32.const 14))) (i32.const 8)))))
         (call $acm_write_pcm16_format (local.get $dst) (local.get $cb)
           (local.get $ch) (local.get $rate))
         (if (i32.eq (local.get $bits) (i32.const 8))
@@ -382,19 +376,19 @@
             (call $gs16 (i32.add (local.get $dst) (i32.const 12)) (local.get $ch))
             (call $gs16 (i32.add (local.get $dst) (i32.const 14)) (i32.const 8))))
         (return (i32.const 0))))
-    (if (i32.ne (i32.load16_u (local.get $sw)) (i32.const 1))
+    (if (i32.ne (call $gl16 (local.get $src)) (i32.const 1))
       (then (return (i32.const 512))))                      ;; ACMERR_NOTPOSSIBLE
     (if (i32.and (i32.ne (i32.and (local.get $fdw) (i32.const 0x10000)) (i32.const 0))
-                 (i32.ne (i32.load16_u (local.get $dw)) (i32.const 1)))
+                 (i32.ne (call $gl16 (local.get $dst)) (i32.const 1)))
       (then (return (i32.const 512))))
-    (local.set $ch (select (i32.load16_u offset=2 (local.get $dw))
-                           (i32.load16_u offset=2 (local.get $sw))
+    (local.set $ch (select (call $gl16 (i32.add (local.get $dst) (i32.const 2)))
+                           (call $gl16 (i32.add (local.get $src) (i32.const 2)))
                            (i32.ne (i32.and (local.get $fdw) (i32.const 0x20000)) (i32.const 0))))
-    (local.set $rate (select (i32.load offset=4 (local.get $dw))
-                             (i32.load offset=4 (local.get $sw))
+    (local.set $rate (select (call $gl32 (i32.add (local.get $dst) (i32.const 4)))
+                             (call $gl32 (i32.add (local.get $src) (i32.const 4)))
                              (i32.ne (i32.and (local.get $fdw) (i32.const 0x40000)) (i32.const 0))))
-    (local.set $bits (select (i32.load16_u offset=14 (local.get $dw))
-                             (i32.load16_u offset=14 (local.get $sw))
+    (local.set $bits (select (call $gl16 (i32.add (local.get $dst) (i32.const 14)))
+                             (call $gl16 (i32.add (local.get $src) (i32.const 14)))
                              (i32.ne (i32.and (local.get $fdw) (i32.const 0x80000)) (i32.const 0))))
     (if (i32.and (i32.ne (local.get $bits) (i32.const 8)) (i32.ne (local.get $bits) (i32.const 16)))
       (then (return (i32.const 512))))
@@ -402,17 +396,17 @@
       (then (return (i32.const 512))))
     (if (i32.eqz (local.get $rate))
       (then (return (i32.const 512))))
-    (i32.store16 (local.get $dw) (i32.const 1))                 ;; WAVE_FORMAT_PCM
-    (i32.store16 offset=2 (local.get $dw) (local.get $ch))
-    (i32.store offset=4 (local.get $dw) (local.get $rate))
-    (i32.store offset=8 (local.get $dw)                          ;; nAvgBytesPerSec
+    (call $gs16 (local.get $dst) (i32.const 1))                 ;; WAVE_FORMAT_PCM
+    (call $gs16 (i32.add (local.get $dst) (i32.const 2)) (local.get $ch))
+    (call $gs32 (i32.add (local.get $dst) (i32.const 4)) (local.get $rate))
+    (call $gs32 (i32.add (local.get $dst) (i32.const 8))                          ;; nAvgBytesPerSec
       (i32.mul (local.get $rate)
         (i32.mul (local.get $ch) (i32.shr_u (local.get $bits) (i32.const 3)))))
-    (i32.store16 offset=12 (local.get $dw)                       ;; nBlockAlign
+    (call $gs16 (i32.add (local.get $dst) (i32.const 12))                       ;; nBlockAlign
       (i32.mul (local.get $ch) (i32.shr_u (local.get $bits) (i32.const 3))))
-    (i32.store16 offset=14 (local.get $dw) (local.get $bits))
+    (call $gs16 (i32.add (local.get $dst) (i32.const 14)) (local.get $bits))
     (if (i32.ge_u (local.get $cb) (i32.const 18))
-      (then (i32.store16 offset=16 (local.get $dw) (i32.const 0))))
+      (then (call $gs16 (i32.add (local.get $dst) (i32.const 16)) (i32.const 0))))
     (i32.const 0))
 
   (func $handle_acmFormatSuggest (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
@@ -1583,16 +1577,15 @@
   ;; WAVEFORMATEX: +0 wFormatTag(2), +2 nChannels(2), +4 nSamplesPerSec(4),
   ;;   +8 nAvgBytesPerSec(4), +12 nBlockAlign(2), +14 wBitsPerSample(2)
   (func $handle_waveOutOpen (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $fmt_wa i32) (local $rate i32) (local $ch i32) (local $bits i32)
+    (local $rate i32) (local $ch i32) (local $bits i32)
     (local $handle i32) (local $fdwOpen i32) (local $cbType i32)
     ;; arg0=phwo, arg1=uDeviceID, arg2=lpFormat, arg3=dwCallback, arg4=dwInstance
     ;; fdwOpen is 6th arg at [esp+24]
     (local.set $fdwOpen (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24))))
-    ;; Read WAVEFORMATEX
-    (local.set $fmt_wa (call $g2w (local.get $arg2)))
-    (local.set $rate (i32.load (i32.add (local.get $fmt_wa) (i32.const 4))))
-    (local.set $ch (i32.load16_u (i32.add (local.get $fmt_wa) (i32.const 2))))
-    (local.set $bits (i32.load16_u (i32.add (local.get $fmt_wa) (i32.const 14))))
+    ;; Read each field through guest memory; backing pages may be separate.
+    (local.set $rate (call $gl32 (i32.add (local.get $arg2) (i32.const 4))))
+    (local.set $ch (call $gl16 (i32.add (local.get $arg2) (i32.const 2))))
+    (local.set $bits (call $gl16 (i32.add (local.get $arg2) (i32.const 14))))
     ;; Callback type from fdwOpen bits 16-18:
     ;; 0=none, 1=window, 2=thread, 3=function, 5=event
     (local.set $cbType (i32.and (i32.shr_u (local.get $fdwOpen) (i32.const 16)) (i32.const 7)))
@@ -1658,22 +1651,22 @@
   ;; 797: waveOutPrepareHeader — return MMSYSERR_NOERROR, set WHDR_PREPARED flag
   (func $handle_waveOutPrepareHeader (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     ;; Set dwFlags |= WHDR_PREPARED (0x02) in WAVEHDR at arg1+16
-    (local $wa i32)
-    (local.set $wa (call $g2w (local.get $arg1)))
-    (i32.store (i32.add (local.get $wa) (i32.const 16))
-      (i32.or (i32.load (i32.add (local.get $wa) (i32.const 16))) (i32.const 2)))
+    (local $flags_ga i32)
+    (local.set $flags_ga (i32.add (local.get $arg1) (i32.const 16)))
+    (call $gs32 (local.get $flags_ga)
+      (i32.or (call $gl32 (local.get $flags_ga)) (i32.const 2)))
     (i32.store offset=0 (global.get $reg_base) (i32.const 0))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))
   )
 
   ;; 798: waveOutUnprepareHeader — return MMSYSERR_NOERROR, clear WHDR_PREPARED/INQUEUE and mark DONE
   (func $handle_waveOutUnprepareHeader (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $wa i32)
-    (local.set $wa (call $g2w (local.get $arg1)))
-    (i32.store (i32.add (local.get $wa) (i32.const 16))
+    (local $flags_ga i32)
+    (local.set $flags_ga (i32.add (local.get $arg1) (i32.const 16)))
+    (call $gs32 (local.get $flags_ga)
       (i32.and
         (i32.or
-          (i32.and (i32.load (i32.add (local.get $wa) (i32.const 16))) (i32.const 0xFFFFFFFD))
+          (i32.and (call $gl32 (local.get $flags_ga)) (i32.const 0xFFFFFFFD))
           (i32.const 1))
         (i32.const 0xFFFFFFEF)))
     (i32.store offset=0 (global.get $reg_base) (i32.const 0))
@@ -1688,11 +1681,10 @@
   ;; finishes playing. The host schedules that completion against the audio
   ;; clock; 0xAD98 keeps the last WAVEHDR available for Reset/Close flushes.
   (func $handle_waveOutWrite (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $wa i32) (local $data_ga i32) (local $data_len i32)
-    (local.set $wa (call $g2w (local.get $arg1)))
+    (local $data_ga i32) (local $data_len i32)
     ;; Read lpData and dwBufferLength from WAVEHDR
-    (local.set $data_ga (i32.load (local.get $wa)))
-    (local.set $data_len (i32.load (i32.add (local.get $wa) (i32.const 4))))
+    (local.set $data_ga (call $gl32 (local.get $arg1)))
+    (local.set $data_len (call $gl32 (i32.add (local.get $arg1) (i32.const 4))))
     ;; Send PCM data to host for playback. Use logical-and (coerce both to 0/1)
     ;; — bare i32.and is BITWISE and silently drops calls where data_ga and
     ;; data_len happen not to share any 1-bits (e.g. lpData=0x78521c & len=0x2d00 = 0).
@@ -1701,9 +1693,9 @@
       (then
         ;; Submitted buffers are no longer DONE and remain INQUEUE until the
         ;; scheduled audio-clock completion fires.
-        (i32.store (i32.add (local.get $wa) (i32.const 16))
+        (call $gs32 (i32.add (local.get $arg1) (i32.const 16))
           (i32.or
-            (i32.and (i32.load (i32.add (local.get $wa) (i32.const 16))) (i32.const 0xFFFFFFFE))
+            (i32.and (call $gl32 (i32.add (local.get $arg1) (i32.const 16))) (i32.const 0xFFFFFFFE))
             (i32.const 0x10)))
         (drop (call $host_wave_out_write
           (local.get $arg0)
@@ -1711,7 +1703,7 @@
           (local.get $data_len)))
         (drop (call $host_wave_out_schedule_done
           (local.get $arg0)
-          (local.get $wa)
+          (call $g2w (local.get $arg1))
           (local.get $arg1)
           (local.get $data_len)))))
     ;; Save this buffer's guest address so Reset/Close can flush if needed.
@@ -1848,19 +1840,17 @@
   ;; mmioStringToFOURCCA(sz, uFlags) — pack four bytes, padding with spaces.
   ;; MMIO_TOUPPER (0x10) applies ASCII case folding before packing.
   (func $handle_mmioStringToFOURCCA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $src i32) (local $i i32) (local $ch i32)
+    (local $i i32) (local $ch i32)
     (local $fourcc i32) (local $ended i32)
-    (if (local.get $arg0)
-      (then (local.set $src (call $g2w (local.get $arg0))))
-      (else (local.set $ended (i32.const 1))))
+    (local.set $ended (i32.eqz (local.get $arg0)))
     (block $done
       (loop $pack
         (br_if $done (i32.ge_u (local.get $i) (i32.const 4)))
         (local.set $ch (i32.const 0x20))
         (if (i32.eqz (local.get $ended))
           (then
-            (local.set $ch (i32.load8_u
-              (i32.add (local.get $src) (local.get $i))))
+            (local.set $ch (call $gl8
+              (i32.add (local.get $arg0) (local.get $i))))
             (if (i32.eqz (local.get $ch))
               (then
                 (local.set $ended (i32.const 1))
@@ -2937,8 +2927,10 @@
   ;; the display state the screen metrics read, then the owning window resized
   ;; to it, then the messages Windows sends. There is deliberately no second
   ;; notion of "the current mode" here — SM_CXSCREEN has to give one answer.
-  (func $change_display_settings_core (param $devmode i32) (param $flags i32)
-    (local $fields i32) (local $w i32) (local $h i32) (local $bpp i32)
+  ;; $wide selects DEVMODEW, whose two doubled CHAR[32] arrays (dmDeviceName,
+  ;; dmFormName) put dmFields 32 bytes and the display fields 64 bytes later.
+  (func $change_display_settings_core (param $devmode i32) (param $flags i32) (param $wide i32)
+    (local $fields i32) (local $fo i32) (local $mo i32) (local $w i32) (local $h i32) (local $bpp i32)
     (local $changed i32) (local $target i32)
     ;; Taking the display is decided by whether a MODE IS APPLIED, not by
     ;; CDS_FULLSCREEN. That flag used to gate this, and reading it as "the app
@@ -2969,14 +2961,16 @@
     ;; down took Pinball's restored menu with it. RestoreDisplayMode is the
     ;; call that ends a DirectDraw mode.
     (if (i32.eqz (local.get $devmode)) (then (return)))
-    (local.set $fields (call $gl32 (i32.add (local.get $devmode) (i32.const 40))))
+    (local.set $fo (select (i32.const 72) (i32.const 40) (local.get $wide)))
+    (local.set $mo (select (i32.const 64) (i32.const 0) (local.get $wide)))
+    (local.set $fields (call $gl32 (i32.add (local.get $devmode) (local.get $fo))))
     ;; DM_PELSWIDTH | DM_PELSHEIGHT. A DEVMODE that names neither is asking for
     ;; something else (a refresh rate, an orientation) and leaves the mode be.
     (if (i32.ne (i32.and (local.get $fields) (i32.const 0x00180000))
                 (i32.const 0x00180000))
       (then (return)))
-    (local.set $w (call $gl32 (i32.add (local.get $devmode) (i32.const 108))))
-    (local.set $h (call $gl32 (i32.add (local.get $devmode) (i32.const 112))))
+    (local.set $w (call $gl32 (i32.add (local.get $devmode) (i32.add (local.get $mo) (i32.const 108)))))
+    (local.set $h (call $gl32 (i32.add (local.get $devmode) (i32.add (local.get $mo) (i32.const 112)))))
     ;; Refuse a mode no display has rather than resizing the window to it.
     (if (i32.or
           (i32.or (i32.lt_u (local.get $w) (i32.const 64))
@@ -2988,7 +2982,7 @@
         (return)))
     (local.set $bpp (call $dx_display_bpp_get))
     (if (i32.ne (i32.and (local.get $fields) (i32.const 0x00040000)) (i32.const 0))
-      (then (local.set $bpp (call $gl32 (i32.add (local.get $devmode) (i32.const 104))))))
+      (then (local.set $bpp (call $gl32 (i32.add (local.get $devmode) (i32.add (local.get $mo) (i32.const 104)))))))
     (if (i32.eqz (local.get $bpp)) (then (local.set $bpp (i32.const 32))))
     (local.set $changed
       (i32.or
@@ -3035,7 +3029,7 @@
     (call $invalidate_hwnd (local.get $target)))
 
   (func $handle_ChangeDisplaySettingsA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (call $change_display_settings_core (local.get $arg0) (local.get $arg1))
+    (call $change_display_settings_core (local.get $arg0) (local.get $arg1) (i32.const 0))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
   )
 
@@ -3044,8 +3038,14 @@
   ;; OpenGL path takes the screen through this spelling rather than the short
   ;; one, so both have to record the same fullscreen intent.
   (func $handle_ChangeDisplaySettingsExA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (call $change_display_settings_core (local.get $arg1) (local.get $arg3))
+    (call $change_display_settings_core (local.get $arg1) (local.get $arg3) (i32.const 0))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24)))
+  )
+
+  ;; ChangeDisplaySettingsW(lpDevMode, dwFlags) — same policy, DEVMODEW layout.
+  (func $handle_ChangeDisplaySettingsW (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (call $change_display_settings_core (local.get $arg0) (local.get $arg1) (i32.const 1))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
   )
 
   ;; EnumDisplaySettingsA(lpszDeviceName, iModeNum, lpDevMode) — 3 args stdcall.
@@ -3135,8 +3135,8 @@
   )
 
   ;; EnumDisplaySettingsW has the same enumeration policy as the ANSI API — the
-  ;; same shared mode table, the same dense index — but the 32-WCHAR device name
-  ;; moves DEVMODEW's display fields 32 bytes.
+  ;; same shared mode table, the same dense index — but DEVMODEW's two WCHAR[32]
+  ;; arrays move dmSize 32 bytes and the display fields 64 bytes.
   (func $handle_EnumDisplaySettingsW (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $buf i32) (local $screen i32) (local $size i32)
     (local $legacy i32) (local $w i32) (local $h i32) (local $bpp i32) (local $raw i32)
@@ -3165,14 +3165,19 @@
         (local.set $w (call $enum_mode_res_w (i32.div_u (local.get $raw) (i32.const 3))))
         (local.set $h (call $enum_mode_res_h (i32.div_u (local.get $raw) (i32.const 3))))
         (local.set $bpp (call $enum_mode_raw_bpp (local.get $raw)))))
-    ;; The Win95 DEVMODEW prefix is 156 bytes; later versions grew to 188
-    ;; and 220 bytes. The current-mode fields exist in every one of them.
-    (if (i32.lt_u (local.get $size) (i32.const 156))
+    ;; DEVMODEW doubles both CHAR[32] arrays of DEVMODEA (dmDeviceName and
+    ;; dmFormName), so it is 64 bytes longer: the Win95 prefix is 188 bytes
+    ;; (DEVMODEA's 124 + 64) and today's structure 220 (156 + 64). The
+    ;; current-mode fields exist in both. These used to sit only 32 bytes past
+    ;; the ANSI ones, so dmBitsPerPel landed in dmFormName and a caller read
+    ;; whatever its stack held -- GameMaker:Studio refused to start, reporting
+    ;; an 8-bit desktop.
+    (if (i32.lt_u (local.get $size) (i32.const 188))
       (then (i32.store offset=0 (global.get $reg_base) (i32.const 0))
             (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))) (return)))
-    ;; The fields below end at 156 and the clear covers at most 220.
+    ;; The fields below end at 188 and the clear covers at most 220.
     (local.set $len
-      (select (i32.const 156)
+      (select (i32.const 188)
         (select (local.get $size) (i32.const 220)
           (i32.lt_u (local.get $size) (i32.const 220)))
         (local.get $legacy)))
@@ -3185,14 +3190,25 @@
     (i32.store16 offset=68 (local.get $buf) ;; dmSize
       (select (i32.const 0) (local.get $size) (local.get $legacy)))
     (i32.store offset=72 (local.get $buf) (i32.const 0x5C0000)) ;; dmFields
-    (i32.store offset=136 (local.get $buf) (local.get $bpp))    ;; dmBitsPerPel
-    (i32.store offset=140 (local.get $buf) (local.get $w))      ;; dmPelsWidth
-    (i32.store offset=144 (local.get $buf) (local.get $h))      ;; dmPelsHeight
-    (i32.store offset=152 (local.get $buf) (i32.const 60))      ;; dmDisplayFrequency
+    (i32.store offset=168 (local.get $buf) (local.get $bpp))    ;; dmBitsPerPel
+    (i32.store offset=172 (local.get $buf) (local.get $w))      ;; dmPelsWidth
+    (i32.store offset=176 (local.get $buf) (local.get $h))      ;; dmPelsHeight
+    (i32.store offset=184 (local.get $buf) (i32.const 60))      ;; dmDisplayFrequency
     (call $guest_span_writeback (local.get $arg2) (local.get $buf) (local.get $len))
     (i32.store offset=0 (global.get $reg_base) (i32.const 1))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))
   )
+
+  ;; EnumDisplaySettingsExW(lpszDeviceName, iModeNum, lpDevMode, dwFlags) — the
+  ;; flags (EDS_RAWMODE, EDS_ROTATEDMODE) only widen which modes a multi-monitor
+  ;; driver lists; this display has one mode table, so it is the 3-arg call
+  ;; plus one more stack argument.
+  (func $handle_EnumDisplaySettingsExW (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $esp i32)
+    (local.set $esp (i32.load offset=16 (global.get $reg_base)))
+    (call $handle_EnumDisplaySettingsW (local.get $arg0) (local.get $arg1) (local.get $arg2)
+      (local.get $arg3) (local.get $arg4) (local.get $name_ptr))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (local.get $esp) (i32.const 20))))
 
   ;; EnumDisplayDevicesW(lpDevice, iDevNum, lpDisplayDevice, dwFlags).
   ;; Expose the fixed host surface as one primary desktop adapter and one
@@ -3386,7 +3402,6 @@
   ;; midiOutGetDevCapsA(uDeviceID, lpMidiOutCaps, cbMidiOutCaps) — 3 args
   ;; Fill MIDIOUTCAPSA struct with basic info, return MMSYSERR_NOERROR (0)
   (func $handle_midiOutGetDevCapsA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $caps i32)
     (local $n i32)
     (local.set $n (call $host_midi_num_devs))
     (if (i32.or
@@ -3398,16 +3413,15 @@
         (i32.store offset=0 (global.get $reg_base) (i32.const 2)) ;; MMSYSERR_BADDEVICEID
         (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))
         (return)))
-    (local.set $caps (call $g2w (local.get $arg1)))
     ;; Zero out the struct
-    (memory.fill (local.get $caps) (i32.const 0) (local.get $arg2))
+    (call $guest_memset (local.get $arg1) (i32.const 0) (local.get $arg2))
     ;; wMid (manufacturer ID) = 1 (MM_MICROSOFT)
-    (i32.store16 (local.get $caps) (i32.const 1))
+    (call $gs16 (local.get $arg1) (i32.const 1))
     ;; wPid = 1
-    (i32.store16 (i32.add (local.get $caps) (i32.const 2)) (i32.const 1))
+    (call $gs16 (i32.add (local.get $arg1) (i32.const 2)) (i32.const 1))
     ;; wTechnology at offset 40 = MOD_MIDIPORT (1)
     ;; (szPname[MAXPNAMELEN=32] runs from +8 through +39)
-    (i32.store16 (i32.add (local.get $caps) (i32.const 40)) (i32.const 1))
+    (call $gs16 (i32.add (local.get $arg1) (i32.const 40)) (i32.const 1))
     ;; dwSupport at offset 48 = 0
     (i32.store offset=0 (global.get $reg_base) (i32.const 0))  ;; MMSYSERR_NOERROR
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))  ;; stdcall, 3 args
@@ -3471,14 +3485,22 @@
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))  ;; stdcall, 1 arg
   )
 
-  ;; midiOutGetVolume(hmo, lpdwVolume) — 2 args; report max volume both channels
+  ;; midiOutGetVolume(hmo, lpdwVolume) — 2 args; retrieve host volume state
   (func $handle_midiOutGetVolume (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $out i32) (local $result i32)
     (if (i32.eqz (local.get $arg1))
       (then
         (i32.store offset=0 (global.get $reg_base) (i32.const 11)) ;; MMSYSERR_INVALPARAM
         (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
         (return)))
-    (i32.store offset=0 (global.get $reg_base) (call $host_midi_out_get_volume (local.get $arg0) (call $g2w (local.get $arg1))))
+    ;; The host ABI takes a contiguous physical DWORD. Borrow an invocation
+    ;; span for page-crossing output and scatter only after host success.
+    (local.set $out (call $guest_span_in (local.get $arg1) (i32.const 4)))
+    (local.set $result (call $host_midi_out_get_volume (local.get $arg0) (local.get $out)))
+    (if (i32.eqz (local.get $result))
+      (then (call $guest_span_writeback (local.get $arg1) (local.get $out) (i32.const 4)))
+      (else (call $guest_span_release (local.get $out) (i32.const 4))))
+    (i32.store offset=0 (global.get $reg_base) (local.get $result))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))  ;; stdcall, 2 args
   )
 
@@ -3581,8 +3603,8 @@
           (then (i32.store offset=0 (global.get $reg_base) (i32.const 11)))  ;; MMSYSERR_INVALPARAM
           (else
             (if (i32.or
-                  (i32.ne (i32.load (local.get $arg1)) (i32.const 52))
-                  (i32.eqz (i32.load offset=4 (local.get $arg1))))
+                  (i32.ne (call $gl32 (local.get $arg1)) (i32.const 52))
+                  (i32.eqz (call $gl32 (i32.add (local.get $arg1) (i32.const 4)))))
               (then (i32.store offset=0 (global.get $reg_base) (i32.const 11)))  ;; MMSYSERR_INVALPARAM
               (else (i32.store offset=0 (global.get $reg_base) (i32.const 167)))  ;; JOYERR_UNPLUGGED
             )
@@ -3674,16 +3696,16 @@
   ;; only use them for startup diagnostics before requesting their own limits.
   (func $handle_GetProcessWorkingSetSize (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (if (local.get $arg1)
-      (then (i32.store (call $g2w (local.get $arg1)) (i32.const 0x00100000))))
+      (then (call $gs32 (local.get $arg1) (i32.const 0x00100000))))
     (if (local.get $arg2)
-      (then (i32.store (call $g2w (local.get $arg2)) (i32.const 0x10000000))))
+      (then (call $gs32 (local.get $arg2) (i32.const 0x10000000))))
     (i32.store offset=0 (global.get $reg_base) (i32.const 1))  ;; TRUE
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))  ;; stdcall, 3 args
   )
 
   ;; 853: waveInOpen(lphWaveIn, device, format, callback, instance, flags)
   (func $handle_waveInOpen (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $fmt_wa i32) (local $rate i32) (local $ch i32) (local $bits i32)
+    (local $rate i32) (local $ch i32) (local $bits i32)
     (local $flags i32) (local $cbType i32) (local $handle i32)
     (local.set $flags (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24))))
     ;; WAVE_FORMAT_QUERY validates only and must not acquire microphone access.
@@ -3692,10 +3714,9 @@
         (i32.store offset=0 (global.get $reg_base) (i32.const 0))
         (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28)))
         (return)))
-    (local.set $fmt_wa (call $g2w (local.get $arg2)))
-    (local.set $rate (i32.load offset=4 (local.get $fmt_wa)))
-    (local.set $ch (i32.load16_u offset=2 (local.get $fmt_wa)))
-    (local.set $bits (i32.load16_u offset=14 (local.get $fmt_wa)))
+    (local.set $rate (call $gl32 (i32.add (local.get $arg2) (i32.const 4))))
+    (local.set $ch (call $gl16 (i32.add (local.get $arg2) (i32.const 2))))
+    (local.set $bits (call $gl16 (i32.add (local.get $arg2) (i32.const 14))))
     (local.set $cbType (i32.and (i32.shr_u (local.get $flags) (i32.const 16)) (i32.const 7)))
     (local.set $handle (call $host_wave_in_open
       (local.get $rate) (local.get $ch) (local.get $bits)
@@ -3732,19 +3753,15 @@
 
   ;; 858: waveInPrepareHeader — set WHDR_PREPARED
   (func $handle_waveInPrepareHeader (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $wa i32)
-    (local.set $wa (call $g2w (local.get $arg1)))
-    (i32.store offset=16 (local.get $wa)
-      (i32.or (i32.load offset=16 (local.get $wa)) (i32.const 2)))
+    (call $gs32 (i32.add (local.get $arg1) (i32.const 16))
+      (i32.or (call $gl32 (i32.add (local.get $arg1) (i32.const 16))) (i32.const 2)))
     (i32.store offset=0 (global.get $reg_base) (i32.const 0))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))))
 
   ;; 859: waveInUnprepareHeader — clear PREPARED/INQUEUE, retain DONE
   (func $handle_waveInUnprepareHeader (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $wa i32)
-    (local.set $wa (call $g2w (local.get $arg1)))
-    (i32.store offset=16 (local.get $wa)
-      (i32.and (i32.load offset=16 (local.get $wa)) (i32.const 0xFFFFFFED)))
+    (call $gs32 (i32.add (local.get $arg1) (i32.const 16))
+      (i32.and (call $gl32 (i32.add (local.get $arg1) (i32.const 16))) (i32.const 0xFFFFFFED)))
     (i32.store offset=0 (global.get $reg_base) (i32.const 0))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))))
 
@@ -3752,13 +3769,22 @@
   (func $handle_waveInAddBuffer (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $wa i32) (local $data_ga i32) (local $length i32)
     (local.set $wa (call $g2w (local.get $arg1)))
-    (local.set $data_ga (i32.load (local.get $wa)))
-    (local.set $length (i32.load offset=4 (local.get $wa)))
-    (i32.store offset=8 (local.get $wa) (i32.const 0))
-    (i32.store offset=16 (local.get $wa)
-      (i32.or
-        (i32.and (i32.load offset=16 (local.get $wa)) (i32.const 0xFFFFFFFE))
-        (i32.const 0x12))) ;; PREPARED | INQUEUE
+    (if (local.get $arg1)
+      (then
+        (local.set $data_ga (call $gl32 (local.get $arg1)))
+        (local.set $length (call $gl32 (i32.add (local.get $arg1) (i32.const 4))))
+        (call $gs32 (i32.add (local.get $arg1) (i32.const 8)) (i32.const 0))
+        (call $gs32 (i32.add (local.get $arg1) (i32.const 16))
+          (i32.or
+            (i32.and (call $gl32 (i32.add (local.get $arg1) (i32.const 16))) (i32.const 0xFFFFFFFE))
+            (i32.const 0x12)))) ;; PREPARED | INQUEUE
+      (else
+        ;; Preserve the existing NULL-sentinel field side effects and host call.
+        (local.set $data_ga (i32.load (local.get $wa)))
+        (local.set $length (i32.load offset=4 (local.get $wa)))
+        (i32.store offset=8 (local.get $wa) (i32.const 0))
+        (i32.store offset=16 (local.get $wa)
+          (i32.or (i32.and (i32.load offset=16 (local.get $wa)) (i32.const 0xFFFFFFFE)) (i32.const 0x12)))))
     (i32.store offset=0 (global.get $reg_base) (call $host_wave_in_add_buffer
       (local.get $arg0) (local.get $wa) (local.get $arg1)
       (call $g2w (local.get $data_ga)) (local.get $length)))
@@ -3837,6 +3863,131 @@
         (i32.store offset=0 (global.get $reg_base) (i32.const 11))))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
   )
+
+  ;; --- Waitable timers ---------------------------------------------------
+  ;; A waitable timer is an event the system signals at a deadline, and both
+  ;; halves already exist: the event is an ordinary sync object (so every
+  ;; wait path -- single, multiple, alertable, cross-thread -- works on it
+  ;; unchanged), and the deadline is a multimedia-timer slot of the
+  ;; TIME_CALLBACK_EVENT_SET kind, which the winmm timer thread (or, without
+  ;; it, every message pump) signals when due. Slot layout as timeSetEvent's:
+  ;;   +0 id, +4 interval ms, +8 the timer's event handle, +12 lPeriod ms
+  ;;   (0 = one-shot), +16 phase tick, +20 flags 0x10 EVENT_SET | 0x40
+  ;;   waitable timer | 1 one-shot.
+  ;; GameMaker:Studio's runner paces every frame through one of these.
+  (func $waitable_timer_slot (param $h i32) (result i32)
+    (local $i i32) (local $slot i32)
+    (block $done (loop $scan
+      (br_if $done (i32.ge_u (local.get $i) (global.get $MM_TIMER_MAX)))
+      (local.set $slot (call $mm_timer_slot (local.get $i)))
+      (if (i32.and
+            (i32.ne (i32.load (local.get $slot)) (i32.const 0))
+            (i32.and
+              (i32.ne (i32.and (i32.load offset=20 (local.get $slot)) (i32.const 0x40)) (i32.const 0))
+              (i32.eq (i32.load offset=8 (local.get $slot)) (local.get $h))))
+        (then (return (local.get $slot))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $scan)))
+    (i32.const 0))
+
+  ;; Disarm timer $h; 1 if it was armed. CloseHandle calls this for every
+  ;; handle, so a periodic timer does not outlive its event.
+  (func $waitable_timer_cancel (param $h i32) (result i32)
+    (local $slot i32)
+    (if (i32.eqz (local.get $h)) (then (return (i32.const 0))))
+    (local.set $slot (call $waitable_timer_slot (local.get $h)))
+    (if (i32.eqz (local.get $slot)) (then (return (i32.const 0))))
+    (i32.store (local.get $slot) (i32.const 0))
+    (i32.const 1))
+
+  ;; CreateWaitableTimerW(lpTimerAttributes, bManualReset, lpTimerName).
+  ;; bManualReset FALSE is a synchronization timer: an auto-reset event.
+  (func $handle_CreateWaitableTimerW (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (i32.store offset=0 (global.get $reg_base) (call $create_event_core
+      (local.get $arg1) (i32.const 0) (local.get $arg2) (i32.const 1)))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))))
+
+  ;; SetWaitableTimer(hTimer, pDueTime, lPeriod, pfnCompletionRoutine,
+  ;; lpArgToCompletionRoutine, fResume) — 6 args. *pDueTime is a FILETIME:
+  ;; negative = relative, in 100ns units; positive = absolute UTC. Setting a
+  ;; timer makes it non-signaled and replaces any earlier deadline. fResume
+  ;; (wake a suspended machine) has nothing to act on.
+  (func $handle_SetWaitableTimer (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $due i64) (local $ms i64) (local $now i64) (local $buf i32)
+    (local $i i32) (local $slot i32) (local $id i32) (local $tick i32) (local $first i32)
+    ;; A completion routine is an APC queued to the setting thread; not
+    ;; implemented, and silently dropping it would lose the app's callback.
+    (if (local.get $arg3) (then (call $crash_unimplemented (local.get $name_ptr))))
+    (if (i32.or (i32.eqz (local.get $arg1)) (i32.lt_s (local.get $arg2) (i32.const 0)))
+      (then
+        (global.set $last_error (i32.const 87)) ;; ERROR_INVALID_PARAMETER
+        (i32.store offset=0 (global.get $reg_base) (i32.const 0))
+        (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28)))
+        (return)))
+    (if (i32.eqz (call $host_reset_event (local.get $arg0)))
+      (then
+        (global.set $last_error (i32.const 6)) ;; ERROR_INVALID_HANDLE
+        (i32.store offset=0 (global.get $reg_base) (i32.const 0))
+        (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28)))
+        (return)))
+    (drop (call $waitable_timer_cancel (local.get $arg0)))
+    (local.set $due (i64.or
+      (i64.extend_i32_u (call $gl32 (local.get $arg1)))
+      (i64.shl (i64.extend_i32_u (call $gl32 (i32.add (local.get $arg1) (i32.const 4))))
+               (i64.const 32))))
+    (if (i64.lt_s (local.get $due) (i64.const 0))
+      (then
+        (local.set $ms (i64.div_u
+          (i64.add (i64.sub (i64.const 0) (local.get $due)) (i64.const 9999))
+          (i64.const 10000))))
+      (else
+        ;; Absolute: measure against the same UTC clock GetSystemTimeAsFileTime reads.
+        (local.set $buf (call $heap_alloc (i32.const 8)))
+        (call $wall_clock_to_guest (local.get $buf) (i32.const 2) (i32.const 8))
+        (local.set $now (i64.or
+          (i64.extend_i32_u (call $gl32 (local.get $buf)))
+          (i64.shl (i64.extend_i32_u (call $gl32 (i32.add (local.get $buf) (i32.const 4))))
+                   (i64.const 32))))
+        (call $heap_free (local.get $buf))
+        (if (i64.gt_s (local.get $due) (local.get $now))
+          (then (local.set $ms (i64.div_u
+            (i64.add (i64.sub (local.get $due) (local.get $now)) (i64.const 9999))
+            (i64.const 10000)))))))
+    (if (i64.gt_u (local.get $ms) (i64.const 0x7FFFFFFF))
+      (then (local.set $ms (i64.const 0x7FFFFFFF))))
+    (local.set $first (i32.wrap_i64 (local.get $ms)))
+    (block $found (loop $scan
+      (if (i32.ge_u (local.get $i) (global.get $MM_TIMER_MAX))
+        (then
+          (global.set $last_error (i32.const 8)) ;; ERROR_NOT_ENOUGH_MEMORY
+          (i32.store offset=0 (global.get $reg_base) (i32.const 0))
+          (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28)))
+          (return)))
+      (local.set $slot (call $mm_timer_slot (local.get $i)))
+      (br_if $found (i32.eqz (i32.load (local.get $slot))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $scan)))
+    (local.set $id (i32.load (global.get $MM_TIMER_NEXT_ID)))
+    (if (i32.eqz (local.get $id)) (then (local.set $id (i32.const 1))))
+    (i32.store (global.get $MM_TIMER_NEXT_ID) (i32.add (local.get $id) (i32.const 1)))
+    (local.set $tick (call $host_get_ticks))
+    (i32.store offset=4 (local.get $slot) (local.get $first))
+    (i32.store offset=8 (local.get $slot) (local.get $arg0))
+    (i32.store offset=12 (local.get $slot) (local.get $arg2))
+    (i32.store offset=16 (local.get $slot) (local.get $tick))
+    (i32.store offset=20 (local.get $slot)
+      (i32.or (i32.const 0x50) (i32.eqz (local.get $arg2))))
+    ;; The id last: a slot is live once +0 is non-zero.
+    (i32.store (local.get $slot) (local.get $id))
+    (call $mm_timer_thread_ensure)
+    (i32.store offset=0 (global.get $reg_base) (i32.const 1))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28))))
+
+  ;; CancelWaitableTimer(hTimer): disarm without changing the signaled state.
+  (func $handle_CancelWaitableTimer (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (drop (call $waitable_timer_cancel (local.get $arg0)))
+    (i32.store offset=0 (global.get $reg_base) (i32.const 1))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8))))
 
   ;; --- BASS 2.x PCM compatibility --------------------------------------
   ;; Pocket Tanks 1.6 loads its effects through BASS_SampleLoad and then

@@ -73,9 +73,11 @@ assert.deepStrictEqual(renderer.inputQueue[0], {
   msg: 0x0202,
   wParam: 0,
   lParam: (20 << 16) | 15,
+  pointerProcess: undefined,
   mouseX: 55,
   mouseY: 70,
   mouseButtons: 0,
+  cursorWarpSerial: 0,
 });
 
 console.log('PASS  captured dialog mouse-up is queued for modal-loop dispatch');
@@ -204,6 +206,7 @@ const nativeDialog = {
 };
 const nativeDialogRenderer = new FakeRenderer();
 nativeDialogRenderer.wasm = nativeDialogWasm;
+nativeDialogRenderer.windows = { [nativeDialog.hwnd]: nativeDialog };
 nativeDialogRenderer.inputQueue = [];
 nativeDialogRenderer._mouseX = 132;
 nativeDialogRenderer._mouseY = 79;
@@ -223,9 +226,11 @@ assert.deepStrictEqual(nativeDialogRenderer.inputQueue, [{
   msg: 0x0201,
   wParam: 1,
   lParam: (19 << 16) | 32,
+  pointerProcess: undefined,
   mouseX: 132,
   mouseY: 79,
   mouseButtons: 1,
+  cursorWarpSerial: 0,
 }], 'registered x86 dialog child should receive DOWN through the guest queue');
 assert.deepStrictEqual(nativeDialogRenderer._directMouseDown, {
   win: nativeDialog,

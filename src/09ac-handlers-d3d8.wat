@@ -70,7 +70,6 @@
       (return)))
     (call $handle_IDirect3DShader9_Release (local.get $arg1)
       (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (local.get $name_ptr))
-    (if (global.get $d3d_render_token) (then (return)))
     (i32.store offset=0 (global.get $reg_base) (i32.const 0))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4))))
 
@@ -210,6 +209,7 @@
     ;; same format gate the matching create path uses, so capability
     ;; negotiation can never promise a resource that create then refuses.
     ;;   Usage 0, RType TEXTURE (3): ordinary 2D textures.
+    ;;   D3DUSAGE_RENDERTARGET (1), RType TEXTURE (3): render-target textures.
     ;;   D3DUSAGE_RENDERTARGET (1), RType SURFACE (1): the colour targets the
     ;;     back buffer and CreateRenderTarget accept.
     ;;   D3DUSAGE_DEPTHSTENCIL (2), RType SURFACE (1): the depth formats the
@@ -225,6 +225,10 @@
             (i32.or (i32.eq (local.get $rtype) (i32.const 3))
                     (i32.eq (local.get $rtype) (i32.const 5))))
         (then (local.set $ok (call $d3d9_texture_format_supported (local.get $format)))))
+      ;; D3DUSAGE_RENDERTARGET (1), RType TEXTURE (3): the render-target
+      ;; textures CreateTexture makes (D3DX / GM8 surface_create walk these).
+      (if (i32.and (i32.eq (local.get $arg4) (i32.const 1)) (i32.eq (local.get $rtype) (i32.const 3)))
+        (then (local.set $ok (i32.ne (call $d3d9_render_target_texture_format (local.get $format)) (i32.const 0)))))
       (if (i32.and (i32.eq (local.get $arg4) (i32.const 1)) (i32.eq (local.get $rtype) (i32.const 1)))
         (then (local.set $ok (i32.or (call $d3d9_color_target_format (local.get $format))
           (i32.and (i32.eq (local.get $arg3) (global.get $D3D8_FMT_R5G6B5))
@@ -481,15 +485,13 @@
                 (br $rows)))
               (local.set $i (i32.add (local.get $i) (i32.const 1)))
               (br $rects)))
-            (local.set $row (i32.load offset=24 (local.get $d)))
-            (i32.store (local.get $row) (i32.add (i32.load (local.get $row)) (i32.const 1)))
+            (call $d3d9_texture_touch (i32.load offset=24 (local.get $d)))
             (local.set $hr (i32.const 0))
             (br $done)))))
       ;; A colour target is on one side: one rect goes through UpdateSurface.
       (if (i32.le_u (local.get $arg3) (i32.const 1)) (then
         (call $heap_free (local.get $scratch))
         (call $d3d9_update_surface (local.get $arg0) (local.get $src) (local.get $arg2) (local.get $dst) (local.get $points))
-        (if (global.get $d3d_render_token) (then (return)))
         (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28)))
         (return)))
       (call $crash_unimplemented (local.get $name_ptr)))
@@ -552,7 +554,6 @@
     (if (local.get $bb16) (then (call $gs32 (i32.add (local.get $pp9) (i32.const 8)) (i32.const 22))))
     (call $handle_IDirect3DDevice9_Reset (local.get $arg0) (local.get $pp9)
       (local.get $arg2) (local.get $arg3) (local.get $arg4) (local.get $name_ptr))
-    (if (global.get $d3d_render_token) (then (return)))
     (if (i32.load offset=0 (global.get $reg_base)) (then (return)))
     ;; Reset reports the size it chose for a zero width/height back.
     (call $gs32 (local.get $arg1) (call $gl32 (local.get $pp9)))
@@ -1380,7 +1381,6 @@
     (local.set $surface (call $d3d8_surface_in (local.get $arg0)))
     (call $handle_IDirect3DSurface9_Release (local.get $surface)
       (local.get $arg1) (local.get $arg2) (local.get $arg3) (local.get $arg4) (local.get $name_ptr))
-    (if (global.get $d3d_render_token) (then (return)))
     ;; A freed image surface's address is reused by later allocations, so its
     ;; view must not outlive it. (A back buffer's view is re-made by every
     ;; GetBackBuffer, so forgetting one costs nothing.)
@@ -1429,7 +1429,6 @@
     (call $handle_IDirect3DSurface9_LockRect (local.get $surface)
       (local.get $arg1) (local.get $arg2) (local.get $arg3) (local.get $arg4) (local.get $name_ptr))
     ;; A lock handed to the render worker re-enters this handler when done.
-    (if (global.get $d3d_render_token) (then (return)))
     (local.set $e (call $d3d8_view_entry (local.get $surface) (i32.const 0)))
     (if (i32.and (i32.ne (local.get $e) (i32.const 0))
           (i32.and (i32.eqz (i32.load offset=0 (global.get $reg_base)))
@@ -1552,7 +1551,6 @@
     (call $d3d9_draw_buffer (local.get $arg0) (local.get $arg1) (local.get $base)
       (local.get $arg2) (local.get $arg3) (local.get $arg4)
       (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24))) (i32.const 1))
-    (if (global.get $d3d_render_token) (then (return)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28))))
 
   ;; Convert the Direct3D 8 declaration token stream into D3DVERTEXELEMENT9.

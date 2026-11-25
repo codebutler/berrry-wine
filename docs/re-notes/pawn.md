@@ -1,9 +1,40 @@
 # Pawn 3
 
 A chess program. `--app=pawn`, exe `binaries/wep32-community/Pawn/Pawn.exe`.
-Renders its board through Direct3D 9 and reads the mouse through DirectInput 7.
+Renders its board through Direct3D 9. It creates a DirectInput 7 mouse, but
+normal windowed gameplay consumes native USER mouse messages; its keyboard
+uses DirectInput immediate state.
 
 ## Running it
+
+### November 21 mouse consumer diagnosis
+
+Run `20261121-pawn-consumer-cause` passively traces the original software
+route: mouse `0x08222010` is created and formatted, but never acquired or
+polled. Keyboard `0x08222018` is acquired and returns 1,710 successful
+256-byte GetDeviceState calls in the bounded idle trace. No mouse
+GetDeviceData or GetDeviceState occurs. A separate native diagnostic drag
+returns WM_MOUSEMOVE, WM_LBUTTONDOWN and WM_LBUTTONUP through PeekMessageA
+and DispatchMessageA at Pawn's original `0x419ca1` call site.
+
+The buffered receipt precondition from `20261121-pawn-normal-load` therefore
+cannot become ready for this consumer: it requires an acquired mouse and a
+phase-2 GetDeviceData poll, neither of which this route produces. That closed
+run was never queried or replayed. A keyboard poll is not a mouse poll.
+
+The browser receipt bridge previously refused every USER motion intent.
+It now supports exact WM_MOUSEMOVE confirmation through the existing owning
+Worker USER-return protocol. Preparation derives the client point and current
+button/modifier mask from the real renderer. Confirmation requires that exact
+message, coordinates and mask, under the existing actor, scene, generation,
+geometry and deadline fences. Queue publication alone grants no receipt.
+Buffered DI intents retain their separate native-ring protocol.
+
+The new regression fails against the Git baseline at preparation and passes
+with the fix, including wrong point/buttons, untrusted input, replacement
+actor, changed scene, deadline and replay controls. Existing mouse and native
+Peek/Get checks and the locked full build pass. This diagnosis and bridge
+repair do not alone establish a fresh browser move or AI reply.
 
 ```bash
 node test/run.js --app=pawn --no-build --headless-gl --screen=1024x768 \
@@ -273,3 +304,189 @@ source repair was needed. This establishes bounded actual WebGL browser
 move/reply, without full-game acceptance, a disk-latency repair, or a general
 hardware/performance claim. Source recovery uses Git plus recorded patches;
 no source/media archives, local browser, extra box, workers or public deployment.
+
+### 2026-11-20: native DI7 observation seam; manual integration still unqualified
+
+Evidence: `scratch/runs/20261120-pawn-directinput7-consumer-after-temp-cleanup/`.
+No original Pawn or browser was launched. The current native dispatcher and
+DirectInput handlers were exercised through a real v7 mouse created by
+`IDirectInput7::CreateDeviceEx`, using fixture-only setup exports and the
+unchanged renderer producer. The existing `jig-owning-api-observer.js` observed
+actual owning-instance API entry/return, HRESULT, stack cleanup and guest output.
+Buffered DOWN and independent UP returned correctly; PEEK returned the same
+DOWN record without consuming it. Unacquired state retained DIERR_NOTACQUIRED.
+Ordinary renderer motion plus DOWN and independent UP also returned through
+native `GetDeviceState`.
+
+These are native fixture observations, not prepared manual-input confirmation.
+Real +5/-5 producer motions and no motion gave byte-identical native states, so
+returned-byte equality cannot establish prepared-motion lineage. The current
+browser guard allocates its receipt token during USER dequeue, confirms native
+USER returns, and retires pending DOWN on physical UP before that receipt.
+DI7 requires an actual producer-to-owning-consumer link with the same identity,
+generation and lifetime fences; host queue state or USER receipts remain
+insufficient. No such integration or old-fail/new-pass acceptance was completed.
+
+The final lifetime fixture failed an author assertion expecting immediate COM
+pointer reuse: the actual allocator chose the next unused slot after Release,
+consistent with its documented allocation policy. Its separate watchdog also
+exited on an unsupported new stage name. Both failures are retained; the scope
+closed without replay. They establish no game/API defect or pointer-reuse proof.
+All known native children exited and were joined. Fresh move/reply, second turn,
+Quit, first writer, PV, record-four causality and historical allocation lifetimes
+remain unproved/UNKNOWN. Existing historical move/reply evidence above is unchanged.
+
+### 2026-11-21: native buffered DI receipts implemented
+
+Run `20261121-pawn-di7-native-receipts` implements the missing integration.
+An opt-in `consumer: 'directinput-buffered'` mouse or motion intent binds the
+device and acquisition generation observed at actual native GetDeviceData.
+The production renderer tags exact ring positions before publishing its tail;
+native selection, atomic removal and written guest records confirm those
+positions through the owning Worker RPC. Returned-byte equality and USER
+dequeue confer no DI receipt. PEEK records an observation while leaving the
+ticket pending; count-only reads confer none. Physical UP remains independent
+and can precede consumption of buffered DOWN. Release and Unacquire/reacquire
+invalidate pending generations. Missing/wrong native actor metadata cannot
+deliver tagged DOWN, while UP remains deliverable. Multiple PEEK records now
+retain the sequence numbers their later removal returns.
+
+Actual Git-baseline WAT and bridge return native DOWN/UP but fail receipt
+confirmation in both main and real OS Worker controls. The new native controls
+pass both routes, including byte-equal unowned DOWN, +5/-5 and absent motion,
+PEEK/count-only, expiry, wrong device/actor, independent UP, final COM Release
+and same-pointer reacquisition. The lifetime fixture expects the allocator's
+fresh-slot preference after Release; it does not demand immediate pointer reuse
+or change allocation policy. Native API entry/return observations use
+`tools/jig-owning-api-observer.js` on the executing instance. The canonical
+locked build and existing DirectInput-device/USER/mouse/scheduling tests pass.
+The separate buffered-keyboard extraction test fails on a missing
+`$selective_watch_on` definition outside its selected source fragments; this
+is also reproduced with unchanged baseline DirectInput source.
+
+The single bounded browser attempt closed UNKNOWN during startup waiting for
+a native owner. Its retained HTTP ledger has no Pawn media or emulator-module
+request; no prepared input, move/reply or screenshot was obtained. No replay
+or subsequent runtime observation was made. This run proves the emulator
+receipt fix and native controls, not fresh original gameplay. Chrome closed,
+its owned profile was removed, and the finite native supervisor recorded no
+leaked children. No sandbox box was created (ID/expiry/stop receipt null).
+
+### 2026-11-21 normal mouse menu receipt boundary
+
+Run `20261121-menu-input-contract` repairs the normal nonclient menu contract.
+The synchronous WAT menu tracker does not enqueue a client WM_LBUTTONDOWN.
+The browser bridge now acknowledges explicit menu open/selection intents as
+`MENU_HANDLED`, with exact native tracker identity and selected command ID;
+it leaves client consumption false and the native USER token zero. Cancellation,
+disabled items and separators cannot satisfy a selection receipt. Existing
+client DOWN and independent trusted physical UP requirements remain separate.
+An ordinary authored PE in the production shell/actual CPUWorker fails the old
+contract and, with the repair, visibly receives its native command callback twice.
+Focused negative controls and the literal locked build pass.
+
+The one fresh immutable Pawn run used matching actual Worker modules and
+unchanged media. A trusted e2-e4 drag received native USER receipts, and Pawn
+replied e7-e6. Mouse Game/open and New/command 1 then received distinct menu
+tracker receipts and visibly reset the board, reversed sides, and produced a
+white AI opening move. No new-game dialog appeared on this observed path;
+dialog cancel/accept and a subsequent human move were not tested. Waiting for
+the next reviewed input timed out and closed the scope UNKNOWN without replay
+or later endpoint requests. All three gestures retained independently prearmed
+trusted UP and release acknowledgments. The original inner supervisor and outer
+actual wait/both-EOF receipts are retained; exit 1 records that review timeout,
+not a native input receipt failure. No sandbox box was created.
+
+### 2026-11-21 play and capture after normal Game/New
+
+Run `20261121-pawn-after-reset` used one fresh immutable original on published
+`d7a39d3faacd66610eee086534ea756a07378791`, reusing the accepted authored menu
+proof and unchanged requester/input path. Actual Worker bytecode matched
+`2c37a26bd614bc2b2529d3921185bc111aa11547c1454135b9a01fca2a3a03f2`;
+all six original media files matched before and after execution.
+
+The reviewed full frames show initial human e2–e4 and AI e7–e6, followed by
+ordinary mouse Game/New command 1. The board reset and reversed, with Black
+below and files running h through a from left to right. White's AI opened
+e2–e4. Human Black then played d7–d5; White captured e4×d5. Black legally
+captured that pawn with Qd8×d5, and White replied Nb1–c3. The final frame shows
+the black queen on d5, the captured white pawn absent, and yellow b1/c3
+outlines. No dialog appeared and no concrete emulator defect was found.
+
+All five physical DOWN gestures had independently prearmed trusted UP and
+release-dispatch acknowledgments. The two menu receipts remain MENU_HANDLED,
+client consumed=false and token=0. Native 500 ms, independent UP 1800 ms,
+review 5000 ms and consent 20000 ms bounds were unchanged. The original
+finished normally without UNKNOWN, cancellation or replay; actual inner and
+outer supervisor waits exited 0, outer stdout/stderr both reached EOF and
+the inner supervisor reported no leaked children. No runtime source change,
+guest-state manipulation, forced focus, clock/pump change or test box was used.
+This proves the bounded post-reset move/reply/capture sequence, not a full game.
+
+### 2026-11-21 direct history command receipt repair
+
+Run `20261121-pawn-undo-redo` inspected the original PE (no menu resources)
+and normal UI before using history. Game contains New/Load/Save/Quit
+(commands 1/2/3/12). The advertised top bar is `|<`, `<<`, `>>`, `>|`,
+with native command IDs 13/4/5/14. These are direct command items, not popups.
+
+The sole immutable production-browser original used published `d7a39d3fa`
+and actual CPUWorker module `2c37a26b`. After ordinary Game/New, White opened
+d2–d4 on this run's reversed board. Human Black played e7–e5 and White
+captured d4×e5. The first ordinary `<<` click then closed UNKNOWN: the WAT
+bar-click wrapper always recorded kind 1 (popup opened), even when the tracker
+posted a direct WM_COMMAND and closed. No later runtime query or replay was
+made. Undo's visible result, captured-piece restoration, redo and subsequent
+play remain unverified; the UNKNOWN receipt is not proof the guest ignored undo.
+
+The generic repair preserves the tracker's actual result: direct bar commands
+record selection kind 2 and the exact ID; popup opens remain kind 1; MDI chrome
+is neither. The exported handler retains its boolean return. An ordinary authored
+PE in the full production shell/actual CPUWorker fails the old receipt contract
+and passes with only this WAT source changed. Two ordinary clicks visibly invoke
+its guest WM_COMMAND callback twice, with MENU_HANDLED, consumed=false, token=0.
+Native tests cover distinct `<<`/`>>` IDs, one posted command each, popup opening,
+and outside misses. Focused menu, disabled-owner, renderer, CLI receipt and MDI
+tests and the literal locked build pass. Every original and authored DOWN retains
+independently prearmed trusted UP and release ACK with unchanged
+500/1800/5000/20000 ms bounds. Inner/outer actual waits and both outer EOFs are
+retained. No second Pawn original, forced state/focus, clock/pump change, Wine,
+Python, worker agent, deployment or test box was used. This is a causal native
+receipt repair, not completed Pawn undo/redo acceptance.
+
+### 2026-11-21 corrected history and continued play
+
+Run `20261121-pawn-history-fixed` used exactly one fresh original on immutable
+published `ce9c41c0366d9a6b80f40569c90d7ae239e9015b`, reusing the accepted
+authored oldfail/newpass proof above. Both initial and final actual CPUWorker
+bytecode matched the retained module
+`79c7a04f44ea0d6e48e851f6e0350f09da8c4a8717f77c6df9965d6c1cdd4834`.
+The module was compiled from the full published commit, including the earlier
+callback repair, rather than the earlier isolated menu-control overlay.
+Served source and all nine media identities matched before and after the run.
+
+Full reviewed frames show ordinary mouse Game/New, the reversed board with
+Black below, White AI e2–e4, human Black d7–d5, then White e4×d5. Clicking
+`<<` restored the black pawn on d5 and returned White's pawn to e4, with red
+history outlines. Clicking `>>` restored the capture: White's pawn on d5,
+the black pawn absent, e4 empty, and yellow e4/d5 outlines. These direct menu
+receipts selected commands 4 and 5 respectively, with client consumed=false
+and token=0. The frames establish restoration and redo independently of those
+receipts. Black then legally played Qd8×d5, and White replied Nb1–c3; the final
+frame shows the black queen on d5, White's captured pawn absent, and yellow
+b1/c3 outlines. Continued play confirms Black's turn after redo. The history
+view has no separate turn readout or move list; White-to-move at the undone
+position is inferred from the restored position, not independently tested by
+branching into a new move there.
+
+All six gestures retained independently prearmed trusted physical UP and
+release-dispatch ACK, with unchanged 500/1800/5000/20000 ms bounds. No UNKNOWN,
+CANCELLED, replay or second original occurred. One passive screenshot helper
+resized the viewport from 1272×853 to 800×600 through Puppeteer's default;
+the complete board remained visible and its input coordinates did not change.
+The browser used an owned private X display and the production software route.
+Actual inner and outer waits exited 0 with both stdout/stderr EOF; the native
+supervisor reported no leaks, and browser/display/profile cleanup completed.
+No runtime source change, forced guest state/focus, clock/pump/Present change,
+Wine, Python, subworker, public deployment or test box was used. This verifies
+the bounded capture/history/continued-play sequence, not a full game.

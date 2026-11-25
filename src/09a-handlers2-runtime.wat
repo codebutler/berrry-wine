@@ -58,6 +58,12 @@
     (call $crt_callback_begin (i32.const 0) (local.get $arg0) (local.get $arg1) (i32.const 0))
   )
 
+  ;; int __cdecl _initterm_e(PIFV *first, PIFV *last): ordered [first,last)
+  ;; NULL-skipping walk, returning the first nonzero initializer result.
+  (func $handle__initterm_e (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (call $crt_callback_begin (i32.const 3) (local.get $arg0) (local.get $arg1) (i32.const 0))
+  )
+
   ;; Translate the x87 control word into the bit layout exposed by the 32-bit
   ;; Microsoft CRT. Exception bits are deliberately reordered; RC moves from
   ;; x87 bits 10..11 to CRT bits 8..9, and PC uses the reverse encoding.
@@ -128,22 +134,44 @@
       (i32.shr_u (i32.and (local.get $control) (i32.const 0x00040000)) (i32.const 6))))
     (global.set $fpu_cw (local.get $cw)))
 
-  ;; 211: _controlfp(new, mask) — cdecl; query/update the current x87 word.
-  (func $handle__controlfp (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+  (func $msvcrt_control_update (param $new i32) (param $requested_mask i32) (result i32)
     (local $control i32) (local $mask i32)
     (local.set $control (call $msvcrt_control_from_x87))
     ;; _controlfp does not modify the x86 DENORMAL OPERAND exception mask;
     ;; _control87 is the API which may change that bit.
-    (local.set $mask (i32.and (local.get $arg1) (i32.const 0x0007031F)))
+    (local.set $mask (i32.and (local.get $requested_mask) (i32.const 0x0007031F)))
     (local.set $control
       (i32.or
         (i32.and (local.get $control) (i32.xor (local.get $mask) (i32.const -1)))
-        (i32.and (local.get $arg0) (local.get $mask))))
+        (i32.and (local.get $new) (local.get $mask))))
     (call $msvcrt_control_to_x87 (local.get $control))
-    (i32.store offset=0 (global.get $reg_base) (call $msvcrt_control_from_x87))
+    (call $msvcrt_control_from_x87))
+
+  ;; 211: _controlfp(new, mask) — cdecl; query/update the current x87 word.
+  (func $handle__controlfp (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (i32.store offset=0 (global.get $reg_base)
+      (call $msvcrt_control_update (local.get $arg0) (local.get $arg1)))
     ;; The caller owns the two arguments. Pop only our return address.
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
   )
+
+  ;; _controlfp_s(currentControl?, new, mask): optional output, errno_t result.
+  ;; This x86 CPU exposes x87, not SSE2/MXCSR; DN is a documented x86 no-op.
+  ;; Invalid selected bits invoke the default nonreturning invalid-parameter
+  ;; policy. Custom invalid-parameter-handler registration remains fail-fast
+  ;; unimplemented, so there is no registered guest handler to bypass here.
+  (func $handle__controlfp_s (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $control i32)
+    (if (i32.and (i32.and (local.get $arg1) (local.get $arg2)) (i32.const 0xFCF0FCE0))
+      (then
+        ;; STATUS_INVALID_CRUNTIME_PARAMETER: default _invoke_watson termination.
+        (call $handle__exit (i32.const 0xC0000417) (i32.const 0) (i32.const 0)
+          (i32.const 0) (i32.const 0) (local.get $name_ptr))
+        (return)))
+    (local.set $control (call $msvcrt_control_update (local.get $arg1) (local.get $arg2)))
+    (if (local.get $arg0) (then (call $gs32 (local.get $arg0) (local.get $control))))
+    (i32.store offset=0 (global.get $reg_base) (i32.const 0))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4))))
 
   ;; 212: _strrev
   (func $handle__strrev (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
@@ -656,8 +684,8 @@
   (func $handle_RegOpenKeyA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     ;; RegOpenKeyA(hKey, lpSubKey, phkResult) — 3 args stdcall
     (local $hResult i32)
-    (local.set $hResult (call $host_reg_open_key
-      (local.get $arg0) (call $g2w (local.get $arg1)) (i32.const 0)))
+    (local.set $hResult (call $reg_open_key_legacy
+      (local.get $arg0) (local.get $arg1) (i32.const 0)))
     (if (local.get $hResult)
       (then (call $gs32 (local.get $arg2) (local.get $hResult))
              (i32.store offset=0 (global.get $reg_base) (i32.const 0)))  ;; ERROR_SUCCESS
@@ -1219,7 +1247,7 @@
 
   ;; 266: rand
   (func $handle_rand (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (global.set $rand_seed (i32.add (i32.mul (global.get $rand_seed) (i32.const 1103515245)) (i32.const 12345)))
+    (global.set $rand_seed (i32.add (i32.mul (global.get $rand_seed) (i32.const 214013)) (i32.const 2531011)))
     (i32.store offset=0 (global.get $reg_base) (i32.and (i32.shr_u (global.get $rand_seed) (i32.const 16)) (i32.const 0x7FFF)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4))) (return)
   )
@@ -1567,3 +1595,9 @@
     ;; owns all three arguments.
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
   )
+
+  ;; The unchanged VS2012 caller pops its own filter argument at 402ba2.
+  (func $handle___crtSetUnhandledExceptionFilter (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (i32.store (global.get $reg_base)
+      (i32.atomic.rmw.xchg (global.get $TOP_EXCEPTION_FILTER) (local.get $arg0)))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4))))

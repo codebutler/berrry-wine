@@ -7,6 +7,145 @@ renderer (`ref_gl.dll` / `ref_soft.dll`), `SndDll.dll` and, under `Base\`,
 `gamex86.dll`, `Player.dll` and `Client Effects.dll` are `LoadLibrary`'d at
 runtime. Registered 274f69e21.
 
+## November 12 current checkpoint load comparison
+
+Current module `04c53419…` restores the complete unchanged `crate0400` set on
+the actual SoftwareGL owner. The latest control shows HUD health 31 after
+normal load, a 600 ms backward pulse followed by 3000 ms with the movement key
+released, and a separate 4500 ms neutral interval. These checks use native
+pause/resume cycles; their final screenshots display the paused banner.
+They establish bounded living movement, not sustained onward gameplay.
+
+WebGL again exits natively with code 8 during the same normal load. The new
+passive observer records successful context creation/current binding and zero
+at the existing startup error queries. There are no load-time error queries,
+so those results do not establish a clear error flag during loading. No
+runtime violation, repair or new checkpoint was proved. That comparison's final
+successful swap precedes exit by five milliseconds, but its completed pixels
+were not retained in that run. The2055 witness below fills this observation gap.
+
+Published `8f68731a1`; [diagnosis, exact recovery and lifecycle limits](heretic2-runtime-boundary-20261112.md),
+run `20261112-heretic2-runtime-boundary-1910`. Coordinator review checked 364
+references, 30 full PNG identities and PNG CRCs, and four complete frames.
+The box stopped normally; original local manager/watchdog parent waits remain
+unknown. Further investigation uses runtime/API/renderer observations only,
+without guest reverse engineering or guest modifications.
+
+The later [original exit-frame witness](heretic2-exit-witness-2055-20261112.md),
+published `6e8c88fa2`, recovers the actual completed640×480 owning-WebGL image
+before teardown. The PNG's decoded RGBA equals the independent retained pixel
+hash, and all22 owner fields match. Completion is5 ms before native
+ExitProcess(8) entry and6 ms before host exit selection. The complete original
+frame shows the normal loading console and Paused over black; there is no
+visible error diagnostic. The final-frame objective is met. Exit cause,
+loaded-world survival and a new paired comparison remain unknown.
+
+Root verified136 encoded/raw blobs mapping161 paths,11 original full PNGs,
+42 balanced trusted input edges and seven independent releases. Whole-four
+VFS readback matches the unchanged save. The box stopped normally, expiry null;
+the browser parent1 after the pending post-exit capture is separate from
+Chrome0 and actual stop/manager/watchdog0 waits with both EOFs.
+
+The [retained API audit](heretic2-exit-api-2130-20261112.md), `a4420f289`,
+identifies the next observation gap. Each of54 zero-EAX ReadFile post-handler
+records is followed by matching re-entry and success within the ReadFile
+stream. The frozen source invokes that hook during internal lazy-I/O parking,
+but the observer did not retain yield/park state. These rows do not prove
+guest-visible read failures or an exit cause. Ordinary-load-phase park/completion
+correlation remains needed; no speculative patch, extra GL/GetLastError query or
+guest reverse engineering follows from the audit.
+
+## November 12 observer limits and interrupted follow-up
+
+The later [payload-free observer](heretic2-payload-free-iat-observer-2245-20261112.md),
+`66d04d314`, removes inherited payload decoding from the future hooks. Its
+composed IAT/COM tests cover caller-to-thunk re-entry, bounded trace overflow and
+phase reset; payload guards report zero forbidden reads and zero decoder
+constructions. Actual original startup records **149 internal read parks and
+149 correlated retries in each recorder**. These are two observations of the
+same events, not 298 distinct parks. Guest returns remain UNKNOWN.
+
+That original reached Easy, verified all four save files and typed the sole
+`load crate0400` command. The newer settled screenshot label failed the driver's
+phase gate before observer reset or Enter. **No Load was submitted**, so this
+run neither reproduces Exit8 nor qualifies ordinary-load trace retention.
+Root checked 330 sealed file hashes, 134 opaque recovered blobs mapping 164
+paths, and all twelve unique full PNGs behind thirteen capture paths.
+
+The preceding [2230 staging attempt](heretic2-save-stage-correlation-2230-20261112.md)
+had retained an inherited WriteFile payload preview, violating the owner's
+no-decode restriction. Its evidence remains preserved and opaque; root did not
+inspect or use that payload. Its integrity checks are not a compliance claim.
+The later payload-free guards do not retroactively qualify it.
+
+A separate driver-gate follow-up ended during provisioning: launcher status1,
+missing final report, and automatic safety-review refusal. The rejected
+workflow was not retried. [Cleanup](heretic2-interrupted-provision-cleanup-2335-20261112.md),
+`1c86ee44c`, preserved eighteen opaque snapshots and normally archived
+`bx_ktb4h7k3`, expiry null, stop `stop_20860d58ccf62cab` completed unforced.
+Root verified all snapshot raw/encoded hashes and the stop receipt. Historical
+provision/manager/watchdog exit statuses and EOFs remain UNKNOWN; process
+absence is not a clean join or proof of a completed original run. No new cause,
+runtime repair, loaded-world survival or checkpoint is established.
+
+## November 12 health-crate successor
+
+Run `20261112-heretic2-north-opening-health-crate-0400` reached the original
+tavern crate through the north opening, broke it with native Flying Fist, and
+recorded HEALTH POTION and HELLORB in the native console. Exact health gain
+and full-health status remain unmeasured. Staff strikes had not broken this
+crate; the neighboring small crate remained intact.
+
+The new preferred interior continuation is **all four** `crate0400` files in
+that run's `save-inputs/crate0400/`, with `crate0400-native-manifest.json` and
+`RECOVERY.md`. Initialize original Game → Easy, verify the complete unchanged
+VFS save readback, then use normal console `load crate0400`. It saves near
+(291.996,1623.636,−29.967), facing south. Normal reload returned upright;
+fresh movement reached (289.753,1675.588), followed by released survival.
+The large crate remained absent. Keep whole `tavern0237` and `key0136` as
+living fallbacks. `guard0330` and `door0136` remain experimental failed-reload
+sets; do not prefer them. No guard defeat or permanent safety is established.
+
+The actual route crossed near x526 through the opening at y1536–1568,
+continued north beyond the partition's y1632 end, then went west to the
+crate's north face. Native map geometry was guidance; the break and pickups
+were observed in the original game. Some movement completed in a later cycle;
+the run helper's neutral wait increased from 700 to 3000 ms without changing
+game clocks. These wall intervals do not establish exact input timing.
+
+The tested published baseline is `30f9318e6`, actual Worker module
+`1165f15c…`, software GL. Later shared `lib/d3dim-gpu.js` work was excluded
+from this isolated runtime. The coordinator checked 1,380 recovered references
+/ 541 unique raw hashes, 88 native-file references and the full break,
+pickup-console and loaded-survival images. No production change, build or task
+commit was made. The box stopped normally before expiry with runtime parent
+wait/EOF; outer transport exit143 remains separate. WebGL parity, FPS and audio
+are not established by this route.
+
+## November 12 onward-room limit
+
+Run `20261112-heretic2-crate-successor-tavern-onward-0435` normal-loaded
+`crate0400` upright twice and verified fresh movement. Native traversal then
+climbed the north stairs to a cobbled room with crates, a red banner, a boarded
+arch and a close humanoid enemy. A bounded Flying Fist attack left it standing.
+No defeat, door opening or level transition was established.
+
+Both new whole-four saves are **experimental**. `onward0435` normal-loaded
+with explicit “Corvus died.” Saving earlier on the stairs as `landing0435`
+first rendered upright, but its first fresh backward check reached Load Game
+without movement. Neither replaces `crate0400`. Exact health, damage timing
+and internal death flags remain unknown; these observations do not establish
+an emulator defect. A future attempt needs different threat handling or a
+living lower-stair checkpoint. The active slot moved to another game.
+
+The coordinator verified 1,227 recovered references / 479 unique raw hashes,
+96 native-file references and the full room/death images. Tested source stayed
+`30f9318e6` / actual Worker `1165f15c…`, isolated from later renderer changes.
+No production code, build or task commit was needed. The box stopped normally
+before expiry; runtime and watchdog waits/EOF passed, while outer transport
+exit143 remains separate. Exact recovery and failed-save manifests remain in
+that run's `RESULT.md` and `RECOVERY.md`.
+
 ## Licence
 
 `license.txt` in `_user1.cab` is Activision's standard licence: personal use
@@ -279,3 +418,17 @@ Local box ID/state/expiry: N/A. No audio, FPS, browser/native parity or full
 suite claim is made. Only this note is tracked; evidence and control helpers
 remain in the ignored run directory. `cleanup.json` verifies owned runtime,
 helper and watcher PIDs/groups absent and no new temporary directories.
+
+## GPU stream v2 main-menu seam (2026-11-16)
+
+On the browser default (software GL on the gps WebGL executor) the main-menu
+book showed a 1 px dark line at y 256. The book is 1:1
+point-sampled WRAP tiles (256x256, 256x128, 256x64, 256x32) whose quad edges
+sit exactly on pixel centres, so the D3D top-left rule decides the row. The
+executor emulated that with a 1/128 px y lift, which SwiftShader's 4-bit
+subpixel grid rounds away; GL then gave row 256 to the upper tile at v = 1.0,
+which wraps to its texel row 0. The lift is now 1/16 px (`Y_CENTRE` in
+`lib/gpu-stream-webgl.js`) and the per-app `glRenderer: 'webgl'` opt-out is
+gone. Headless GL keeps more subpixel bits, so the CLI never showed it:
+`test/test-gpu-stream-webgl-subpixel.js` snaps vertices in the VS to
+reproduce it. Evidence `scratch/runs/20261116-gps-edges/`.

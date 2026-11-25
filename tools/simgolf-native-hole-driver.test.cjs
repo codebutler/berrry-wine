@@ -16,7 +16,10 @@ async function main(){
  // Install the current compiled module using the current Worker's actual seam.
  const bytes=fs.readFileSync(root+'/build/wine-assembly.wasm'),mod=new WebAssembly.Module(bytes),memory=new WebAssembly.Memory({initial:8192,maximum:8192,shared:true}),imports={host:{memory}};
  for(const i of WebAssembly.Module.imports(mod))if(i.kind==='function')imports.host[i.name]=()=>0;
- const worker={WebAssembly,selectedModule:mod,built:{imports},instance:null,endpointIdentity:7,workerSlot:0,crypto};vm.createContext(worker);
+ const registrations=[];
+ const worker={WebAssembly,selectedModule:mod,built:{imports},instance:null,endpointIdentity:7,workerSlot:0,crypto,
+  cpuClock:null,memory,GuestRpc:require('../lib/guest-rpc.js'),writerView:null,writerCpu:null,writerRowIndex:null,
+  send:v=>registrations.push(v),IS_WEB_WORKER:true};vm.createContext(worker);
  const workerSource=fs.readFileSync(root+'/lib/guest-worker.js','utf8'),wa=workerSource.indexOf('const result = await WebAssembly.instantiate(selectedModule, built.imports);'),wb=workerSource.indexOf('if (quake2LoadObservation) instance =',wa);assert(wa>=0&&wb>wa);
  await vm.runInContext('(async()=>{'+workerSource.slice(wa,wb)+'})()',worker);assert(worker.instance instanceof WebAssembly.Instance);
  const wine={processId:1000,running:true,_stopped:false,renderer:{peekKeyDownState:()=>0},guestWorker:{link:{module:mod,worker:{},endpointIdentity:7,slot:0}}};
@@ -115,22 +118,23 @@ async function main(){
   clientCases.push({kind,clientStickyClosed:true,consumerRejectsAbsentNextCommand:true});checks++;
  }
  const parentCases=[];
- for(const kind of ['wrong-id','stale-id','missing','delayed','refusal','malformed','success']){
+ for(const kind of ['wrong-id','stale-id','missing','delayed','refusal','malformed','success','delayed-read']){
   const dir=fs.mkdtempSync(run+'/parent-'+kind+'-');
   const child=cp.spawn(process.execPath,[__filename,run,'parent',dir,kind],{stdio:['ignore','pipe','pipe']});
   let stdout='',stderr='';child.stdout.on('data',b=>stdout+=b);child.stderr.on('data',b=>stderr+=b);
-  const cap=setTimeout(()=>child.kill('SIGKILL'),5000);
+  const cap=setTimeout(()=>child.kill('SIGKILL'),kind==='delayed-read'?30000:5000);
   const code=await new Promise(r=>child.once('close',r));clearTimeout(cap);
-  assert.equal(code,0,stderr);const result=JSON.parse(stdout);assert.equal(result.signals,kind==='success'?0:1);assert(result.childWait&&result.stdoutEOF&&result.stderrEOF);parentCases.push(result);checks++;
+  assert.equal(code,0,stderr);const result=JSON.parse(stdout);assert.equal(result.signals,['success','delayed-read'].includes(kind)?0:1);assert(result.childWait&&result.stdoutEOF&&result.stderrEOF);parentCases.push(result);checks++;
  }
  const custodyCases=[];
  for(const kind of ['wrong-id','missing','delayed','success']){
   const dir=fs.mkdtempSync(run+'/custody-'+kind+'-');fs.mkdirSync(dir+'/commands');
   fs.writeFileSync(dir+'/lifecycle.json',JSON.stringify({browserDeadline:Date.now()+8000}));
-  // The executed shim preserves the actual kernel-custodian parent across exec.
+  // The executed shim preserves the actual supervising parent across exec.
   const shim=dir+'/consumer-shim.cjs';fs.writeFileSync(shim,`process.env.SIMGOLF_OWNER_IDENTITY=JSON.stringify(require(${JSON.stringify(root+'/tools/native-clock-process-proof.cjs')}).identity(process.ppid));process.argv=${JSON.stringify([process.execPath,__filename,run,'consumer',dir,kind])};require(${JSON.stringify(__filename)});`);
-  const gate="import os,sys;assert sys.stdin.readline()=='go\\n';os.execvp(sys.argv[1],sys.argv[1:])";
-  const child=cp.spawn('python3',['-c',gate,'python3',root+'/tools/simgolf-native-hole-launch.py',dir,process.execPath,shim],{stdio:['pipe','pipe','pipe']});
+  // Block on one exact stdin line, then exec in this same PID (the owning parent).
+  const gate='IFS= read -r line && [ "$line" = go ] || exit 1; exec "$@"';
+  const child=cp.spawn('/bin/sh',['-c',gate,'sh',process.execPath,root+'/tools/simgolf-native-hole-launch.js',dir,process.execPath,shim],{stdio:['pipe','pipe','pipe']});
   let stdout='',stderr='',stdoutEOF=false,stderrEOF=false;child.stdout.on('data',b=>stdout+=b);child.stderr.on('data',b=>stderr+=b);child.stdout.on('end',()=>stdoutEOF=true);child.stderr.on('end',()=>stderrEOF=true);
   const done=new Promise(r=>child.once('close',r));
   // Independent of the consumer/custodian event loops; never relax the launch cap.
@@ -143,10 +147,10 @@ async function main(){
    assert(fs.existsSync(dir+'/consumer-ready'));
    if(kind==='success')await transport.request(dir,'current',{action:'capture'},1000);else await assert.rejects(transport.request(dir,'current',{action:'capture'},70));
    const code=await done;assert.equal(code,kind==='success'?0:1,stderr);assert(stdoutEOF&&stderrEOF);
-   const drain=JSON.parse(fs.readFileSync(dir+'/kernel-drain.json'));assert(drain.complete);assert.deepEqual(drain.remaining,[]);assert.deepEqual(drain.unreaped,[]);assert(drain.commandLog.eof&&drain.commandLog.closed);
-   for(const pin of [drain.journal,drain.commandLog]){const b=require('node:zlib').gunzipSync(fs.readFileSync(dir+'/'+pin.path));assert.equal(b.length,pin.originalBytes);assert.equal(h.sha(b),pin.originalSha256);}
+   const drain=JSON.parse(fs.readFileSync(dir+'/receipt.json'));assert.equal(drain.leaked,false);assert.equal(drain.spawnError,null);
+   assert.equal(drain.terminated===null||drain.terminated==='sweep after exit',kind==='success','only failures cancel the supervised tree');
    if(kind!=='success'){assert(fs.existsSync(dir+'/terminal-error.json'));assert(!fs.existsSync(dir+'/reply-1.json'));}
-   custodyCases.push({kind,actualOwningParent:child.pid,parentWait:code,stdoutEOF,stderrEOF,complete:drain.complete,commandEOF:drain.commandLog.eof,owned:drain.owned.length,reaped:drain.reaped.length});checks++;
+   custodyCases.push({kind,actualOwningParent:child.pid,parentWait:code,stdoutEOF,stderrEOF,level:drain.level,terminated:drain.terminated,exit:drain.exit,signal:drain.signal,tracked:drain.tracked.length});checks++;
   }finally{
    watchdog.kill('SIGTERM');const watcherCode=await new Promise(r=>watchdog.once('close',(code,signal)=>r({code,signal})));
    assert(watchStdoutEOF&&watchStderrEOF);
@@ -168,12 +172,17 @@ async function parentControl(dir,kind){
  const done=new Promise(r=>child.once('close',r));
  for(let n=0;n<500&&!fs.existsSync(dir+'/consumer-ready');n++)await delay(2);
  assert(fs.existsSync(dir+'/consumer-ready'));
- const request=transport.request(dir,'current',{action:'capture'},kind==='success'?1000:70);
- if(kind==='success')assert.equal((await request).id,'current');else await assert.rejects(request);
+ const positive=['success','delayed-read'].includes(kind);
+ const began=Date.now();
+ const request=transport.request(dir,'current',{action:'capture'},kind==='delayed-read'?28000:positive?1000:70);
+ if(positive)assert.equal((await request).id,'current');else await assert.rejects(request);
  const code=await done;assert.equal(code,0,stderr);assert(stdoutEOF&&stderrEOF);
+ assert.equal(fs.readdirSync(dir+'/commands').length,1,'one publication; no replay');
+ if(positive){assert(!fs.existsSync(dir+'/transport-closed.json'));assert.equal(JSON.parse(fs.readFileSync(dir+'/reply-0.json')).id,'current');}
+ if(kind==='delayed-read')assert(Date.now()-began>=21000,'same read retained past ordinary observation window');
  const result=JSON.parse(stdout);assert.equal(result.owner,process.pid);assert.equal(result.laterProtocol,0);assert.equal(result.laterEffects,0);
  process.removeListener('SIGTERM',handler);
- console.log(JSON.stringify({kind,signals,childWait:true,stdoutEOF,stderrEOF,...result}));
+ console.log(JSON.stringify({kind,signals,childWait:true,stdoutEOF,stderrEOF,onePublication:true,elapsedMs:Date.now()-began,...result}));
 }
 async function consumerControl(dir,kind){
  let protocol=0;const initStart=source.indexOf("const simgolf=require("),initEnd=source.indexOf('\nasync function send(',initStart);
@@ -185,6 +194,7 @@ async function consumerControl(dir,kind){
  fs.writeFileSync(dir+'/consumer-ready','ready');let consumed=false;
  try{
   while(!consumed){consumed=await transport.consume(dir,0,async()=>{
+   if(kind==='delayed-read'){await delay(21000);return;}
    if(kind==='success')return;
    if(['wrong-id','stale-id','refusal','malformed'].includes(kind))fs.writeFileSync(dir+'/reply-0.json',kind==='malformed'?'broken':JSON.stringify({ok:true,id:kind==='refusal'?'current':kind,status:kind==='refusal'?'refused-before-dispatch':undefined}));
    // Pending and delayed commands must observe notification before returning an ACK.
@@ -192,7 +202,7 @@ async function consumerControl(dir,kind){
    if(kind==='delayed')await delay(20);
   });if(!consumed)await delay(2);}
  }catch(e){scope.guard.fail(e);}
- if(kind!=='success'){
+ if(!['success','delayed-read'].includes(kind)){
   while(!scope.guard.error)await delay(2);
   for(const m of ['Runtime.evaluate','Input.dispatchMouseEvent','Page.captureScreenshot','Browser.close'])await assert.rejects(scope.send(m));
   let effects=0;await assert.rejects(transport.consume(dir,1,async()=>effects++));assert.equal(effects,0);

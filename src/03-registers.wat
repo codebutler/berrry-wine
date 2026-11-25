@@ -370,8 +370,20 @@
   ;; Everything $g2w does once the direct window has missed. Only the
   ;; g2w-fast macro calls it; a direct-window address passed here would be
   ;; mistranslated, since this never tests that window.
+  ;; Guest system-heap reservation. Scalars use the authority; translating
+  ;; this range to process-private linear memory would break cross-process data.
+  (func $shared_heap_address (param $ga i32) (result i32)
+    (i32.lt_u (i32.sub (local.get $ga) (i32.const 0x80000000)) (i32.const 0x01000000)))
+
   (func $g2w_slow (param $ga i32) (result i32)
     (local $wa i32)
+    ;; The armed-lazy call sits after the sparse lookup (block $lazy) on
+    ;; purpose: V8's inliner visits a function's calls in order under one
+    ;; budget, and the cold 09a8gv closure ahead of $guest_page_translate
+    ;; would leave the VirtualAlloc lookup out of line.
+    (block $lazy
+    (if (call $shared_heap_address (local.get $ga)) (then
+      (drop (call $host_shared_heap (i32.const 12) (local.get $ga) (i32.const 0) (i32.const 0) (i32.const 0))) (unreachable)))
     ;; CreateDIBSection pointers live in a dedicated high guest range backed by
     ;; the final 64MB of linear memory. Test it only after the normal direct
     ;; window misses so ordinary loads retain their original hot path.
@@ -379,10 +391,7 @@
           (i32.sub (local.get $ga) (global.get $DIB_GUEST_BASE))
           (global.get $DIB_GUEST_CAPACITY))
       (then
-        (if (i32.atomic.load (region.addr $D3DIM_LAZY_SHARED 4)) (then
-          (call $d3dim_lazy_access
-            (i32.add (global.get $DIB_BACKING_BASE)
-              (i32.sub (local.get $ga) (global.get $DIB_GUEST_BASE))) (i32.const 1))))
+        (br_if $lazy (i32.atomic.load (region.addr $GPS_LAZY 4)))
         (return (i32.add
           (global.get $DIB_BACKING_BASE)
           (i32.sub (local.get $ga) (global.get $DIB_GUEST_BASE))))))
@@ -392,8 +401,13 @@
     (local.set $wa (call $guest_page_translate (local.get $ga)))
     (if (i32.ne (local.get $wa) (global.get $NULL_SENTINEL))
       (then (return (local.get $wa))))
-    (call $g2w_miss (local.get $ga))
-  )
+    (return (call $g2w_miss (local.get $ga))))
+    ;; A lazy GPU-surface entry is armed (09a8gv): settle what this touches.
+    (call $gps_lazy_access
+      (i32.add (global.get $DIB_BACKING_BASE)
+        (i32.sub (local.get $ga) (global.get $DIB_GUEST_BASE))) (i32.const 1))
+    (i32.add (global.get $DIB_BACKING_BASE)
+      (i32.sub (local.get $ga) (global.get $DIB_GUEST_BASE))))
 
   ;; Would $g2w resolve $ga? The same three lookups with no miss side effect,
   ;; for a handler that has to decide whether an access faults before making it.
@@ -466,8 +480,8 @@
           (i32.le_u (local.get $len)
             (i32.sub (global.get $DIB_GUEST_CAPACITY) (local.get $off))))
       (then
-        (if (i32.atomic.load (region.addr $D3DIM_LAZY_SHARED 4)) (then
-          (call $d3dim_lazy_access
+        (if (i32.atomic.load (region.addr $GPS_LAZY 4)) (then
+          (call $gps_lazy_access
             (i32.add (global.get $DIB_BACKING_BASE) (local.get $off)) (local.get $len))))
         (return (i32.add (global.get $DIB_BACKING_BASE) (local.get $off)))))
 
@@ -531,6 +545,8 @@
   ;; few x86 word/dword accesses that actually cross a non-contiguous boundary.
   (func $gl32 (param $ga i32) (result i32)
     (local $wa i32) (local $end_wa i32) (local $g2w_wa i32) (local $epoch i32) (local $redirected i32)
+    (if (call $shared_heap_address (local.get $ga)) (then
+      (return (call $host_shared_heap (i32.const 10) (local.get $ga) (i32.const 4) (i32.const 0) (i32.const 0)))))
     ;; A complete direct-window dword cannot fault or run a mapping barrier.
     ;; Guest page edges inside that window are still physically contiguous.
     ;; Keep partial spans on the translating path below, including its SEH
@@ -585,6 +601,7 @@
 
   (func $gl64 (param $ga i32) (result i64)
     (local $wa i32) (local $end_wa i32) (local $epoch i32)
+    (if (call $shared_heap_address (local.get $ga)) (then (return (i64.or (i64.extend_i32_u (call $gl32 (local.get $ga))) (i64.shl (i64.extend_i32_u (call $gl32 (i32.add (local.get $ga) (i32.const 4)))) (i64.const 32))))))
     (local.set $wa (i32.add (i32.sub (local.get $ga) (global.get $image_base)) (global.get $GUEST_BASE)))
     (if (i32.le_u (local.get $wa) (i32.sub (region.end $DIRECT_WINDOW) (i32.const 8)))
       (then (return (i64.load (local.get $wa)))))
@@ -603,6 +620,8 @@
 
   (func $gl16 (param $ga i32) (result i32)
     (local $wa i32) (local $end_wa i32) (local $g2w_wa i32) (local $epoch i32)
+    (if (call $shared_heap_address (local.get $ga)) (then
+      (return (call $host_shared_heap (i32.const 10) (local.get $ga) (i32.const 2) (i32.const 0) (i32.const 0)))))
     (local.set $wa (g2w-fast (local.get $ga)))
     (if (i32.ne (i32.and (local.get $ga) (i32.const 0xFFF)) (i32.const 0xFFF))
       (then (return (i32.load16_u (local.get $wa)))))
@@ -617,6 +636,8 @@
       (i32.shl (i32.load8_u (call $g2w (i32.add (local.get $ga) (i32.const 1)))) (i32.const 8))))
   (func $gl8 (param $ga i32) (result i32)
     (local $g2w_wa i32)
+    (if (call $shared_heap_address (local.get $ga)) (then
+      (return (call $host_shared_heap (i32.const 10) (local.get $ga) (i32.const 1) (i32.const 0) (i32.const 0)))))
     (i32.load8_u (g2w-fast (local.get $ga))))
   ;; Cheap "could a write here be touching code?" test, for one guest address.
   ;; Page-granular over the whole guest space ($code_page_test, 04-cache; exact
@@ -946,6 +967,8 @@
     ;; Reject an unenrolled CPU before translation, filters or the store.
     (if (i32.atomic.load offset=4 (global.get $WRITER_SESSION))
       (then (drop (call $writer_check))))
+    (if (call $shared_heap_address (local.get $ga)) (then
+      (drop (call $host_shared_heap (i32.const 11) (local.get $ga) (i32.const 4) (local.get $v) (i32.const 0))) (return)))
     (local.set $wa (g2w-fast (local.get $ga)))
     (if (i32.le_u (i32.and (local.get $ga) (i32.const 0xFFF)) (i32.const 0xFFC))
       (then
@@ -1000,6 +1023,10 @@
     ;; Reject an unenrolled CPU before translation, filters or the store.
     (if (i32.atomic.load offset=4 (global.get $WRITER_SESSION))
       (then (drop (call $writer_check))))
+    (if (call $shared_heap_address (local.get $ga)) (then
+      (call $gs32 (i32.add (local.get $ga) (i32.const 0)) (i32.wrap_i64 (i64.shr_u (local.get $v) (i64.const 0))))
+      (call $gs32 (i32.add (local.get $ga) (i32.const 4)) (i32.wrap_i64 (i64.shr_u (local.get $v) (i64.const 32))))
+      (return)))
     (local.set $wa (g2w-fast (local.get $ga)))
     (if (i32.le_u (i32.and (local.get $ga) (i32.const 0xFFF)) (i32.const 0xFF8))
       (then
@@ -1038,6 +1065,7 @@
   ;; adjacent sparse guest pages need not be adjacent in WASM memory.
   (func $gl128 (param $ga i32) (result v128)
     (local $wa i32) (local $g2w_wa i32)
+    (if (call $shared_heap_address (local.get $ga)) (then (return (i32x4.replace_lane 3 (i32x4.replace_lane 2 (i32x4.replace_lane 1 (i32x4.splat (call $gl32 (local.get $ga))) (call $gl32 (i32.add (local.get $ga) (i32.const 4)))) (call $gl32 (i32.add (local.get $ga) (i32.const 8)))) (call $gl32 (i32.add (local.get $ga) (i32.const 12)))))))
     (if (i32.le_u (i32.and (local.get $ga) (i32.const 0xFFF)) (i32.const 0xFF0))
       (then
         (local.set $wa (g2w-fast (local.get $ga)))
@@ -1062,6 +1090,12 @@
         ;; Reject an unenrolled CPU before translation, filters or the store.
     (if (i32.atomic.load offset=4 (global.get $WRITER_SESSION))
       (then (drop (call $writer_check))))
+    (if (call $shared_heap_address (local.get $ga)) (then
+      (call $gs32 (i32.add (local.get $ga) (i32.const 0)) (i32x4.extract_lane 0 (local.get $v)))
+      (call $gs32 (i32.add (local.get $ga) (i32.const 4)) (i32x4.extract_lane 1 (local.get $v)))
+      (call $gs32 (i32.add (local.get $ga) (i32.const 8)) (i32x4.extract_lane 2 (local.get $v)))
+      (call $gs32 (i32.add (local.get $ga) (i32.const 12)) (i32x4.extract_lane 3 (local.get $v)))
+      (return)))
     (local.set $wa (g2w-fast (local.get $ga)))
         ;; Unmapped: the miss is reported, and the write goes nowhere.
         (if (i32.eq (local.get $wa) (global.get $NULL_SENTINEL)) (then (return)))
@@ -1093,6 +1127,8 @@
     ;; Reject an unenrolled CPU before translation, filters or the store.
     (if (i32.atomic.load offset=4 (global.get $WRITER_SESSION))
       (then (drop (call $writer_check))))
+    (if (call $shared_heap_address (local.get $ga)) (then
+      (drop (call $host_shared_heap (i32.const 11) (local.get $ga) (i32.const 2) (local.get $v) (i32.const 0))) (return)))
     (local.set $wa (g2w-fast (local.get $ga)))
     (if (i32.ne (i32.and (local.get $ga) (i32.const 0xFFF)) (i32.const 0xFFF))
       (then
@@ -1136,6 +1172,8 @@
     ;; Reject an unenrolled CPU before translation, filters or the store.
     (if (i32.atomic.load offset=4 (global.get $WRITER_SESSION))
       (then (drop (call $writer_check))))
+    (if (call $shared_heap_address (local.get $ga)) (then
+      (drop (call $host_shared_heap (i32.const 11) (local.get $ga) (i32.const 1) (local.get $v) (i32.const 0))) (return)))
     (local.set $wa (g2w-fast (local.get $ga)))
     (if (i32.and ;; inline $code_page_test: slot = (ga>>12 ^ ga>>28 ^ (ga>>30)<<15) & 0xFFFF
               (i32.load8_u (i32.add (global.get $CODE_PAGE_BITMAP)
@@ -1172,18 +1210,20 @@
   ;; `cmp al,0x10 / ror eax,0x10 / jz`, and with the rotate's result written
   ;; as the ZF source it never took the branch and decoded forever. So the
   ;; record goes to exact raw mode (9), the one that stores each flag
-  ;; independently -- the same shape SAHF and POPF produce. The SF source has
-  ;; bits 7, 15 and 31 all set because the 8- and 16-bit shift handlers
-  ;; rewrite $flag_sign_shift to 7 / 15 after $do_shift returns.
+  ;; independently -- the same shape SAHF and POPF produce. SF lives in the
+  ;; packed raw flags, independent of both ZF and the operand's sign shift.
   (func $set_flags_rotate (param $cf i32) (param $of i32)
-    (local $zf i32) (local $sf i32) (local $pf i32)
+    (local $zf i32) (local $sf i32) (local $pf i32) (local $af i32)
     (local.set $zf (call $get_zf))
     (local.set $sf (call $get_sf))
     (local.set $pf (call $get_pf))
+    (local.set $af (call $get_af))
     (global.set $flag_op (i32.const 9))
     (global.set $flag_sign_shift (i32.const 31))
     (global.set $flag_a (i32.or (i32.and (local.get $cf) (i32.const 1))
-                                (i32.shl (local.get $pf) (i32.const 1))))
+      (i32.or (i32.shl (local.get $pf) (i32.const 1))
+        (i32.or (i32.shl (local.get $af) (i32.const 2))
+                (i32.shl (local.get $sf) (i32.const 3))))))
     (global.set $flag_b (i32.and (local.get $of) (i32.const 1)))
     (global.set $flag_res
       (if (result i32) (local.get $zf) (then (i32.const 0))
@@ -1199,7 +1239,24 @@
     (global.set $flag_a (local.get $a)) (global.set $flag_b (i32.const 1)) (global.set $flag_res (local.get $r)))
 
   (func $get_zf (result i32) (i32.eqz (global.get $flag_res)))
-  (func $get_sf (result i32) (i32.and (i32.shr_u (global.get $flag_res) (global.get $flag_sign_shift)) (i32.const 1)))
+  (func $get_sf (result i32)
+    (if (result i32) (i32.eq (global.get $flag_op) (i32.const 9))
+      (then (i32.and (i32.shr_u (global.get $flag_a) (i32.const 3)) (i32.const 1)))
+      (else (i32.and (i32.shr_u (global.get $flag_res) (global.get $flag_sign_shift)) (i32.const 1)))))
+
+  ;; Exact raw mode packs CF/PF/AF/SF independently in flag_a bits 0..3.
+  ;; ADD/SUB/INC/DEC AF is the carry/borrow across bit 3. The remaining lazy
+  ;; modes do not supply an AF source here; undefined AF is never asserted.
+  (func $get_af (result i32)
+    (if (i32.eq (global.get $flag_op) (i32.const 9))
+      (then (return (i32.and (i32.shr_u (global.get $flag_a) (i32.const 2)) (i32.const 1)))))
+    (if (i32.or
+          (i32.or (i32.eq (global.get $flag_op) (i32.const 1)) (i32.eq (global.get $flag_op) (i32.const 2)))
+          (i32.or (i32.eq (global.get $flag_op) (i32.const 4)) (i32.eq (global.get $flag_op) (i32.const 5))))
+      (then (return (i32.and (i32.shr_u
+        (i32.xor (i32.xor (global.get $flag_a) (global.get $flag_b)) (global.get $flag_res))
+        (i32.const 4)) (i32.const 1)))))
+    (i32.const 0))
   (func $get_cf (result i32)
     (if (result i32) (i32.eq (global.get $flag_op) (i32.const 1))
       (then (i32.lt_u (global.get $flag_res) (global.get $flag_a)))
@@ -1236,7 +1293,7 @@
     (else (i32.const 0))))))
 
   ;; SAHF/POPF supply independently writable flags. In exact raw mode (9),
-  ;; flag_a packs CF in bit 0 and PF in bit 1. Other modes derive parity from
+  ;; flag_a packs CF/PF/AF/SF in bits 0..3. Other modes derive parity from
   ;; the lazy arithmetic result as before.
   (func $get_pf (result i32)
     (if (result i32) (i32.eq (global.get $flag_op) (i32.const 9))
@@ -1277,8 +1334,8 @@
   ;;
   ;; PF comes from the same expression $eval_cc uses for JP/SETP, so a program
   ;; that reads parity out of a pushed EFLAGS word agrees with one that branches
-  ;; on it. $eflags_extra carries every bit we do not model (IF, IOPL, NT, RF,
-  ;; AC, and bit 21 ID) straight back out of the last popfd -- see $load_eflags.
+  ;; on it. $eflags_extra carries the non-arithmetic flags. The POPF handlers
+  ;; apply user privilege/reserved-bit restrictions before restoring them.
   (func $build_eflags (result i32)
     (i32.or (i32.or (i32.or (i32.or
       (i32.shl (call $get_cf) (i32.const 0))
@@ -1291,28 +1348,31 @@
         (i32.shl (call $get_of) (i32.const 11))))
       (i32.or
         (i32.shl (call $get_pf) (i32.const 2))  ;; PF
-        (global.get $eflags_extra)))
+        (i32.or (i32.shl (call $get_af) (i32.const 4)) (global.get $eflags_extra))))
   )
 
   ;; Restore flags from EFLAGS value (for popfd)
-  ;; Uses flag_op=9 (exact raw mode): CF/PF/ZF/SF/OF are independent.
+  ;; Uses flag_op=9 (exact raw mode): CF/PF/AF/ZF/SF/OF are independent.
   (func $load_eflags (param $f i32)
-    ;; Everything outside the six bits we model is remembered verbatim, so
-    ;; pushfd hands it back. Dropping it used to break the standard CPUID probe
+    ;; Retain the defined non-arithmetic bits, excluding reserved bits.
+    ;; Dropping ID used to break the standard CPUID probe
     ;; (toggle bit 21, pushfd, compare): the toggle never survived, so the ID
     ;; bit read back unchanged and the program concluded the CPU has no CPUID
     ;; at all. Allegro does exactly this, which is why Liquid War never even
     ;; executed the cpuid its binary contains, and so never installed its MMX
-    ;; blitters. Mask = ~(CF|bit1|PF|AF|ZF|SF|DF|OF).
-    (global.set $eflags_extra (i32.and (local.get $f) (i32.const 0xFFFFF328)))
+    ;; blitters. Mask = TF|IF|IOPL|NT|RF|VM|AC|VIF|VIP|ID.
+    (global.set $eflags_extra (i32.and (local.get $f) (i32.const 0x003F7300)))
     (global.set $df (i32.and (i32.shr_u (local.get $f) (i32.const 10)) (i32.const 1)))
     (global.set $flag_op (i32.const 9))  ;; exact raw flags mode
-    ;; Pack CF/PF in flag_a, OF in flag_b, and encode ZF/SF in flag_res.
+    ;; Pack CF/PF/AF/SF in flag_a, OF in flag_b, and encode ZF in flag_res.
     (global.set $flag_a (i32.or
       (i32.and (local.get $f) (i32.const 1))
-      (i32.and (i32.shr_u (local.get $f) (i32.const 1)) (i32.const 2))))
+      (i32.or (i32.and (i32.shr_u (local.get $f) (i32.const 1)) (i32.const 2))
+        (i32.or (i32.and (i32.shr_u (local.get $f) (i32.const 2)) (i32.const 4))
+                (i32.and (i32.shr_u (local.get $f) (i32.const 4)) (i32.const 8))))))
     (global.set $flag_b (i32.and (i32.shr_u (local.get $f) (i32.const 11)) (i32.const 1)))  ;; OF = bit 11
-    ;; flag_res: bit 31 = SF, zero iff ZF. This makes get_zf and get_sf work with flag_sign_shift=31.
+    ;; flag_res is zero iff ZF. SF is independent in flag_a, so SF=ZF=1
+    ;; supplied by POPF/SAHF is representable as well.
     ;;
     ;; PF is carried independently in flag_a, so even synthetic combinations
     ;; such as ZF=1/PF=0 round-trip exactly.
@@ -1323,6 +1383,16 @@
         (then (global.set $flag_res (i32.const 0x80000001)))
         (else (global.set $flag_res (i32.const 1))))))
   )
+
+  ;; The supported protected-mode guest executes at CPL3, IOPL0 (not V86).
+  ;; POPFD can write status, TF, DF, NT, AC and ID, but cannot install IF,
+  ;; IOPL, RF, VM, VIF, VIP or reserved bits. Preserve privileged bits; RF
+  ;; clears when POPF executes. IF starts at the user default 1.
+  ;; Keep this separate from $load_eflags, also used for internal flag edits.
+  (func $load_user_eflags (param $f i32)
+    (call $load_eflags (i32.or
+      (i32.and (local.get $f) (i32.const 0x00244DD5))
+      (i32.or (i32.and (global.get $eflags_extra) (i32.const 0x001A3200)) (i32.const 2)))))
 
   ;; Save caller-saved registers + lazy flags onto guest stack (10 dwords = 40 bytes).
   ;; saved_cf belongs to each frame: restored INC/DEC flags read it lazily.

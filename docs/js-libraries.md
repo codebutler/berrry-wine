@@ -11,11 +11,15 @@
 | `dll-loader.js` | DLL loading, relocation, import patching |
 | `hlp-parser.js` | Windows HLP file parser (B+tree, Hall phrase decompression) |
 | `thread-manager.js` | Multi-thread support via separate WASM instances |
+| `guest-main-owner.js` | Explicit local or Worker main-guest execution, export calls and snapshots; callers await operations and never fall back to the host shadow |
 | `storage.js` | localStorage-backed registry and INI file persistence |
 | `filesystem.js` | Virtual filesystem for file operations |
 | `vfs-host-files.js` | Expands explicit CLI `--vfs-include` globs within their bounded host roots |
 | `vlan-wire.js` | Virtual LAN transport: loopback segment (instances in one process) and process wire (emulators in separate OS processes over child IPC). Carries opaque frames only — all routing lives in WAT |
 | `compile-wat.js` | Browser-side WAT → WASM compiler (wraps wabt.js) |
+| `gpu-stream-host.js` | GPU stream v2 kick host: drains the WAT ring (Glide, D3DIM, D3D8/9) into the `gpu-stream-webgl.js` / `gpu-stream-software.js` executors, or a null executor. D3D8/9 have no other path since d3d9-retire S4 (`d3d9-host.js`, `d3d9-backend.js` and `d3d9-render-worker.js` were deleted); `ctx.d3d9GpsBackend` (`webgl`/`software`/`null`/`none`) picks the executor |
+| `d3d9-shader.js` / `d3d9-software-backend.js` | D3D9 shader-IR → GLSL compiler used by the WebGL executor; native WAT software rasterizer `Device` used by the software executor |
+| `d3d-command-stream.js` | D3DIM (DX5–7) legacy `Encoder` only: RECORD_FLIP / RECORD_GL into the shared render worker; the D3D8/9 neutral command queue was removed |
 
 ### Rendering surfaces
 
@@ -56,3 +60,26 @@ a 256-pixel readback; otherwise no CPU frame readback is made, though the
 WebGL fallback copies a source-sized image from WebGL into Canvas2D each
 frame (about 1 ms/frame in headless Chrome on an M1). Measurements:
 `docs/re-notes/quake3-demo.md`.
+
+### CRT presets
+
+The debug toolbar's CRT select (`Off` / `VGA monitor` / `Arcade/TV`, plus
+optional Curve and Persistence) is stored as `{ preset, curvature,
+persistence }` under `wine-assembly:crt-effects`; an old `{ scanlines, mask,
+glow }` value reads as `vga` if any flag was on. With a preset on,
+`presentation-filter.js` **replaces the scaler**: one beam pass reads the
+native frame (cropped, display-gamma corrected) and draws the output rectangle
+directly — decode 2.4 to linear, two nearest beam lines x four horizontal
+taps, a vertical Gaussian spot that widens with gun intensity and is
+integrated over the output pixel, a quarter-resolution halation buffer, and a
+phosphor mask in device pixels with brightness compensation, then encode 2.2.
+The selected scaler does not run (`lastBackend` is
+`webgl-beam+crt`, `lastCrt` reports lines/doublescan/mask/bloom). VGA
+doublescans sources of 300 rows or fewer. The mask is dropped when a canvas
+pixel is not a whole number of device pixels and faded in below ~2.25 output
+pixels per source pixel; the line structure fades to a flat beam below ~2
+output pixels per line; halation is skipped for the filter's lifetime on a
+>2 MP output measured slower than 12 ms. Without WebGL, or when the output is
+smaller than the frame, presentation falls back to the selected scaler with no
+effect. `tools/crt-stills.js` renders reference frames through every preset at
+chosen CSS sizes and DPRs and reports brightness against Off.

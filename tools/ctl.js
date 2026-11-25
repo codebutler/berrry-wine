@@ -39,6 +39,9 @@
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const https = require('https');
+// The LAN hub (dev-server --cert) is https; pick the module per URL.
+const lib = u => (u.protocol === 'https:' ? https : http);
 
 const argv = process.argv.slice(2);
 const flag = (name, fallback) => {
@@ -71,7 +74,7 @@ function post(url, body) {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify(body);
     const u = new URL(url);
-    const request = http.request({
+    const request = lib(u).request({
       host: u.hostname, port: u.port, path: u.pathname + u.search, method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
     }, response => {
@@ -91,7 +94,7 @@ function post(url, body) {
 function get(url) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
-    http.get({ host: u.hostname, port: u.port, path: u.pathname + u.search }, response => {
+    lib(u).get({ host: u.hostname, port: u.port, path: u.pathname + u.search }, response => {
       let text = '';
       response.setEncoding('utf8');
       response.on('data', chunk => { text += chunk; });
@@ -258,6 +261,9 @@ async function main() {
     if (positional[2]) commands.name = positional[2];
     const every = process.argv.find(a => a.startsWith('--every='));
     if (every) commands.everyNSteps = parseInt(every.slice(8), 10);
+    // --scale=2: nearest-neighbour upscale so pixel art survives the encoder.
+    const scale = process.argv.find(a => a.startsWith('--scale='));
+    if (scale) commands.scale = parseInt(scale.slice(8), 10);
   } else if (VERB === 'eval') {
     commands = { action: 'eval', code: positional.slice(1).join(' ') };
   } else if (VERB === 'cmd') {

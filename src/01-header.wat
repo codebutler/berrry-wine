@@ -41,6 +41,9 @@
   ;; synthesise — test/run.js derives get_ticks from the batch counter. Use
   ;; this only to bound a wait on something outside this instance.
   (import "host" "real_time_ms" (func $host_real_time_ms (result i32)))
+  ;; Host CSPRNG entropy. A returned DWORD is not a per-Worker pointer key;
+  ;; $pointer_secret atomically publishes one winning value in process memory.
+  (import "host" "entropy_u32" (func $host_entropy_u32 (result i32)))
   ;; Snapshot the host wall clock into a caller-provided WASM buffer.
   ;; kind: 0=UTC SYSTEMTIME, 1=local SYSTEMTIME, 2=UTC FILETIME.
   ;; The i32 result keeps Worker RPC synchronous so the shared-memory write is
@@ -117,7 +120,17 @@
   (import "host" "draw_text" (func $host_draw_text (param i32 i32 i32 i32 i32)))
   ;; draw_text(x, y, text_ptr, text_len, color)
   (import "host" "check_input" (func $host_check_input (result i32)))
+  ;; Opaque guarded intent provenance; zero for ordinary physical input.
+  (import "host" "check_input_token" (func $host_check_input_token (result i32)))
+  (import "host" "input_validate" (func $host_input_validate (param i32) (result i32)))
+  (import "host" "input_consumed" (func $host_input_consumed (param i32 i32 i32 i32 i32) (result i32)))
+  ;; Native DirectInput lifetime/poll/record boundary. Sequence is the shared
+  ;; producer ring position, never inferred from returned motion bytes.
+  (import "host" "di_mouse_receipt" (func $host_di_mouse_receipt (param i32 i32 i32 i32 i32) (result i32)))
   ;; check_input() → packed event (0 = none)
+  (import "host" "input_pump_idle" (func $host_input_pump_idle (param i32)))
+  ;; input_pump_idle(thread) — native unfiltered message pump exhausted all
+  ;; work, including posted messages/paint/timers after the host input poll.
   (import "host" "check_input_lparam" (func $host_check_input_lparam (result i32)))
   ;; check_input_lparam() → lParam of last check_input event
   (import "host" "check_input_wparam" (func $host_check_input_wparam (result i32)))
@@ -230,9 +243,10 @@
   ;; opcode, stdcall stack WA, auxiliary target HWND -> integer/API result.
   (import "host" "gpu_gl_call"
     (func $host_gpu_gl_call (param i32 i32 i32) (result i32)))
-  ;; Glide normalized batch/barrier: opcode, packet WA, packet byte length.
-  (import "host" "glide_submit"
-    (func $host_glide_submit (param i32 i32 i32) (result i32)))
+  ;; GPU stream v2 (src/09a8gs-gpu-stream.wat): ring header WA, mode
+  ;; 0 async / 1 drain / 2 drain+close -> 1, or 0 when no executor opened.
+  (import "host" "gpu_stream_kick"
+    (func $host_gpu_stream_kick (param i32 i32) (result i32)))
   (import "host" "note_richedit_charformat_size" (func $host_note_richedit_charformat_size (param i32 i32 i32)))
   ;; note_richedit_charformat_size(yHeightTwips, selectionLo, selectionHi)
   ;; GDI host imports
@@ -298,6 +312,9 @@
   ;; nothing anywhere naming the allocation that started it.
   (import "host" "heap_oom_trace"
     (func $host_heap_oom_trace (param i32 i32)))
+  ;; System authority operations; allocation bytes never use a private mirror.
+  (import "host" "shared_heap"
+    (func $host_shared_heap (param i32 i32 i32 i32 i32) (result i32)))
 
   ;; Every standard scrollbar strip as it is painted: control-local rect,
   ;; orientation, and the page model it was handed. A strip that is flat grey
@@ -489,6 +506,8 @@
   (import "host" "fs_file_api_ansi" (func $host_fs_file_api_ansi (param i32) (result i32)))
   (import "host" "fs_logical_drive_mask" (func $host_fs_logical_drive_mask (result i32)))
   (import "host" "fs_drive_type" (func $host_fs_drive_type (param i32 i32) (result i32)))
+  ;; Disk root/directory validation; returns a Win32 error, zero on success.
+  (import "host" "fs_disk_path_error" (func $host_fs_disk_path_error (param i32 i32 i32) (result i32)))
   ;; fs_drive_type(rootWA, isWide) → DRIVE_* value, or 0 when no mount claims
   ;; that letter and the caller should keep its built-in answer.
   (import "host" "fs_volume_label" (func $host_fs_volume_label (param i32 i32 i32 i32) (result i32)))
@@ -535,6 +554,10 @@
   ;; a nested synchronous send, which cannot return to the host's event loop.
 
   ;; COM host imports
+  (import "host" "com_localserver_information" (func $host_com_localserver_information (param i32 i32 i32 i32) (result i32)))
+  (import "host" "com_interface_operation" (func $host_com_interface_operation (param i32 i32 i32) (result i32)))
+  (import "host" "com_interface_result" (func $host_com_interface_result (param i32 i32) (result i32)))
+  (import "host" "com_proxy_stub" (func $host_com_proxy_stub (param i32 i32 i32) (result i32)))
   (import "host" "com_create_instance" (func $host_com_create_instance (param i32 i32 i32 i32 i32) (result i32)))
   ;; com_create_instance(rclsidWA, pUnkOuterGA, dwClsContext, riidWA, ppvGA) → HRESULT
   (import "host" "com_register_class_object" (func $host_com_register_class_object (param i32 i32 i32 i32) (result i32)))
@@ -547,6 +570,7 @@
   (import "host" "com_get_pending_dll" (func $host_com_get_pending_dll (param i32 i32) (result i32)))
   (import "host" "com_initialize_thread" (func $host_com_initialize_thread (param i32 i32 i32) (result i32)))
   (import "host" "com_uninitialize_thread" (func $host_com_uninitialize_thread (param i32) (result i32)))
+  (import "host" "com_is_initialized" (func $host_com_is_initialized (param i32) (result i32)))
   ;; Thread/event host imports
   ;; create_thread(start, param, stackSize, flags, lpThreadIdWA, creatorTid)
   ;; returns the
@@ -2389,7 +2413,8 @@
   ;; slot 0 still produces the non-zero handle callers test for.
   (global $CURSOR_TABLE i32 (region.addr $CURSOR_TABLE 0))
   (global $CURSOR_TABLE_SIZE i32 (region.size $CURSOR_TABLE))
-  (global $CURSOR_TABLE_STRIDE i32 (i32.const 24))
+  ;; +24/+28 identify a shared NE resource's module and type/NAMEINFO id.
+  (global $CURSOR_TABLE_STRIDE i32 (i32.const 32))
   ;; The first 32 records live in the fixed region. Icon-heavy clients keep
   ;; their independent copies in a lazily allocated extension on the guest
   ;; heap rather than consuming another fixed slice of the region map.
@@ -3077,6 +3102,8 @@
   (global $KERNEL32_MODULE_SIZE i32 (region.size $KERNEL32_MODULE))
   (global $STATIC_SYS_DLL_IMAGES i32 (region.addr $STATIC_SYS_DLL_IMAGES 0))
   (global $STATIC_SYS_DLL_IMAGES_SIZE i32 (region.size $STATIC_SYS_DLL_IMAGES))
+  (global $COMCTL32_DIALOG_RSRC i32 (region.addr $COMCTL32_DIALOG_RSRC 0))
+  (global $COMCTL32_DIALOG_RSRC_SIZE i32 (region.size $COMCTL32_DIALOG_RSRC))
   (global $DLL_SYNTHETIC_REFS_SIZE i32 (region.size $DLL_SYNTHETIC_REFS))
   (global $DLL_LIFECYCLE_TABLE i32 (region.addr $DLL_LIFECYCLE_TABLE 0))
   (global $DLL_LIFECYCLE_TABLE_SIZE i32 (region.size $DLL_LIFECYCLE_TABLE))
@@ -3094,7 +3121,7 @@
   ;; imports — Warcraft III's Game.dll imports 460 ordinals from War3Demo.exe.
   (global $exe_export_rva (mut i32) (i32.const 0))
   ;; rand() state
-  (global $rand_seed (mut i32) (i32.const 12345))
+  (global $rand_seed (mut i32) (i32.const 1))
   ;; Native Win98 reference exposes 80 slots. Each instance registers its vector
   ;; so releasing an index clears existing threads, including direct FS reads.
   (global $TLS_SLOT_COUNT i32 (i32.const 80))
@@ -3162,6 +3189,8 @@
   (global $capture_hwnd (mut i32) (i32.const 0))      ;; hwnd that has mouse capture (SetCapture/ReleaseCapture)
   (global $CURSOR_THREAD_STATE i32 (region.addr $CURSOR_THREAD_STATE 0))
   (global $CURSOR_THREAD_STATE_SIZE i32 (i32.const 0x110))
+  (global $TME_THREAD_STATE i32 (region.addr $TME_THREAD_STATE 0))  ;; TrackMouseEvent, 09a5 $tme_addr
+  (global $TME_THREAD_STATE_SIZE i32 (i32.const 0x440))
   (global $caret_hwnd (mut i32) (i32.const 0))        ;; USER caret owner hwnd
   (global $caret_x (mut i32) (i32.const 0))           ;; USER caret client x
   (global $caret_y (mut i32) (i32.const 0))           ;; USER caret client y
@@ -3339,6 +3368,8 @@
   ;; When PeekMessageA is called with PM_NOREMOVE, we fetch from JS but cache here.
   ;; Next PM_REMOVE call consumes the cache instead of fetching again.
   (global $pending_input_packed (mut i32) (i32.const 0))
+  (global $pending_input_token (mut i32) (i32.const 0))
+  (global $input_return_token (mut i32) (i32.const 0))
   (global $pending_input_lparam (mut i32) (i32.const 0))
   (global $pending_input_hwnd   (mut i32) (i32.const 0))
   ;; Win32 MSG bookkeeping for GetMessagePos/GetMessageTime and MSG.pt.
@@ -3577,7 +3608,8 @@
   ;; gets back as "the previous filter" -- CRTs save that return value and put
   ;; it back on the way out, so it has to be a real stored slot rather than a
   ;; constant.
-  (global $unhandled_exception_filter (mut i32) (i32.const 0))
+  (global $TOP_EXCEPTION_FILTER i32 (region.addr $TOP_EXCEPTION_FILTER 0))
+  (global $TOP_EXCEPTION_FILTER_SIZE i32 (region.size $TOP_EXCEPTION_FILTER))
   ;; One process-global vectored exception registration. The handler address
   ;; doubles as the opaque removal handle in this bounded single-registration
   ;; model; ordinary SEH and top-level filters retain their existing paths.
@@ -3751,6 +3783,9 @@
   ;; dialog so its controls and application-owned state survive tab switches.
   (global $propsheet_page_hwnds (mut i32) (i32.const 0))
   (global $propsheet_frame_hwnd (mut i32) (i32.const 0))
+  ;; Client-pixel page area of the live sheet: the largest page template.
+  (global $propsheet_page_w (mut i32) (i32.const 420))
+  (global $propsheet_page_h (mut i32) (i32.const 228))
   (global $propsheet_finish_page (mut i32) (i32.const 0))
   (global $propsheet_finish_nmhdr (mut i32) (i32.const 0))
   (global $ddenum_ret_thunk (mut i32) (i32.const 0)) ;; CACA0007 DDEnumerate callback return

@@ -83,7 +83,7 @@ const draw = ({ type, bytes, write }, corners = CORNERS) => {
     }
 
     // A byte quadruple as a position stays refused. D3DCOLOR's components are
-    // permuted by lib/d3d9-host.js before the backend sees them and UBYTE4 is
+    // permuted by the producer before the backend sees them and UBYTE4 is
     // an index set, so either one here is a bug, not a coordinate encoding.
     for (const type of [4, 5, 8]) {
       assert.throws(() => device.draw(draw({ type, bytes: 4,

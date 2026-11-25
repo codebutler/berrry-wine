@@ -116,11 +116,11 @@
   ;; PeekMessage, which ignores that marker, but has_pending_message and
   ;; MsgWaitForMultipleObjects count it, so every idle wait returned at once.
   ;;
-  ;; Only when no top-level survives at all does the old synthetic marker
-  ;; (flag 1) remain -- the loop-exit shape GetMessageA gives a launcher whose
-  ;; last window just died -- and $main_hwnd_adopt retires it the moment a
-  ;; replacement main window appears. An explicit PostQuitMessage (flag 2)
-  ;; is never downgraded.
+  ;; A windowless interval is legal too: modeless wizards can destroy one page
+  ;; before retrieving the thread message that creates the next. Inventing a
+  ;; quit here makes GetMessage return zero before that message is delivered.
+  ;; Leave all termination decisions to the guest (including its WM_DESTROY
+  ;; callback); an explicit PostQuitMessage must survive this bookkeeping.
   (func $destroy_main_window_lifecycle (param $hwnd i32)
     (local $repl i32)
     (if (i32.eq (local.get $hwnd) (global.get $main_hwnd))
@@ -137,10 +137,6 @@
         (if (local.get $repl)
           (then (call $main_hwnd_adopt (local.get $repl)))
           (else
-            (if (i32.and
-                  (i32.eqz (global.get $quit_flag))
-                  (call $wnd_is_effectively_visible (local.get $hwnd)))
-              (then (global.set $quit_flag (i32.const 1))))
             ;; The slot is removed next. Leave no stale main handle behind so
             ;; a replacement top-level created during an SDL video-mode reset
             ;; becomes the new input/paint target.
@@ -250,7 +246,10 @@
     ;; Transfer focus to main_hwnd: deliver WM_SETFOCUS synchronously via EIP redirect.
     ;; On real Windows, destroying the focused window gives focus to the next foreground window.
     ;; Only if main_hwnd is valid and different from the destroyed window (may have been promoted).
-    (if (i32.and (i32.ne (local.get $focus_lost) (i32.const 0))
+    ;; WM_DESTROY may already have restored a modal owner's live focus.
+    ;; Do not overwrite that synchronous consequence with the main fallback.
+    (if (i32.and (i32.and (i32.ne (local.get $focus_lost) (i32.const 0))
+                   (i32.eqz (call $wnd_lookup_live (global.get $focus_hwnd))))
                  (i32.and (i32.ne (global.get $main_hwnd) (i32.const 0))
                           (i32.ne (global.get $main_hwnd) (local.get $arg0))))
       (then
@@ -480,12 +479,11 @@
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
   )
 
-  ;; ConvertToGlobalHandle promotes a process-local kernel handle so it can be
-  ;; inherited by another process. This emulator has one process and stable
-  ;; handle identities, therefore the promoted handle is the same handle.
+  ;; Global handle promotion requires an authority reference and consumes the
+  ;; local source. A numeric identity return grants neither contract across
+  ;; real process peers. Keep unsupported promotion explicit.
   (func $handle_ConvertToGlobalHandle (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (i32.store offset=0 (global.get $reg_base) (local.get $arg0))
-    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
+    (call $crash_unimplemented (local.get $name_ptr))
   )
 
   ;; Primary-monitor enumeration. Each suspended callback owns a stack frame:
@@ -787,6 +785,8 @@
 
   ;; 93: GetWindowRect
   (func $handle_GetWindowRect (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $allocation i32) (local $stage i32)
+    (local $left i32) (local $top i32) (local $right i32) (local $bottom i32)
     ;; GetWindowRect(hwnd, lpRect) — fills RECT with screen coords
     (if (i32.eqz (call $window_handle_valid (local.get $arg0)))
       (then
@@ -794,7 +794,29 @@
         (i32.store offset=0 (global.get $reg_base) (i32.const 0))
         (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
         (return)))
-    (call $host_get_window_rect (local.get $arg0) (call $g2w (local.get $arg1)))
+    ;; The host writes contiguous physical bytes and may reenter Wasm for
+    ;; child geometry. Own the staging allocation until its result is saved.
+    ;; Aligning 16 bytes within 31 keeps the RECT inside one guest page even
+    ;; when the allocator's backing pages are not physically adjacent.
+    (local.set $allocation (call $heap_alloc (i32.const 31)))
+    (if (i32.eqz (local.get $allocation))
+      (then
+        (global.set $last_error (i32.const 8)) ;; ERROR_NOT_ENOUGH_MEMORY
+        (i32.store offset=0 (global.get $reg_base) (i32.const 0))
+        (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
+        (return)))
+    (local.set $stage (call $g2w
+      (i32.and (i32.add (local.get $allocation) (i32.const 15)) (i32.const -16))))
+    (call $host_get_window_rect (local.get $arg0) (local.get $stage))
+    (local.set $left (i32.load (local.get $stage)))
+    (local.set $top (i32.load offset=4 (local.get $stage)))
+    (local.set $right (i32.load offset=8 (local.get $stage)))
+    (local.set $bottom (i32.load offset=12 (local.get $stage)))
+    (call $heap_free (local.get $allocation))
+    (call $gs32 (local.get $arg1) (local.get $left))
+    (call $gs32 (i32.add (local.get $arg1) (i32.const 4)) (local.get $top))
+    (call $gs32 (i32.add (local.get $arg1) (i32.const 8)) (local.get $right))
+    (call $gs32 (i32.add (local.get $arg1) (i32.const 12)) (local.get $bottom))
     (i32.store offset=0 (global.get $reg_base) (i32.const 1))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12))) (return)
   )
@@ -855,18 +877,51 @@
   ;; 97: GetCursorPos
   (func $handle_GetCursorPos (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $pos i32)
-    (local $x i32)
-    (local $y i32)
-    (local.set $pos (call $host_get_mouse_position))
-    (local.set $x (i32.and (local.get $pos) (i32.const 0xFFFF)))
-    (local.set $y (i32.and (i32.shr_u (local.get $pos) (i32.const 16)) (i32.const 0xFFFF)))
-    (global.set $last_msg_pos_x (local.get $x))
-    (global.set $last_msg_pos_y (local.get $y))
-    (call $gs32 (local.get $arg0) (local.get $x))
-    (call $gs32 (i32.add (local.get $arg0) (i32.const 4)) (local.get $y))
+    (local.set $pos (call $cursor_screen_pos))
+    (call $gs32 (local.get $arg0) (i32.extend16_s (local.get $pos)))
+    (call $gs32 (i32.add (local.get $arg0) (i32.const 4)) (i32.shr_s (local.get $pos) (i32.const 16)))
     (i32.store offset=0 (global.get $reg_base) (i32.const 1))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8))) (return)
   )
+
+  ;; The cursor's screen position as USER reports it, packed (y << 16) | x:
+  ;; GetCursorPos and the TrackMouseEvent leave/hover checks read the same
+  ;; clamped point.
+  (func $cursor_screen_pos (result i32)
+    (local $pos i32)
+    (local $x i32)
+    (local $y i32)
+    (local $lim i32)
+    (local.set $pos (call $host_get_mouse_position))
+    (local.set $x (i32.extend16_s (local.get $pos)))
+    (local.set $y (i32.shr_s (local.get $pos) (i32.const 16)))
+    ;; The Windows cursor never leaves the screen (SM_CXSCREEN x SM_CYSCREEN,
+    ;; the DirectDraw mode while one is set) or an active ClipCursor
+    ;; rectangle, and games index framebuffers with it unchecked. A browser
+    ;; pointer can: Red Alert dragged a selection box past the picture, drew a
+    ;; vertical line of length -3 and its pixel loop (0x5a3033) ran down 1.25M
+    ;; rows into the shared arena (berrry.wine crash report 2026-11-24).
+    (local.set $lim (call $screen_metric_w))
+    (if (i32.gt_s (local.get $lim) (i32.const 0)) (then
+      (if (i32.ge_s (local.get $x) (local.get $lim))
+        (then (local.set $x (i32.sub (local.get $lim) (i32.const 1)))))
+      (if (i32.lt_s (local.get $x) (i32.const 0)) (then (local.set $x (i32.const 0))))))
+    (local.set $lim (call $screen_metric_h))
+    (if (i32.gt_s (local.get $lim) (i32.const 0)) (then
+      (if (i32.ge_s (local.get $y) (local.get $lim))
+        (then (local.set $y (i32.sub (local.get $lim) (i32.const 1)))))
+      (if (i32.lt_s (local.get $y) (i32.const 0)) (then (local.set $y (i32.const 0))))))
+    (if (global.get $clip_cursor_active) (then
+      (if (i32.lt_s (local.get $x) (global.get $clip_cursor_l))
+        (then (local.set $x (global.get $clip_cursor_l))))
+      (if (i32.ge_s (local.get $x) (global.get $clip_cursor_r))
+        (then (local.set $x (i32.sub (global.get $clip_cursor_r) (i32.const 1)))))
+      (if (i32.lt_s (local.get $y) (global.get $clip_cursor_t))
+        (then (local.set $y (global.get $clip_cursor_t))))
+      (if (i32.ge_s (local.get $y) (global.get $clip_cursor_b))
+        (then (local.set $y (i32.sub (global.get $clip_cursor_b) (i32.const 1)))))))
+    (i32.or (i32.and (local.get $x) (i32.const 0xFFFF))
+            (i32.shl (local.get $y) (i32.const 16))))
 
   ;; 98: GetLastActivePopup(hWnd) — 1 arg stdcall. USER remembers the last
   ;; active direct owned popup; child/owned windows and empty groups return hWnd.
@@ -876,9 +931,14 @@
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))  ;; stdcall, 1 arg
   )
 
-  ;; 99: GetFocus — STUB: unimplemented
+  ;; 99: GetFocus — the calling queue's live focus, or NULL. An idle/shadow
+  ;; instance or a retired foreign HWND cannot supply focus for this thread.
   (func $handle_GetFocus (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (i32.store offset=0 (global.get $reg_base) (global.get $focus_hwnd))
+    (i32.store offset=0 (global.get $reg_base)
+      (select (global.get $focus_hwnd) (i32.const 0)
+        (i32.and (call $wnd_lookup_live (global.get $focus_hwnd))
+          (i32.eq (call $wnd_get_thread (global.get $focus_hwnd))
+            (global.get $current_thread_id)))))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4))))
 
   ;; 100: ReleaseDC(hwnd, hdc) — release the WAT-owned DC, return 1.
@@ -1283,6 +1343,9 @@
     (i32.atomic.load offset=8 (call $cursor_thread_addr (local.get $tid))))
   (func $cursor_thread_reset (param $tid i32)
     (local $p i32)
+    (if (i32.and (i32.ne (call $capture_live) (i32.const 0))
+          (i32.eq (call $capture_publication_word (i32.const 4)) (local.get $tid)))
+      (then (call $capture_store (i32.const 0))))
     (local.set $p (call $cursor_thread_addr (local.get $tid)))
     (i32.atomic.store (local.get $p) (i32.const 0))
     (i32.atomic.store offset=8 (local.get $p) (i32.const 0)))
@@ -1598,14 +1661,16 @@
 
   ;; 116: FillRect(hdc, lprc, hbr)
   (func $handle_FillRect (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $desc i32) (local $rc i32)
+    (local $desc i32)
     (local.set $desc (global.get $GDI_LINE_DESC))
-    (local.set $rc (call $g2w (local.get $arg1)))
     (if (call $gdi_surface_descriptor (local.get $arg0) (local.get $desc))
       (then (i32.store offset=0 (global.get $reg_base) (call $gdi_fill_rect_desc
         (local.get $arg0) (local.get $desc)
-        (load.field Rect left (local.get $rc)) (load.field.memarg Rect top (local.get $rc))
-        (load.field.memarg Rect right (local.get $rc)) (load.field.memarg Rect bottom (local.get $rc))
+        ;; RECT fields, including unaligned scalars, may cross sparse guest pages.
+        (call $gl32 (i32.add (local.get $arg1) (offset-of Rect left)))
+        (call $gl32 (i32.add (local.get $arg1) (offset-of Rect top)))
+        (call $gl32 (i32.add (local.get $arg1) (offset-of Rect right)))
+        (call $gl32 (i32.add (local.get $arg1) (offset-of Rect bottom)))
         (local.get $arg2))))
       (else (i32.store offset=0 (global.get $reg_base) (i32.const 0))))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))
@@ -1967,24 +2032,28 @@
   ;; calls IsDialogMessageA on every pump iteration; while this answered 0
   ;; unconditionally, Enter simply fell through to the edit and vanished.
   ;;
-  ;; Only the two command keys are claimed. Everything else still answers 0,
-  ;; so the caller goes on to TranslateMessage/DispatchMessage exactly as it
-  ;; did before -- USER would have dispatched those same messages itself and
-  ;; returned TRUE, and this way the app's own pump stays in charge of them.
+  ;; Selection keys share their policy with DialogBox's native input loop.
+  ;; Other messages remain with the caller's TranslateMessage/DispatchMessage.
   (func $handle_IsDialogMessageA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $handled i32)
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
+    (local.set $handled (call $dialog_process_message (local.get $arg0) (local.get $arg1)))
+    (i32.store (global.get $reg_base) (local.get $handled)))
+
+  (func $dialog_process_message (param $arg0 i32) (param $arg1 i32) (result i32)
+    (local $handled i32)
     (local $target i32) (local $msg i32) (local $vk i32)
     (local $walk i32) (local $depth i32) (local $inside i32)
     (local $code i32) (local $def i32) (local $id i32) (local $btn i32)
-    (i32.store offset=0 (global.get $reg_base) (i32.const 0))
-    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))  ;; stdcall, 2 args
+    (local $dialog_generation i64) (local $target_generation i64)
     (if (i32.or (i32.eqz (local.get $arg0)) (i32.eqz (local.get $arg1)))
-      (then (return)))
+      (then (return (local.get $handled))))
     (local.set $target (call $gl32 (local.get $arg1)))
     (local.set $msg (call $gl32 (i32.add (local.get $arg1) (i32.const 4))))
     (local.set $vk (call $gl32 (i32.add (local.get $arg1) (i32.const 8))))
     ;; WM_KEYDOWN only, and only the keys USER itself claims: the two command
     ;; keys, Tab, and the four arrows. Everything else still falls through.
-    (if (i32.ne (local.get $msg) (i32.const 0x0100)) (then (return)))
+    (if (i32.ne (local.get $msg) (i32.const 0x0100)) (then (return (local.get $handled))))
     (if (i32.eqz (i32.or
           (i32.or
             (i32.eq (local.get $vk) (i32.const 0x0D))
@@ -1993,7 +2062,7 @@
             (i32.eq (local.get $vk) (i32.const 0x09))
             (i32.and (i32.ge_u (local.get $vk) (i32.const 0x25))
                      (i32.le_u (local.get $vk) (i32.const 0x28))))))
-      (then (return)))
+      (then (return (local.get $handled))))
     ;; The message must belong to this dialog or one of its descendants.
     (local.set $inside (i32.eq (local.get $target) (local.get $arg0)))
     (local.set $walk (local.get $target))
@@ -2006,29 +2075,36 @@
       (local.set $depth (i32.add (local.get $depth) (i32.const 1)))
       (br_if $done_walk (i32.ge_u (local.get $depth) (i32.const 32)))
       (br $up)))
-    (if (i32.eqz (local.get $inside)) (then (return)))
+    (if (i32.eqz (local.get $inside)) (then (return (local.get $handled))))
+    (local.set $dialog_generation (call $wnd_lookup_generation (local.get $arg0)))
+    (local.set $target_generation (call $wnd_lookup_generation (local.get $target)))
     ;; A control that asks for every key keeps it (DLGC_WANTALLKEYS/MESSAGE).
     (local.set $code (call $wnd_send_message
       (local.get $target) (i32.const 0x0087)
       (local.get $vk) (local.get $arg1)))
-    (if (i32.and (local.get $code) (i32.const 0x0004)) (then (return)))
+    ;; WM_GETDLGCODE is application code and can retire either window.
+    (if (i32.or
+          (i64.ne (local.get $dialog_generation) (call $wnd_lookup_generation (local.get $arg0)))
+          (i64.ne (local.get $target_generation) (call $wnd_lookup_generation (local.get $target))))
+      (then (return (i32.const 1))))
+    (if (i32.and (local.get $code) (i32.const 0x0004)) (then (return (local.get $handled))))
     ;; Tab and the arrows move the focus, and a control that asked for them
     ;; (DLGC_WANTTAB / DLGC_WANTARROWS -- an edit or a listbox) keeps them.
     (if (i32.eq (local.get $vk) (i32.const 0x09))
       (then
-        (if (i32.and (local.get $code) (i32.const 0x0002)) (then (return)))
+        (if (i32.and (local.get $code) (i32.const 0x0002)) (then (return (local.get $handled))))
         (local.set $btn (call $dialog_next_tabstop
           (local.get $arg0) (local.get $target)
           (select (i32.const -1) (i32.const 1)
             (i32.and (call $host_get_key_down_state (i32.const 0x10))
                      (i32.const 0x8000)))))
         (if (local.get $btn) (then (call $set_focus (local.get $btn))))
-        (i32.store offset=0 (global.get $reg_base) (i32.const 1))
-        (return)))
+        (local.set $handled (i32.const 1))
+        (return (local.get $handled))))
     (if (i32.and (i32.ge_u (local.get $vk) (i32.const 0x25))
                  (i32.le_u (local.get $vk) (i32.const 0x28)))
       (then
-        (if (i32.and (local.get $code) (i32.const 0x0001)) (then (return)))
+        (if (i32.and (local.get $code) (i32.const 0x0001)) (then (return (local.get $handled))))
         ;; VK_LEFT (0x25) and VK_UP (0x26) go back; VK_RIGHT/VK_DOWN forward.
         (local.set $btn (call $dialog_next_group_item
           (local.get $arg0) (local.get $target)
@@ -2038,15 +2114,15 @@
               (i32.ne (local.get $btn) (i32.const 0))
               (i32.ne (local.get $btn) (local.get $target)))
           (then (call $set_focus (local.get $btn))))
-        (i32.store offset=0 (global.get $reg_base) (i32.const 1))
-        (return)))
+        (local.set $handled (i32.const 1))
+        (return (local.get $handled))))
     (if (i32.eq (local.get $vk) (i32.const 0x1B))
       (then
-        (drop (call $wnd_send_message
-          (local.get $arg0) (i32.const 0x0111) (i32.const 2)
-          (call $ctrl_find_by_id (local.get $arg0) (i32.const 2))))
-        (i32.store offset=0 (global.get $reg_base) (i32.const 1))
-        (return)))
+        (call $dialog_key_command
+          (local.get $arg0) (i32.const 2)
+          (call $ctrl_find_by_id (local.get $arg0) (i32.const 2)))
+        (local.set $handled (i32.const 1))
+        (return (local.get $handled))))
     ;; VK_RETURN on a focused pushbutton fires that button, not the dialog's
     ;; default -- USER makes the focused button the default for as long as it
     ;; holds the focus. Diablo's menus are exactly this shape: five ownerdrawn
@@ -2059,31 +2135,34 @@
         (if (i32.eqz (i32.and (call $wnd_get_style (local.get $target))
                               (i32.const 0x08000000)))  ;; !WS_DISABLED
           (then
-            (drop (call $wnd_send_message
-              (local.get $arg0) (i32.const 0x0111)
-              (call $ctrl_table_get_id (local.get $target)) (local.get $target)))
-            (i32.store offset=0 (global.get $reg_base) (i32.const 1))
-            (return)))))
+            (call $dialog_key_command
+              (local.get $arg0)
+              (call $ctrl_table_get_id (local.get $target)) (local.get $target))
+            (local.set $handled (i32.const 1))
+            (return (local.get $handled))))))
     ;; VK_RETURN: the dialog's own default id when it claims one, IDOK when
     ;; it does not. A default button that exists but is disabled swallows the
     ;; key rather than firing -- an absent one does not.
     (local.set $def (call $wnd_send_message
       (local.get $arg0) (i32.const 0x0400) (i32.const 0) (i32.const 0)))  ;; DM_GETDEFID
+    (if (i64.ne (local.get $dialog_generation) (call $wnd_lookup_generation (local.get $arg0)))
+      (then (return (i32.const 1))))
     (if (i32.eq (i32.shr_u (local.get $def) (i32.const 16)) (i32.const 0x554B))
       (then
         (local.set $id (i32.and (local.get $def) (i32.const 0xFFFF)))
         (local.set $btn (call $ctrl_find_by_id (local.get $arg0) (local.get $id)))
-        (i32.store offset=0 (global.get $reg_base) (i32.const 1))
-        (if (i32.eqz (local.get $btn)) (then (return)))
+        (local.set $handled (i32.const 1))
+        (if (i32.eqz (local.get $btn)) (then (return (local.get $handled))))
         (if (i32.and (call $wnd_get_style (local.get $btn)) (i32.const 0x08000000))
-          (then (return)))
-        (drop (call $wnd_send_message
-          (local.get $arg0) (i32.const 0x0111) (local.get $id) (local.get $btn)))
-        (return)))
-    (drop (call $wnd_send_message
-      (local.get $arg0) (i32.const 0x0111) (i32.const 1)
-      (call $ctrl_find_by_id (local.get $arg0) (i32.const 1))))
-    (i32.store offset=0 (global.get $reg_base) (i32.const 1))
+          (then (return (local.get $handled))))
+        (call $dialog_key_command
+          (local.get $arg0) (local.get $id) (local.get $btn))
+        (return (local.get $handled))))
+    (call $dialog_key_command
+      (local.get $arg0) (i32.const 1)
+      (call $ctrl_find_by_id (local.get $arg0) (i32.const 1)))
+    (local.set $handled (i32.const 1))
+    (local.get $handled)
   )
 
   ;; 128: IsIconic(hwnd) → BOOL — is the window minimized?
@@ -2166,7 +2245,7 @@
 
   ;; 134: GetSysColorBrush(nIndex) — 1 arg stdcall
   (func $handle_GetSysColorBrush (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (i32.store offset=0 (global.get $reg_base) (call $gdi_native_create_solid_brush (call $win98_sys_color (local.get $arg0))))
+    (i32.store offset=0 (global.get $reg_base) (call $gdi_system_brush (local.get $arg0)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
   )
 
@@ -2287,6 +2366,10 @@
       (else
         (call $wnd_set_parent (local.get $hwnd) (i32.const 0))
         (call $wnd_set_owner (local.get $hwnd) (local.get $arg2))))
+    ;; Seal this invocation before any guest callback. Class/owner/DWL_DLGPROC
+    ;; alone also exist on ordinary and modeless windows and confer no trust.
+    (call $native_dialogbox_begin (local.get $hwnd) (local.get $arg3)
+      (call $gl32 (i32.load offset=16 (global.get $reg_base))))
     (local.set $tmpl_visible
       (i32.and (call $wnd_get_style (local.get $hwnd)) (i32.const 0x10000000)))
     (drop (call $wnd_set_style (local.get $hwnd)
@@ -2560,7 +2643,9 @@
   ;; DrawEdge(hdc, qrc, edge, grfFlags) — 4 args stdcall
   (func $handle_DrawEdge (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $rc i32) (local $desc i32)
-    (local.set $rc (call $g2w (local.get $arg1)))
+    ;; The helper reads and optionally adjusts one packed RECT. Adjacent guest
+    ;; pages can have separate backing, including a split inside an i32 field.
+    (local.set $rc (call $guest_span_in (local.get $arg1) (size-of Rect)))
     (local.set $desc (global.get $GDI_LINE_DESC))
     (if (call $gdi_surface_descriptor (local.get $arg0) (local.get $desc))
       (then (i32.store offset=0 (global.get $reg_base) (call $gdi_draw_edge_desc
@@ -2569,6 +2654,9 @@
         (load.field.memarg Rect right (local.get $rc)) (load.field.memarg Rect bottom (local.get $rc))
         (local.get $arg2) (local.get $arg3) (local.get $rc))))
       (else (i32.store offset=0 (global.get $reg_base) (i32.const 0))))
+    (if (i32.and (local.get $arg3) (i32.const 0x2000))
+      (then (call $guest_span_writeback (local.get $arg1) (local.get $rc) (size-of Rect)))
+      (else (call $guest_span_release (local.get $rc) (size-of Rect))))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 20)))
   )
 

@@ -8,6 +8,18 @@ Turn on **FPS graph** in the `?debug` toolbar (or load `?debug&perf` to start it
 
 `throttled%` is the share of steps where the worker budget (`maxWallMs` in `host.js`) expired with work still pending. **A high number is not automatically the bug** — measured on Blobby: 100% throttled, but quadrupling the budget *lowered* guest fps from 29 to 17 and produced 240 long tasks. It means the game loop always has work, not that the scheduler is starving it. The ceiling there is interpreter throughput, so look at what costs instructions, not at the budget.
 
+### Null OpenGL diagnostic
+
+Load `?debug&perf&gl-gps=null` before launching an OpenGL game: the GPU stream
+null executor validates every ring record and draws nothing. Guest CPU
+execution, WAT transform/lighting and the producer's lowering stay; the
+executor's rasterization and presentation go. Completed swaps still count in
+`PRESENT/s`, but no new GL image appears; GDI menus may remain visible.
+Compare against the same build, scene, resolution, thread mode and window
+with the default (`gl-gps` unset). Exclude loading and verify gameplay
+independently of the blank image; the difference is executor CPU work and
+presentation, not a GPU timing measurement.
+
 ### Streaming a real session
 
 `?debug&perf&perf-stream` posts batched samples to `tools/dev-server.js`, which prints one line per second and can append NDJSON. Use it when someone reports jank *they* experienced — a scripted run is a different session on a different machine load:
@@ -86,4 +98,3 @@ It does not mean caching is disabled. `cdnCache: HIT` describes the CDN response
 not a browser cache hit; headers themselves can also come from cached responses.
 The logged Content-Length is response size, not proof of network bytes transferred.
 Normal mode emits no asset-cache diagnostics.
-

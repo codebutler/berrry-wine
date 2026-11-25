@@ -3,6 +3,24 @@
   "sourceSha256": "7cefbcd40b4caa130960a85f8553575b3c97249e74257fac1d632f27934d6de0",
   "note": "Named ordinal assignments are emulator ABI, not Windows version-specific ordinals. 1..127 reserved for documented legacy ordinal ABI. Named surface intersects Wine ownership with existing native handlers, excluding direct fail-fast handlers.",
   "exports": [
+    { "name": "FT_Prolog", "api": "FT_Prolog", "ordinal": 598 },
+    { "name": "FT_Thunk", "api": "FT_Thunk", "ordinal": 599 },
+    { "name": "FT_Exit0", "api": "FT_Exit0", "ordinal": 600 },
+    { "name": "FT_Exit4", "api": "FT_Exit4", "ordinal": 601 },
+    { "name": "FT_Exit8", "api": "FT_Exit8", "ordinal": 602 },
+    { "name": "FT_Exit12", "api": "FT_Exit12", "ordinal": 603 },
+    { "name": "FT_Exit16", "api": "FT_Exit16", "ordinal": 604 },
+    { "name": "FT_Exit20", "api": "FT_Exit20", "ordinal": 605 },
+    { "name": "FT_Exit24", "api": "FT_Exit24", "ordinal": 606 },
+    { "name": "FT_Exit28", "api": "FT_Exit28", "ordinal": 607 },
+    { "name": "FT_Exit32", "api": "FT_Exit32", "ordinal": 608 },
+    { "name": "FT_Exit36", "api": "FT_Exit36", "ordinal": 609 },
+    { "name": "FT_Exit40", "api": "FT_Exit40", "ordinal": 610 },
+    { "name": "FT_Exit44", "api": "FT_Exit44", "ordinal": 611 },
+    { "name": "FT_Exit48", "api": "FT_Exit48", "ordinal": 612 },
+    { "name": "FT_Exit52", "api": "FT_Exit52", "ordinal": 613 },
+    { "name": "FT_Exit56", "api": "FT_Exit56", "ordinal": 614 },
+
     { "api": "LoadLibrary16", "ordinal": 35 },
     { "api": "FreeLibrary16", "ordinal": 36 },
     { "api": "GetProcAddress16", "ordinal": 37 },
@@ -2308,6 +2326,21 @@
       "name": null,
       "api": "KERNEL32_Ordinal99",
       "ordinal": 99
-    }
+    },
+    {"name": "MapLS", "api": "MapLS", "ordinal": 615},
+    {"name": "UnMapLS", "api": "UnMapLS", "ordinal": 616},
+    {"name": "MapSL", "api": "MapSL", "ordinal": 617},
+    {"name": "SMapLS", "api": "SMapLS", "ordinal": 618},
+    {"name": "SUnMapLS", "api": "SUnMapLS", "ordinal": 619},
+    {"name": "SMapLS_IP_EBP_8", "api": "SMapLS_IP_EBP_8", "ordinal": 620},
+    {"name": "SUnMapLS_IP_EBP_8", "api": "SUnMapLS_IP_EBP_8", "ordinal": 621},
+    {"name": "SMapLS_IP_EBP_12", "api": "SMapLS_IP_EBP_12", "ordinal": 622},
+    {"name": "SUnMapLS_IP_EBP_12", "api": "SUnMapLS_IP_EBP_12", "ordinal": 623},
+    {"name": "SMapLS_IP_EBP_16", "api": "SMapLS_IP_EBP_16", "ordinal": 624},
+    {"name": "SUnMapLS_IP_EBP_16", "api": "SUnMapLS_IP_EBP_16", "ordinal": 625},
+    {"name": "SMapLS_IP_EBP_20", "api": "SMapLS_IP_EBP_20", "ordinal": 626},
+    {"name": "SUnMapLS_IP_EBP_20", "api": "SUnMapLS_IP_EBP_20", "ordinal": 627},
+    {"name": "SMapLS_IP_EBP_24", "api": "SMapLS_IP_EBP_24", "ordinal": 628},
+    {"name": "SUnMapLS_IP_EBP_24", "api": "SUnMapLS_IP_EBP_24", "ordinal": 629}
   ]
 }

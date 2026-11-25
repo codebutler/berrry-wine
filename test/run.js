@@ -1,16 +1,89 @@
 const fs = require('fs');
 const path = require('path');
+// Parse args (need these before autoBuild)
+const args = process.argv.slice(2);
+// WINE_RUN_EXTRA_ARGS='--lazy-ranges=5 ...': appended to every run.js command
+// line, so an existing gameplay test that spawns run.js becomes, unedited, the
+// same route under an extra flag (the lazy-loading audit runs each one this
+// way). Whitespace-separated; a flag given twice resolves as getArg reads it.
+if (process.env.WINE_RUN_EXTRA_ARGS) {
+  const extra = process.env.WINE_RUN_EXTRA_ARGS.split(/\s+/).filter(Boolean);
+  args.push(...extra);
+  process.argv.push(...extra);
+  console.error(`[run] WINE_RUN_EXTRA_ARGS: ${extra.join(' ')}`);
+}
+// --tee=PATH: also write everything this process prints (stdout and stderr)
+// to PATH. With WINE_RUN_EXTRA_ARGS it keeps the log of a run a test spawned
+// and only parsed, e.g. for tools/io-range-census.js over its --trace-fs.
+{
+  const tee = args.find(value => value.startsWith('--tee='));
+  if (tee) {
+    const fd = fs.openSync(tee.slice('--tee='.length), 'w');
+    for (const stream of [process.stdout, process.stderr]) {
+      const write = stream.write.bind(stream);
+      stream.write = (chunk, encoding, callback) => {
+        try { fs.writeSync(fd, typeof chunk === 'string' ? chunk : Buffer.from(chunk)); } catch (_) {}
+        return write(chunk, encoding, callback);
+      };
+    }
+  }
+}
+const getArg = (name, def) => {
+  const prefix = `--${name}=`;
+  const arg = args.find(value => value.startsWith(prefix));
+  return arg ? arg.slice(prefix.length) : def;
+};
+const getArgs = name => {
+  const prefix = `--${name}=`;
+  return args.filter(value => value.startsWith(prefix))
+    .flatMap(value => value.slice(prefix.length).split(','))
+    .map(value => value.trim()).filter(Boolean);
+};
+const hasFlag = name => args.includes(`--${name}`);
+// Was `--name=...` written at all? Distinct from getArg(), which cannot tell an
+// absent option from one that was given its default value.
+const argHas = name => args.some(a => a.startsWith(`--${name}=`));
+
+// This launch-local digest runs while host modules/imports are constructed.
+// It grants no adoption or input: restore joins it and verifies the real live
+// provider, source identity, tree and metadata before any PE initializer.
+const CHILD_STATE_TOKEN = getArg('child-state-token', '');
+const CHILD_READONLY_CONTEXT = getArg('child-readonly-context', '');
+const SPAWNED_CHILD = hasFlag('spawned-child');
+const CHILD_MEMORY = hasFlag('child-memory');
+const CHILD_TRANSPORT = getArg('child-transport', 'disk');
+if (!['disk', 'memory'].includes(CHILD_TRANSPORT)) throw new Error('unknown --child-transport');
+if (CHILD_MEMORY && (!SPAWNED_CHILD || !process.send || !CHILD_STATE_TOKEN ||
+    CHILD_READONLY_CONTEXT || argHas('vfs-tree') || argHas('save-vfs') || argHas('overlay-dir')))
+  throw new Error('memory handoff requires an exclusive native child IPC launch');
+const memoryChild = require('../lib/cli-memory-child');
+const memoryInput = CHILD_MEMORY ? memoryChild.receive(process, CHILD_STATE_TOKEN, 'launch') : null;
+let memoryLaunch = null, memoryBefore = null;
+let inheritedReadonly=null,readonlyPreparation=null;
+if (CHILD_READONLY_CONTEXT) {
+  if (!SPAWNED_CHILD || typeof process.send !== 'function' || !CHILD_STATE_TOKEN)
+    throw new Error('readonly media context requires a native child launch');
+  inheritedReadonly=JSON.parse(fs.readFileSync(CHILD_READONLY_CONTEXT,'utf8'));
+  if (inheritedReadonly.version!==1 || inheritedReadonly.token!==CHILD_STATE_TOKEN)
+    throw new Error('readonly media context launch identity mismatch');
+  readonlyPreparation=require('../lib/readonly-media-source-pin').prepareRestore(inheritedReadonly.contexts);
+}
+// Bootstrap the existing desktop transport concurrently with child imports.
+// Registration/hello, USER ownership and readiness stay at the constructor.
+const desktopPreparation = SPAWNED_CHILD ? require('../lib/process-desktop').prepareClient() : null;
+
 const { execSync } = require('child_process');
 const { withCliFailureCleanup } = require('../lib/cli-failure-cleanup');
 const { createHostImports } = require('../lib/host-imports');
 const frameIntervals = require('../lib/frame-intervals');
-const { createRenderWaitAttribution } = require('../lib/render-wait-attribution');
-const { loadDlls, callDllMain, detectRequiredDlls, shouldReportNtForDlls, loadWin16Dlls } = require('../lib/dll-loader');
+const {serviceMainTimingWait} = require('./main-timing-waits');
+const {serviceMainIoWait} = require('../lib/main-io-wait');
+const { callDllMain, detectRequiredDlls, shouldReportNtForDlls, loadWin16Dlls } = require('../lib/dll-loader');
 const { inputEventHwnd } = require('../lib/host-window');
 const { SYSTEM_DATA_FILES, STOCK_ICON_FILES, resolveDllGraph, mountLoadedDllFiles, mountSystemDataFiles,
-  applyStartupShow, startupShowArgs,
-  stageAndLoadPe, applyVirtualAllocTop, setExeName, setExeDrive, setExtraCmdline,
-  setEnvironmentVariable, handleLoadLibraryYield, serviceLoadLibraryYieldSync,
+  startupShowCommand, startupShowArgs,
+  stageAndLoadPeOwned, configureExeOwned, exeDriveForPath,
+  setEnvironmentVariableOwned, handleLoadLibraryYield, serviceLoadLibraryYieldSync,
   handleComDllYield, findVfsDllBytes } = require('../lib/process-boot');
 const {
   applyExeCompatibilityPatches: applyProfilePatches,
@@ -116,50 +189,6 @@ async function decodeMountedImage(hostPath) {
     0, 0, source.width, source.height).data);
   return { width: source.width, height: source.height, rgba };
 }
-// Parse args (need these before autoBuild)
-const args = process.argv.slice(2);
-// WINE_RUN_EXTRA_ARGS='--lazy-ranges=5 ...': appended to every run.js command
-// line, so an existing gameplay test that spawns run.js becomes, unedited, the
-// same route under an extra flag (the lazy-loading audit runs each one this
-// way). Whitespace-separated; a flag given twice resolves as getArg reads it.
-if (process.env.WINE_RUN_EXTRA_ARGS) {
-  const extra = process.env.WINE_RUN_EXTRA_ARGS.split(/\s+/).filter(Boolean);
-  args.push(...extra);
-  process.argv.push(...extra);
-  console.error(`[run] WINE_RUN_EXTRA_ARGS: ${extra.join(' ')}`);
-}
-// --tee=PATH: also write everything this process prints (stdout and stderr)
-// to PATH. With WINE_RUN_EXTRA_ARGS it keeps the log of a run a test spawned
-// and only parsed, e.g. for tools/io-range-census.js over its --trace-fs.
-{
-  const tee = args.find(value => value.startsWith('--tee='));
-  if (tee) {
-    const fd = fs.openSync(tee.slice('--tee='.length), 'w');
-    for (const stream of [process.stdout, process.stderr]) {
-      const write = stream.write.bind(stream);
-      stream.write = (chunk, encoding, callback) => {
-        try { fs.writeSync(fd, typeof chunk === 'string' ? chunk : Buffer.from(chunk)); } catch (_) {}
-        return write(chunk, encoding, callback);
-      };
-    }
-  }
-}
-const getArg = (name, def) => {
-  const prefix = `--${name}=`;
-  const arg = args.find(value => value.startsWith(prefix));
-  return arg ? arg.slice(prefix.length) : def;
-};
-const getArgs = name => {
-  const prefix = `--${name}=`;
-  return args.filter(value => value.startsWith(prefix))
-    .flatMap(value => value.slice(prefix.length).split(','))
-    .map(value => value.trim()).filter(Boolean);
-};
-const hasFlag = name => args.includes(`--${name}`);
-// Was `--name=...` written at all? Distinct from getArg(), which cannot tell an
-// absent option from one that was given its default value.
-const argHas = name => args.some(a => a.startsWith(`--${name}=`));
-
 // WINE_ASSEMBLY_WASM=PATH pins one prebuilt artifact for this process and every
 // test that spawns it. Several tests already read that variable and forward it
 // as `--no-build --wasm=`; reading it here means a test that only passes
@@ -169,37 +198,85 @@ const argHas = name => args.some(a => a.startsWith(`--${name}=`));
 const ENV_WASM = process.env.WINE_ASSEMBLY_WASM || '';
 const NO_BUILD = hasFlag('no-build') || !!ENV_WASM; // --no-build: skip auto-build
 const NO_CLOSE = hasFlag('no-close');      // --no-close: don't inject WM_CLOSE
+const recordNativeExit = require('../lib/cli-native-scene').createNativeExitRecorder(
+  getArg('native-exit-receipt',null),getArg('native-invocation-token',null));
+let childObservation = null;
+const CLI_NATIVE_OBSERVATION = hasFlag('cli-native-observation');
+if (CLI_NATIVE_OBSERVATION) require('../lib/cli-observation-lease').validateObservationArgs(args);
 const NO_RENDERER = hasFlag('no-renderer'); // --no-renderer: skip CLI canvas/renderer (guest-state diagnostics)
 // Experimental programmable D3D9 software path; no DOM or GL provider needed.
 // Keep capability opt-in separate: the implementation is not a full SM profile.
 const D3D9_RENDERER = getArg('d3d9-renderer', null);
 const D3D9_PROGRAMMABLE = hasFlag('d3d9-programmable');
-// --gl-renderer=software: draw OpenGL in WAT (src/09a8g-gl-raster.wat) into a
-// DirectDraw surface. Needs no --headless-gl and no native deps, so it is the
-// only way a GL app gets a context on a box without a display; --png captures
-// the surface like any DX primary. The browser twin is ?gl-renderer=software.
-const GL_RENDERER = getArg('gl-renderer', null);
+// OpenGL is drawn in WAT (src/09a8g-gl-raster.wat) and lowered onto GPU
+// stream v2 (src/09a8gt-gl-gps.wat): the default, and the browser's. It needs
+// no --headless-gl and no native deps, so a GL app gets a context on any box;
+// --png captures the presented frame. WAT owns the WGL contexts
+// (src/09a8cw-gl-wgl.wat); the JS FixedFunctionGL path (--gl-renderer=webgl)
+// is retired.
+const GL_RENDERER = getArg('gl-renderer', 'software');
 const GLIDE_RENDERER = getArg('glide-renderer', 'webgl');
-if (!['software', 'webgl'].includes(GLIDE_RENDERER))
-  throw new Error('--glide-renderer must be software or webgl');
-if (GL_RENDERER !== null && GL_RENDERER !== 'software' && GL_RENDERER !== 'webgl') {
-  throw new Error('--gl-renderer must be software or webgl');
+// null: the GPU stream null executor (validates records, draws nothing).
+if (!['software', 'webgl', 'null'].includes(GLIDE_RENDERER))
+  throw new Error('--glide-renderer must be software, webgl or null');
+// --gpu-stream-dump=FILE: the host bridge tees every GPU stream v2 record
+// (with its arena inputs) into a lib/gpu-stream.js DumpWriter at FILE, for
+// tools/gpu-stream.js list|stats|replay.
+const GPU_STREAM_DUMP = getArg('gpu-stream-dump', null);
+// --gps-tex-diag: count the Glide/D3DIM texture caches' evictions, causes
+// and content repeats (gps_stat 16..31, src/09a8gs-gpu-stream.wat). Hashes
+// every decoded texture, so it costs CPU; the [gps] line prints them.
+const GPS_TEX_DIAG = args.includes('--gps-tex-diag');
+if (GL_RENDERER !== 'software') {
+  throw new Error('--gl-renderer must be software (the JS webgl renderer is retired; --headless-gl puts GL on the WebGL executor)');
 }
 // --d3d-worker: rasterize D3DIM (DX2-7) draws on a render worker_thread over
 // the shared memory, the CLI twin of the browser's render Worker. The guest's
 // main instance can Atomics.wait here, so no --threads is needed.
 const D3D_WORKER = hasFlag('d3d-worker');
-// --d3dim-gpu: rasterize D3DIM (DX2-7) triangles on WebGL instead of the
-// software rasterizer. Needs --headless-gl for a context; WAT still does all
-// transform and lighting (lib/d3dim-gpu.js).
-const D3DIM_GPU = hasFlag('d3dim-gpu');
-if (D3DIM_GPU && D3D_WORKER) { console.error('--d3dim-gpu and --d3d-worker are exclusive'); process.exit(2); }
-if (D3DIM_GPU && !hasFlag('headless-gl')) { console.error('--d3dim-gpu needs --headless-gl'); process.exit(2); }
+// D3DIM (DX2-7) is always GPU stream v2: the WAT producer
+// (src/09abg-d3dim-gps.wat) lowers draws, clears and presents into the ring
+// and lib/gpu-stream-host.js executes it -- on WebGL with --headless-gl,
+// else on the software executor. --d3dim-renderer=webgl|software|null picks
+// one explicitly. --d3dim-gpu is accepted and does nothing (it was the
+// opt-in when D3DIM also had a software rasterizer of its own).
+const D3DIM_RENDERER = getArg('d3dim-renderer', null);
+if (D3DIM_RENDERER !== null && !['webgl', 'software', 'null'].includes(D3DIM_RENDERER)) {
+  console.error('--d3dim-renderer must be webgl, software or null'); process.exit(2);
+}
+// Software GL (--gl-renderer=software) on GPU stream v2: the WAT producer
+// (src/09a8gt-gl-gps.wat) lowers its screen-space triangles, clears and
+// swaps into a ring an executor drains. On by default: the WebGL executor
+// with --headless-gl, the software executor (lib/gpu-stream-software.js)
+// without one. --gl-gps (bare) forces the software executor,
+// --gl-gps=webgl|software|null picks one. There is no switch back to the
+// DIB path: executor selection is the only choice.
+const GL_GPS_ARG = getArg('gl-gps', null);
+if (GL_GPS_ARG !== null && !['software', 'webgl', 'null'].includes(GL_GPS_ARG))
+  throw new Error('--gl-gps must be software, webgl or null');
+const GL_GPS = true;
+const GL_GPS_BACKEND = GL_GPS_ARG !== null ? GL_GPS_ARG
+  : hasFlag('gl-gps') || !hasFlag('headless-gl') ? 'software' : 'webgl';
+// --d3d9-gps=software|webgl|null|none: D3D9 / D3D8 run only on GPU stream v2
+// (src/09akg-d3d9-gps.wat, ring api 4); this names its executor. Default:
+// webgl with --headless-gl, else software when the app sets
+// `d3d9WithoutGpu: 'software'` in lib/apps.js, else none -- a host without
+// an executor, where CreateDevice fails with D3DERR_NOTAVAILABLE and most
+// games take their own no-3D path. --d3d9-renderer=software is an alias for
+// --d3d9-gps=software. The old JS D3D9 path is deleted, so --no-d3d9-gps
+// and --d3d9-gps=off are errors.
+const D3D9_GPS_ARG = getArg('d3d9-gps', null);
+if (hasFlag('no-d3d9-gps') || D3D9_GPS_ARG === 'off') {
+  throw new Error('--no-d3d9-gps / --d3d9-gps=off were removed: D3D9/D3D8 run only on GPU stream v2 ' +
+    '(the old JS D3D9 path is deleted); use --d3d9-gps=none for a host without an executor');
+}
+if (D3D9_GPS_ARG !== null && !['software', 'webgl', 'null', 'none'].includes(D3D9_GPS_ARG))
+  throw new Error('--d3d9-gps must be software, webgl, null or none');
 if (args.some(arg => arg === '--gl-encoder' || arg.startsWith('--gl-encoder='))) {
   throw new Error('--gl-encoder was removed; OpenGL encoding always runs in WAT');
 }
 if (D3D9_RENDERER !== null && D3D9_RENDERER !== 'software') {
-  throw new Error('CLI --d3d9-renderer currently supports software only; WebGL requires a browser/provider');
+  throw new Error('CLI --d3d9-renderer supports software only (an alias for --d3d9-gps=software)');
 }
 const NO_MMX = hasFlag('no-mmx');          // --no-mmx: report a 486DX from CPUID so guests take scalar paths
 const DUMP_GDI = getArg('dump-gdi', null); // --dump-gdi=DIR: dump GDI bitmaps as PNGs
@@ -308,6 +385,10 @@ const TRACE_API_FILTER = (TRACE_API_RAW && TRACE_API_RAW.includes('='))
 const TRACE_API_PAUSED = hasFlag('trace-api-paused');
 const TRACE_API_DEDUP = hasFlag('trace-api-dedup'); // --trace-api-dedup: collapse N consecutive identical lines into "(xN)"
 const TRACE_API_COUNTS = hasFlag('trace-api-counts'); // --trace-api-counts: print histogram of API call names at end
+// --api-thread-census: per-guest-thread census of graphics/sync API calls,
+// COM objects touched by several threads, multi-thread frames and Lock spans
+// (lib/api-thread-census.js). Honours --trace-from/--trace-to.
+const API_THREAD_CENSUS = hasFlag('api-thread-census');
 const TRACE_MOUSE_STATE = hasFlag('trace-mouse-state'); // --trace-mouse-state: log renderer mouse state changes seen by host imports
 const TRACE_INPUT_DISPATCH = hasFlag('trace-input-dispatch'); // bounded schedule/dequeue/route/DispatchMessage timing
 // --trace-stack[=N|=Name1,Name2|=Name:N,...]: walk EBP chain on matched API calls
@@ -428,73 +509,10 @@ const DX_SURFACES = hasFlag('dx-surfaces'); // --dx-surfaces: print the DX_OBJEC
 // real pixel format (565/555/1555/4444/8888) through the same WAT decoder both D3DIM backends sample with.
 const DUMP_DX_SURFACES = getArg('dump-dx-surfaces', null);
 const GL_CENSUS = hasFlag('gl-census'); // --gl-census: at exit, which GL entry points this run actually issued, and whether the WAT mirror stayed trusted
-// --trace-gl[=Name1,Name2]: one line per GL command as the backend receives it,
-// arguments as hex with a float reading beside any word that looks like one
-// (GL passes GLfloat and GLenum through the same stack slots), and for a
-// packed draw its vertex count and first vertex. Honours --trace-from/-to.
-const TRACE_GL_RAW = args.find(a => a === '--trace-gl' || a.startsWith('--trace-gl='));
-const TRACE_GL_VERTS = hasFlag('trace-gl-verts'); // with --trace-gl: print every vertex of each packed draw
-if (TRACE_GL_RAW) {
-  const GLCompatTrace = require('../lib/gl-compat');
-  const only = TRACE_GL_RAW.includes('=')
-    ? new Set(TRACE_GL_RAW.slice(TRACE_GL_RAW.indexOf('=') + 1).split(',').filter(Boolean)) : null;
-  const names = GLCompatTrace.OP_NAMES || GLCompatTrace.CALLS;
-  // Entry points whose arguments are all GLdouble, and how many.
-  const GL_DOUBLE_ARGS = { gluLookAt: 9, gluPerspective: 4, gluOrtho2D: 4, glOrtho: 6,
-    glFrustum: 6, glDepthRange: 2, glClearDepth: 1, glTranslated: 3, glScaled: 3, glRotated: 4 };
-  const word = (dv, off) => {
-    const u = dv.getUint32(off, true) >>> 0;
-    const f = dv.getFloat32(off, true);
-    const a = Math.abs(f);
-    const floaty = u > 0xFFFF && Number.isFinite(f) && a >= 1e-4 && a <= 1e6;
-    return floaty ? `0x${u.toString(16)}~${+f.toPrecision(5)}` : `0x${u.toString(16)}`;
-  };
-  GLCompatTrace.hooks.trace = (slot, opcode, aux, capture) => {
-    if (!traceWindowOpen()) return;
-    const name = names[slot] || `op${opcode}`;
-    if (only && !only.has(name)) return;
-    const parts = [];
-    const doubles = GL_DOUBLE_ARGS[name] || 0;
-    if (capture && capture.buffer && doubles && capture.stackBytes >= 4 + doubles * 8) {
-      // Every argument is a GLdouble: print them as numbers, all of them.
-      // Split into words and capped at ten, gluLookAt lost its up vector.
-      const dv = new DataView(capture.buffer, capture.stackOffset, capture.stackBytes);
-      for (let i = 0; i < doubles; i++) parts.push(`${+dv.getFloat64(4 + i * 8, true).toPrecision(6)}`);
-    } else if (capture && capture.buffer && capture.stackBytes >= 8) {
-      const dv = new DataView(capture.buffer, capture.stackOffset, capture.stackBytes);
-      for (let off = 4; off + 4 <= capture.stackBytes && parts.length < 10; off += 4) parts.push(word(dv, off));
-    }
-    let tail = '';
-    if (capture && capture.pointerOffset && capture.pointerLength) {
-      tail = ` ptr=${capture.pointerLength}B`;
-      if (capture.pointerLength % 76 === 0) {
-        const v = new Float32Array(capture.buffer, capture.pointerOffset, 19);
-        tail += ` verts=${capture.pointerLength / 76} v0=(${Array.from(v.slice(0, 3), x => +x.toPrecision(4))})`
-          + ` rgba=(${Array.from(v.slice(3, 7), x => +x.toPrecision(3))})`;
-        if (TRACE_GL_VERTS) {
-          // --trace-gl-verts: every vertex of the packed draw, object-space
-          // x,y,z and unit-0 u,v, for finding the one triangle that is wrong.
-          const all = new Float32Array(capture.buffer, capture.pointerOffset, capture.pointerLength / 4);
-          const rows = [];
-          for (let i = 0; i + 19 <= all.length; i += 19) {
-            rows.push(`  [gl]   v${i / 19} xyz=(${Array.from(all.slice(i, i + 3), x => +x.toPrecision(6))}) w=${+all[i + 14].toPrecision(4)}`
-              + ` uv=(${+all[i + 7].toPrecision(4)},${+all[i + 8].toPrecision(4)})`
-              + (all[i + 16] !== 1 ? ` q=${+all[i + 16].toPrecision(4)}` : ''));
-          }
-          tail += '\n' + rows.join('\n');
-        }
-      } else if (capture.pointerLength <= 64 && capture.pointerLength % 4 === 0) {
-        // A small array argument (glFogfv, glLightfv, glLoadMatrixf): its
-        // values, since the guest pointer is gone by the time anyone asks.
-        const dv = new DataView(capture.buffer, capture.pointerOffset, capture.pointerLength);
-        const vals = [];
-        for (let off = 0; off < capture.pointerLength; off += 4) vals.push(+dv.getFloat32(off, true).toPrecision(5));
-        tail += ` [${vals.join(', ')}]`;
-      }
-    }
-    console.log(`[gl] ${traceGateBatch >= 0 ? `b${traceGateBatch} ` : ''}${name}(${parts.join(', ')}) aux=0x${(aux >>> 0).toString(16)}${tail}`);
-  };
-}
+// --trace-gl hooked the JS GL replay, which is retired: WAT answers every GL
+// call in place (src/09a8cw-gl-wgl.wat). --trace-api=<gl names> traces them.
+if (args.some(a => a === '--trace-gl' || a.startsWith('--trace-gl=') || a === '--trace-gl-verts'))
+  throw new Error('--trace-gl is retired with the JS GL transport; use --trace-api=glBegin,glVertex3f,...');
 const TRACE_DX_RAW = hasFlag('trace-dx-raw'); // --trace-dx-raw: on each Execute, walk+hexdump the full instruction stream
 const TRACE_FS = hasFlag('trace-fs');     // --trace-fs: log filesystem CreateFile hits/misses
 const QUIET_FS = hasFlag('quiet-fs');     // --quiet-fs: omit ReadFile diagnostics implied by --trace-api; explicit --trace-fs wins
@@ -529,7 +547,6 @@ const REG_EXPORT = getArg('reg-export', '');
 // Private per-launch completion handshake for spawnVfsChild, independent of
 // guest/host exit codes and the earlier child-exit IPC notification.
 const CHILD_STATE_COMPLETION = getArg('child-state-completion', '');
-const CHILD_STATE_TOKEN = getArg('child-state-token', '');
 // --import-saves=FILE / --export-saves=FILE: the same state as a *save bundle*
 // (lib/save-bundle.js) — the app's persistFiles matches plus the registry/INI
 // store, in one zip. --reg-export carries only the second half, so a game whose
@@ -592,7 +609,6 @@ const PIPE_CHILD_ARGS = (getArg('pipe-child-args', '') || '').split(' ').filter(
 const SPAWN_PROCESSES_FLAG = hasFlag('spawn-processes');
 // --spawned-child: this process is such a child (set by the parent, not by
 // hand): report the guest's exit code to the parent over IPC.
-const SPAWNED_CHILD = hasFlag('spawned-child');
 // Child IPC also covers redirected-pipe children and externally forked callers.
 // Once a launch is attempted, pending children/siblings cannot be enumerated
 // by this process-local ThreadManager. Keep failure conservative until exit.
@@ -1079,7 +1095,8 @@ const ZIP_LAUNCH = (() => {
       fs.mkdirSync(path.dirname(out), { recursive: true });
       fs.writeFileSync(out, zipMount.extractSync(bytes, m.entry));
     }
-    return { exePath: path.join(dir, ...hit.rel.split('\\')), root: plan.root, zipPath, dir };
+    return { exePath: path.join(dir, ...hit.rel.split('\\')), root: plan.root, zipPath, dir,
+      guestPath: path.win32.join(plan.root, hit.rel) };
   }
   throw new Error(`--zip-exe=${ZIP_EXE} not found in ${ZIP_MOUNTS.join(', ')}`);
 })();
@@ -1291,8 +1308,14 @@ const EXE_GUEST_PATH = (() => {
   // D:\Setup.exe, not the host temp copy reported as C:\Setup.exe.
   // A registry app's exeGuestPath is the same thing for an installed tree
   // (lib/apps.js), and the browser honours it too.
+  // A --zip-exe launch is likewise the exe's place in the mounted archive, as
+  // the page's upload/import reports it. Without it the mounted-private-DLL
+  // admission (lib/cli-mounted-private-dll.js) has no directory to look in, and
+  // Unreal Tournament out of a ZIP bound Core/Engine/Window.dll to stubs and
+  // trapped on Core!?appPackage@@YAPBGXZ, the issue #30 trap the page had.
   const requested = getArg('exe-guest-path', null) || (ISO_LAUNCH
     ? path.win32.join(ISO_LAUNCH.guestDir, path.basename(ISO_LAUNCH.exePath))
+    : ZIP_LAUNCH && !getArg('exe', null) ? ZIP_LAUNCH.guestPath
     : (APP_ENTRY && !getArg('exe', null) && APP_ENTRY.exeGuestPath) || null);
   if (!requested) return null;
   const rooted = /^[a-z]:[\\/]/i.test(requested) ? requested : `c:\\${requested}`;
@@ -1469,6 +1492,7 @@ const RPC_CENSUS = hasFlag('rpc-census'); // --rpc-census: with --threads, per-t
 // instead of reporting.
 let workerThreadHost = null;
 let closeD3DRender = null;
+let d3dimExecutionOwner = null;
 // --wait-slices=N: worker slices per batch while the MAIN thread is parked in a
 // blocking wait a worker has to satisfy. Nothing else can run then, so this is
 // much larger than THREAD_SLICES; set it to THREAD_SLICES to turn the boost off.
@@ -1739,6 +1763,8 @@ function buildHandlerNameList() {
 
 async function main() {
   return withCliFailureCleanup(async onFailure => {
+  onFailure(()=>readonlyPreparation?.cancel());
+  onFailure(()=>desktopPreparation?.cancel());
   // Fail closed before compilation, PE loading or any VFS mutation.
   const verifiedAssetFiles = ASSET_ENTRY && ASSET_ENTRY.localManifestIntegrity
     ? getAssetFiles(ASSET_ENTRY) : null;
@@ -1780,7 +1806,20 @@ async function main() {
     const { layoutHash, appendSection } = require('../tools/region-layout-hash.js');
     wasmBytes = appendSection(Buffer.from(r.wasmBinary), layoutHash(r.regions.regions));
   }
-  const exeBytes = verifiedAssetFiles ? verifiedAssetFiles.verifiedMedia.exeBytes : readAssetBytes(EXE_PATH);
+  if (process.env.DISCIPLES2_MODULE_SHA256 &&
+      require('node:crypto').createHash('sha256').update(wasmBytes).digest('hex') !== process.env.DISCIPLES2_MODULE_SHA256) {
+    throw new Error('actual CLI module differs from sealed qualification');
+  }
+  if (CHILD_MEMORY) {
+    memoryLaunch = await memoryInput.promise;
+    if (memoryInput.error || memoryLaunch?.guestExe !== EXE_GUEST_PATH ||
+        !(memoryLaunch.image instanceof Uint8Array) || memoryLaunch.cwd !== GUEST_CWD)
+      throw new Error('memory launch executable/cwd identity mismatch');
+    memoryChild.validate(memoryLaunch.snapshot);
+    inheritedReadonly = { contexts: memoryLaunch.snapshot.readonly };
+  }
+  const exeBytes = CHILD_MEMORY ? memoryLaunch.image :
+    verifiedAssetFiles ? verifiedAssetFiles.verifiedMedia.exeBytes : readAssetBytes(EXE_PATH);
 
   // Where a DLL the guest asks for at run time comes from: what the app mounted
   // in the VFS first, then the directories this process can see. The browser
@@ -1789,6 +1828,11 @@ async function main() {
   // plugin sitting in the VFS was "not found" for CoCreateInstance and present
   // for LoadLibrary.
   const findRuntimeDllBytes = (fileName, fullName) => {
+    const installed = require('../lib/installed-dll-closure').findInstalledDll(
+      ctx.vfs, fullName || fileName, EXE_PROCESS_GUEST_PATH);
+    if (installed) return installed.bytes;
+    // Explicit guest paths cannot resolve to unrelated same-basename files.
+    if (/[\\/:]/.test(fullName || '')) return null;
     const fromVfs = findVfsDllBytes(ctx.vfs, fileName, fullName);
     if (fromVfs) return fromVfs;
     for (const dir of [
@@ -1829,6 +1873,7 @@ async function main() {
   });
   let stopped = false;
   let hostExitRequested = false;
+  let memoryGuestExitCode = null;
   // Batches actually executed. Not the same as MAX_BATCHES once --max-seconds
   // or an early exit ends the loop, and it is the throughput number a
   // fixed-duration benchmark is asking for.
@@ -1849,6 +1894,21 @@ async function main() {
   const apiTotal = () => (apiLogOff && instance && instance.exports.get_api_calls)
     ? apiCount + ((instance.exports.get_api_calls() >>> 0) - apiWatSeen) : apiCount;
   const apiCounts = TRACE_API_COUNTS ? new Map() : null;
+  const apiThreadCensus = API_THREAD_CENSUS
+    ? require('../lib/api-thread-census').createApiThreadCensus({ threadName }) : null;
+  const censusRecord = (exportsOf, fallbackTid, name) => {
+    if (!traceWindowOpen()) return;
+    const e = exportsOf;
+    const tid = e && e.get_current_thread_id ? e.get_current_thread_id() >>> 0 : fallbackTid;
+    let self = 0;
+    if (e && e.get_esp && name.includes('_')) {
+      try { self = new DataView(memory.buffer).getUint32(translateGuest((e.get_esp() + 4) >>> 0, e.get_image_base(), memory.buffer), true) >>> 0; } catch (_) { self = 0; }
+    }
+    const readArg = i => {
+      try { return new DataView(memory.buffer).getUint32(translateGuest((e.get_esp() + 4 + 4 * i) >>> 0, e.get_image_base(), memory.buffer), true); } catch (_) { return 0; }
+    };
+    apiThreadCensus.record(tid, name, traceGateBatch, self, e && e.get_esp ? readArg : null);
+  };
   let lastApiName = null;  // track last API name for return value correlation
   let lastApiEntry = null; // typed metadata for last API (for return formatting)
   let lastApiArgs = null;  // raw dword args captured at entry, used for out-param dump on return
@@ -2310,6 +2370,10 @@ async function main() {
         // parent dialog. Generic helper for simple modal prompt dialogs.
         scheduledInput.push({ batch, action: 'edit-ok',
           ctrlId: parseInt(parts[2]), text: parts.slice(3).join(':') });
+      } else if (kind === 'keytext') {
+        if (parts.length !== 4 || !/^\d+$/.test(parts[2]) || !/^\d+$/.test(parts[3]))
+          throw new Error('keytext needs explicit VK and printable character code');
+        scheduledInput.push({ batch, action: 'keydown', code: Number(parts[2]), charCode: Number(parts[3]) });
       } else if (kind === 'keypress' || kind === 'keydown' || kind === 'keyup' ||
                  kind === 'di-keydown' || kind === 'di-keyup') {
         scheduledInput.push({ batch, action: kind, code: parseInt(parts[2]) });
@@ -2774,26 +2838,23 @@ async function main() {
   const apiByName = new Map(apiTable.map(e => [e.name, e]));
   const ctx = {
     getMemory: () => ctx._memory ? ctx._memory.buffer : null,
-    // Without --headless-gl the WebGL backend has no context, CreateDevice fails
-    // with "D3D9 requires a GPU window", and most D3D8/9 games take their own
-    // no-3D path -- GeneRally's CLI gate depends on exactly that. An app with no
-    // such path (UT2003's listen server retries, spawning a 1 MB-allocating
-    // thread each time, until "Unable to allocate thread TLS vector") sets
-    // `d3d9WithoutGpu: 'software'` in lib/apps.js to get the software backend
-    // when no GPU is available. An explicit --d3d9-renderer always wins.
-    d3d9Backend: D3D9_RENDERER
-      || (!HEADLESS_GL && APP_ENTRY?.d3d9WithoutGpu === 'software' ? 'software' : 'webgl'),
-    glBackend: GL_RENDERER || 'webgl',
     glideBackend: GLIDE_RENDERER,
+    glGpsBackend: GL_GPS_BACKEND,
+    // D3DIM's GPU stream executor: WebGL under --headless-gl, else software.
+    d3dimBackend: D3DIM_RENDERER || (hasFlag('headless-gl') ? 'webgl' : 'software'),
+    // The D3D8/9 GPU stream executor. Without --headless-gl there is no WebGL
+    // context, so the host has no executor ('none'): CreateDevice fails and
+    // most D3D8/9 games take their own no-3D path -- GeneRally's CLI gate
+    // depends on exactly that. An app with no such path (UT2003's listen
+    // server retries, spawning a 1 MB-allocating thread each time, until
+    // "Unable to allocate thread TLS vector") sets `d3d9WithoutGpu:
+    // 'software'` in lib/apps.js to get the software executor instead. An
+    // explicit --d3d9-gps (or --d3d9-renderer=software) always wins.
+    d3d9GpsBackend: D3D9_GPS_ARG || D3D9_RENDERER
+      || (HEADLESS_GL ? 'webgl' : APP_ENTRY?.d3d9WithoutGpu === 'software' ? 'software' : 'none'),
+    glGps: GL_GPS,
+    gpuStreamDump: GPU_STREAM_DUMP,
     d3d9Programmable: D3D9_PROGRAMMABLE || APP_ENTRY?.d3d9Programmable === true,
-    createD3DRenderWorker: () => {
-      const {Worker} = require('worker_threads');
-      const {WorkerConsumer} = require('../lib/d3d-command-stream');
-      const sigs = JSON.parse(fs.readFileSync(path.join(ROOT,'lib','host-import-sigs.generated.json'),'utf8')).sigs;
-      return new WorkerConsumer(new Worker(path.join(ROOT,'lib','d3d-render-worker.js')),
-        {module:wasmModule,memory,sigs,imageBase:instance.exports.get_image_base() >>> 0,
-          reclaimHeap:head=>instance.exports.d3d_render_adopt_free_list(head)});
-    },
     renderer,
     // --headless-gl: give the OpenGL bridge a drawable factory so wglCreateContext
     // can succeed without a browser. Opt-in, because without it these guests take
@@ -2910,18 +2971,25 @@ async function main() {
   });
   ctx.offerWaveCallback = waveCallbackRouting.offer;
   const base = createHostImports(ctx);
-  closeD3DRender = () => {
-    ctx.closeGlide();
-    return ctx.closeD3DRender();
+  closeD3DRender = async () => {
+    try { await ctx.closeGlide(); }
+    finally {
+      try { await ctx.closeD3DIMGps(); }
+      finally { await d3dimExecutionOwner?.close(); }
+    }
   };
   if (ctx.vfs) {
     ctx.vfs.dirs.add('c:\\windows');
     ctx.vfs.dirs.add('c:\\windows\\system');
     ctx.vfs.dirs.add('c:\\windows\\fonts');
-    mountSystemDataFiles(ctx.vfs, [...SYSTEM_DATA_FILES, ...STOCK_ICON_FILES].map(file => ({
-      ...file,
-      bytes: new Uint8Array(fs.readFileSync(path.join(ROOT, file.url))),
-    })));
+    // Match the browser: a `localOnly` system file is never published and a
+    // fresh clone does not carry it, so its absence is not fatal (issue #31).
+    mountSystemDataFiles(ctx.vfs, [...SYSTEM_DATA_FILES, ...STOCK_ICON_FILES]
+      .filter(file => !file.localOnly || fs.existsSync(path.join(ROOT, file.url)))
+      .map(file => ({
+        ...file,
+        bytes: new Uint8Array(fs.readFileSync(path.join(ROOT, file.url))),
+      })));
     for (const name of BUNDLED_BITMAP_FONTS) {
       const bundledFon = path.join(ROOT, 'fonts', name);
       if (!fs.existsSync(bundledFon)) {
@@ -3026,9 +3094,33 @@ async function main() {
   };
   const h = base.host;
   const { ProcessDesktop } = require('../lib/process-desktop');
-  const processDesktop = new ProcessDesktop();
+  const processDesktop = new ProcessDesktop({ preparation: desktopPreparation });
   ctx.processDesktop = processDesktop;
   ctx.processId = processDesktop.processId;
+  // Guest Workers authenticate their own connection and execute their own
+  // callbacks. Never broker a Worker COM callback through this local CPU.
+  process.env.WINE_PROCESS_DESKTOP = JSON.stringify(processDesktop.endpoint);
+  process.env.WINE_COM_MODULE_SHA256 = require('node:crypto').createHash('sha256').update(wasmBytes).digest('hex');
+  childObservation = new (require('../lib/cli-child-observation').ChildObservation)({
+    moduleBytes:wasmBytes,runner:__filename,executable:EXE_PATH,executableBytes:exeBytes,
+    guestExe:EXE_PROCESS_GUEST_PATH || EXE_PATH,port:CONTROL ? CONTROL_PORT : null,
+    envelope:getArg('native-child-envelope',null),
+  });
+  const { ComInterfaceRuntime, comRuntimeSourcePin } = require('../lib/com-interface-runtime');
+  ctx.comInterfaces = new ComInterfaceRuntime({
+    getExports: () => ctx.exports, getMemory: () => memory.buffer, desktop: processDesktop,
+    getVfs: () => ctx.vfs,
+    modulePin: process.env.WINE_COM_MODULE_SHA256, sourcePin: comRuntimeSourcePin(),
+    information: (...args) => base.host.com_localserver_information(...args),
+    serviceYield: async ({ reason }) => {
+      const options = { exports: ctx.exports, memoryBuffer: memory.buffer,
+        exeBytes: new Uint8Array(exeBytes), resourceHost: ctx, log: console.log,
+        findDll: findRuntimeDllBytes, findDllSync: findRuntimeDllBytes, onDllCallbackGateWait };
+      if (reason === 3) { await handleComDllYield(options); return true; }
+      if (reason === 5 || reason === 18) { await handleLoadLibraryYield(options); return true; }
+      return false;
+    },
+  });
   onFailure(() => processDesktop.close());
   // --latency-stats: how long an injected event takes to reach pixels. The
   // blit is the moment GDI hands a dirty rect to the presentation surface,
@@ -3402,8 +3494,8 @@ async function main() {
   // one Heroes III run. The count survives in WAT ($api_calls, apiTotal()).
   // The list is every reader of an API name or exit below, plus --esp-audit,
   // which wraps a worker's log. --quiet-api-fast is now an alias of this.
-  const apiLogRequired = traceOn => !QUIET_API || traceOn ||
-    TRACE_API_COUNTS || TRACE_CRITICAL || TRACE_INPUT_DISPATCH || ESP_DELTA ||
+  const apiLogRequired = traceOn => !QUIET_API || traceOn || !!getArg('public-consumer-trace', '') ||
+    TRACE_API_COUNTS || API_THREAD_CENSUS || TRACE_CRITICAL || TRACE_INPUT_DISPATCH || ESP_DELTA ||
     ESP_AUDIT || breakApis.length || hasFlag('observe-morrowind-name') ||
     // Memory dumps accompany a paused API trace; they must not force its
     // dispatch logger on before the explicit trace-api control command.
@@ -3435,6 +3527,7 @@ async function main() {
     if (morrowindNameObserver) morrowindNameObserver.apiEnter(t);
     apiCount++;
     if (apiCounts) apiCounts.set(t, (apiCounts.get(t) || 0) + 1);
+    if (apiThreadCensus) censusRecord(instance.exports, 1, t);
     if (TRACE_API) {
       // A filtered/new call must never inherit an earlier call's metadata.
       lastApiTraced = false;
@@ -4070,6 +4163,9 @@ async function main() {
 
   // --- Override exit to also log ---
   h.exit = code => {
+    memoryGuestExitCode = code >>> 0;
+    childObservation.exit(code);
+    recordNativeExit(code);
     processDesktop.retire();
     hostExitRequested = true;
     logs.push('[Exit] code=' + code); stopped = true;
@@ -4080,11 +4176,12 @@ async function main() {
     // A --spawn-processes child has no wire to keep: once its exit code is
     // on its way, drop the IPC channel, which otherwise keeps this process
     // alive after its shutdown work and the parent waiting on it forever.
-    else if (SPAWNED_CHILD && process.send) {
+    else if (SPAWNED_CHILD && process.send && !CHILD_MEMORY) {
       process.send({ t: 'child-exit', code: code >>> 0 }, () => {
         try { process.disconnect(); } catch (_) {}
       });
     }
+    else if (CHILD_MEMORY && process.connected) process.send({ t: 'child-exit', code: code >>> 0 });
   };
 
   // --- Override shell_about to log; the WAT side ($handle_ShellAboutA →
@@ -4173,8 +4270,13 @@ async function main() {
   // wire. This process becomes the hub of that wire. 0 = "cannot", and the
   // guest falls back to its old CreateProcess path.
   const pipeChildren = [];
+  const pipeChildClosures = [];
   const pipeChildByPid = new Map();
   const livePipeChildren = new Set();
+  onFailure(async () => {
+    for (const rec of livePipeChildren) { rec.terminationCode = 1; rec.child.kill(); }
+    await Promise.all(pipeChildClosures);
+  });
   // Browser aliases require a target-owned table; CLI IPC is unsupported.
   // E4 validity and lifetime are independent of every possible DWORD exit code.
   const processCtl = (op, pid, arg) => {
@@ -4199,9 +4301,10 @@ async function main() {
     if (op === 8) return rec.exited ? 0 : 0x102;
     if (op === 1 || op === 5) {
       if (rec.exited) return -5;
-      rec.exitCode = arg >>> 0;
-      rec.exited = true;
-      rec.child.kill();
+      // A signal request is not process completion. Keep STILL_ACTIVE and
+      // the wait unsignaled until the native child has closed both pipes.
+      if (!rec.child.kill()) return -5;
+      rec.terminationCode = arg >>> 0;
       return 1;
     }
     return -1;
@@ -4254,42 +4357,85 @@ async function main() {
     }
     if (!guestExe) {
       console.log(`[spawn] CreateProcess "${cmd}": ${name} is not in the VFS`);
+      if (CHILD_TRANSPORT === 'memory') throw new Error('memory child executable not found: ' + name);
       return 0;
     }
     const os = require('os');
     const storage = require('../lib/storage');
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-child-'));
+    const inMemory = CHILD_TRANSPORT === 'memory';
+    const tmp = inMemory ? null : fs.mkdtempSync(path.join(os.tmpdir(), 'wa-child-'));
+    const removeTemporary = () => { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); };
     try {
-      const inDir = path.join(tmp, 'in');
-      const outDir = path.join(tmp, 'out');
-      const regIn = path.join(tmp, 'reg-in.json');
-      const regOut = path.join(tmp, 'reg-out.json');
-      const completion = path.join(tmp, 'complete.json');
+      const inDir = tmp && path.join(tmp, 'in');
+      const outDir = tmp && path.join(tmp, 'out');
+      const regIn = tmp && path.join(tmp, 'reg-in.json');
+      const regOut = tmp && path.join(tmp, 'reg-out.json');
+      const completion = tmp && path.join(tmp, 'complete.json');
       const token = require('crypto').randomBytes(32).toString('hex');
-      const written = saveVfsToHost(vfs, inDir);
+      const snapshot = inMemory ? memoryChild.capture(vfs, storage) : null;
+      if (inMemory && (cmd.length > 383 || /[^\x01-\x7f]/.test(cmd) || parsed.params.trim().length > 200))
+        throw new Error('memory child command line exceeds supported ASCII startup bounds');
+      const memoryBase = snapshot && memoryChild.baseline(snapshot);
+      const memoryImage = inMemory ? Buffer.from(vfs.files.get(guestExe).data) : null;
+      // Borrowed disc bytes stay outside mutable state. Carry the actual
+      // source-owned mount plan, directory tree and drive identity separately.
+      let readonlyContextArgs = [];
+      if (!inMemory && (vfs.readOnlyDrives?.size || vfs.readonlyMediaContexts?.length)) {
+        let contexts;
+        try { contexts = require('../lib/readonly-media-context').capture(vfs); }
+        catch (error) {
+          console.log(`[spawn] CreateProcess "${cmd}": readonly media context refused: ${error.message}`);
+          removeTemporary();
+          return 0;
+        }
+        if (contexts.length) {
+          const contextPath = path.join(tmp, 'readonly-context.json');
+          fs.writeFileSync(contextPath, JSON.stringify({ version: 1, token, contexts }));
+          readonlyContextArgs = [`--child-readonly-context=${contextPath}`];
+        }
+      }
+      const written = inMemory ? [] : saveVfsToHost(vfs, inDir);
       const before = new Map(written.map(row => [String(row.guestPath).toLowerCase(), row.outputPath]));
-      const exeRow = written.find(row => String(row.guestPath).toLowerCase() === guestExe);
+      const exeRow = inMemory ? { outputPath: guestExe } :
+        require('../lib/cli-child-executable').childExecutable(vfs, guestExe, written, tmp);
       if (!exeRow) {
-        fs.rmSync(tmp, { recursive: true, force: true });
+        removeTemporary();
         console.log(`[spawn] CreateProcess "${cmd}": ${guestExe} could not be exported`);
         return 0;
       }
-      fs.writeFileSync(regIn, JSON.stringify(storage.exportStore()));
+      if (!inMemory) fs.writeFileSync(regIn, JSON.stringify(storage.exportStore()));
       // An app-local DLL loads as a real PE only when seeded (the app's `dlls`
       // or --dll-seed); the child has no app entry, so hand it the parent's.
       // Rollcage's setup relaunches its own exe as the front end, which then
       // imports QMIXER.DLL from beside it and crashed on the unresolved import.
       const childDllSeeds = [...((ASSET_ENTRY && ASSET_ENTRY.dlls) || []), ...DLL_SEED]
         .map(appAsset).filter(p => fs.existsSync(p))
-        .map(p => childDllSeedPath(p, written));
+        .map(p => inMemory ? (capturedGuestPath(p) || besideExeGuestPath(p, path.basename(p)) || p) : childDllSeedPath(p, written));
+      // VFS trees are mounted after DLL initializers. Forward only explicit
+      // files into the child's early mount pass, using the exported native
+      // state when present. Never replace guest writes with the original host
+      // input, resurrect a deleted file, or materialize unrelated lazy media.
+      const childMountArgs = inMemory ? [] : VFS_MOUNT.flatMap(spec => {
+        const eq = spec.lastIndexOf('=');
+        if (eq <= 0) throw new Error(`invalid explicit mount: ${spec}`);
+        const guest = spec.slice(eq + 1).trim();
+        const normalized = vfs._resolvePath(/^[a-z]:/i.test(guest) ? guest : 'c:\\' + guest.replace(/^\\+/, ''));
+        if (!vfs.files.has(normalized)) return [];
+        const row = written.find(row => String(row.guestPath).toLowerCase() === normalized);
+        return [`--vfs-mount=${row ? row.outputPath : appAsset(spec.slice(0, eq).trim())}=${guest}`];
+      });
       const args = [
-        `--exe=${exeRow.outputPath}`, `--vfs-tree=${inDir}`, `--exe-guest-path=${guestExe}`,
+        ...childMountArgs,
+        ...readonlyContextArgs,
+        `--exe=${exeRow.outputPath}`, `--exe-guest-path=${guestExe}`,
         `--cwd=${cwd}`, `--args=${parsed.params.trim()}`,
         '--no-build', `--wasm=${WASM_PATH}`, '--quiet-api', '--quiet-blocks',
         '--stuck-after=0', '--max-batches=1000000000', `--max-seconds=${MAX_SECONDS || 600}`,
         '--spawned-child', '--spawn-processes',
-        `--save-vfs=${outDir}`, `--reg-import=${regIn}`, `--reg-export=${regOut}`,
-        `--child-state-completion=${completion}`, `--child-state-token=${token}`,
+        ...(inMemory ? ['--child-memory', '--child-transport=memory'] :
+          [`--vfs-tree=${inDir}`, `--save-vfs=${outDir}`, `--reg-import=${regIn}`, `--reg-export=${regOut}`,
+            `--child-state-completion=${completion}`]),
+        `--child-state-token=${token}`,
         ...(childDllSeeds.length ? [`--dll-seed=${childDllSeeds.join(',')}`] : []),
         ...childCodePageArgs(),
         ...PIPE_CHILD_ARGS,
@@ -4297,12 +4443,54 @@ async function main() {
         // and on down the tree: instmsi's msiexec is a grandchild.
         ...(PIPE_CHILD_ARGS.length ? [`--pipe-child-args=${PIPE_CHILD_ARGS.join(' ')}`] : []),
       ];
+      const observation = childObservation.prepare(guestExe,exeRow.outputPath,{
+        processId:instance.exports.get_process_id()>>>0,threadId:instance.exports.get_current_thread_id()>>>0},memoryImage);
+      if (observation) {
+        // Observation options are parent-owned, never supplied via guest args
+        // or forwarded to unrelated grandchildren through pipe-child-args.
+        for(let i=args.length-1;i>=0;i--)if(args[i].startsWith('--native-child-envelope='))args.splice(i,1);
+        args.push('--native-child-envelope='+JSON.stringify(observation));
+      }
       const { fork } = require('child_process');
-      const child = fork(__filename, args, { stdio: ['ignore', 'pipe', 'pipe', 'ipc'], env: processDesktop.environment(ThreadManager.namedEventEnvironment()) });
+      const child = fork(__filename, args, { serialization: inMemory ? 'advanced' : 'json',
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'], env: processDesktop.environment(ThreadManager.namedEventEnvironment()) });
+      const memoryOutput = inMemory ? memoryChild.receive(child, token, 'completion', (MAX_SECONDS || 600) * 1000 + 60000) : null;
+      let memorySendError = null;
+      if (inMemory) {
+        memoryChild.send(child, token, 'launch', { snapshot, image: memoryImage, guestExe, cwd, command: cmd })
+          .catch(error => { memorySendError = error; child.kill(); });
+      }
       const pid = nextChildPid();
+      childObservation.forked(child,observation,pid);
       relayChild(child, `[child ${pid.toString(16)} ${path.win32.basename(guestExe)}]`);
       pipeChildren.push(child);
+      pipeChildClosures.push(new Promise(resolve => child.once('close', resolve)));
       const rec = { child, ready: false, exited: false, exitCode: 259 };
+      // Optional run observability records real OS-child waits, not a signal
+      // request or a guest ExitProcess message. It also covers grandchildren.
+      const waitDirectory = process.env.WINE_COM_PROTOCOL_DIR;
+      const childWait = { pid: child.pid, parent: process.pid, guestPid: pid, guestExe,
+        transport: CHILD_TRANSPORT, actualWait: false, stdoutEOF: false, stderrEOF: false, closed: false };
+      const saveChildWait = () => {
+        if (!waitDirectory) return;
+        try {
+          fs.mkdirSync(waitDirectory, { recursive: true });
+          // Readers sample these evolving exit/EOF/close receipts from another
+          // process. Never truncate the published version while replacing it.
+          const target = path.join(waitDirectory, `native-child-${process.pid}-${child.pid}-wait.json`);
+          const pending = target + '.' + process.pid + '.pending';
+          try {
+            const fd = fs.openSync(pending, 'wx', 0o600);
+            try { fs.writeFileSync(fd, JSON.stringify(childWait, null, 2) + '\n'); fs.fsyncSync(fd); }
+            finally { fs.closeSync(fd); }
+            fs.renameSync(pending, target);
+          } finally { if (fs.existsSync(pending)) fs.unlinkSync(pending); }
+        } catch (error) { console.error('[spawn] child wait evidence failed: ' + error.message); }
+      };
+      child.once('exit', (code, signal) => { Object.assign(childWait, { actualWait: true, exit: code, signal }); saveChildWait(); });
+      child.stdout.once('end', () => { childWait.stdoutEOF = true; saveChildWait(); });
+      child.stderr.once('end', () => { childWait.stderrEOF = true; saveChildWait(); });
+      saveChildWait();
       livePipeChildren.add(rec);
       pipeChildByPid.set(pid, rec);
       let guestCode = null;
@@ -4310,14 +4498,30 @@ async function main() {
         if (msg && msg.t === 'process-input-ready') rec.ready = true;
         if (msg && msg.t === 'child-exit') guestCode = msg.code >>> 0;
       });
-      child.on('exit', code => {
+      child.on('error', error => { memorySendError = error; console.log('[spawn] native child error: ' + error.message); });
+      child.on('close', code => {
         try {
-          mergeChildState(vfs, storage, before, outDir, regOut, completion, token);
+          if (inMemory) {
+            const error = memorySendError || memoryOutput.error;
+            const value = memoryOutput.value;
+            childWait.guardedMerge = error || !value || !value.normalExit ||
+                guestCode == null || value.exitCode !== guestCode || code !== 0 || rec.terminationCode != null || terminationSignal
+              ? { merged: false, reason: error?.message || 'no normal, complete memory child exit' }
+              : memoryChild.merge(vfs, storage, memoryBase, value.delta);
+            memoryOutput.dispose();
+            console.log('[spawn] memory child completion: ' + JSON.stringify(childWait.guardedMerge));
+            if (childWait.guardedMerge.partialApplied) {
+              terminationSignal = 'MEMORY_MERGE_ROLLBACK_FAILURE'; stopped = true; process.exitCode = 1;
+            }
+          } else childWait.guardedMerge = mergeChildState(vfs, storage, before, outDir, regOut, completion, token);
         } catch (e) {
+          childWait.guardedMerge = { merged: false, reason: String(e.message) };
           console.log(`[spawn] merging ${path.win32.basename(guestExe)}'s files back failed: ${e.message}`);
         }
-        fs.rmSync(tmp, { recursive: true, force: true });
-        if (!rec.exited) rec.exitCode = (guestCode != null ? guestCode : (code == null ? 1 : code)) >>> 0;
+        childWait.closed = true;saveChildWait();
+        removeTemporary();
+        rec.exitCode = (rec.terminationCode != null ? rec.terminationCode :
+          (guestCode != null ? guestCode : (code == null ? 1 : code))) >>> 0;
         rec.exited = true;
         livePipeChildren.delete(rec);
       });
@@ -4325,7 +4529,7 @@ async function main() {
       console.log(`[spawn] CreateProcess "${cmd}" -> ${guestExe} (pid ${pid.toString(16)}, cwd ${cwd})`);
       return pid;
     } catch (e) {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      removeTemporary();
       throw e;
     }
   };
@@ -4334,6 +4538,7 @@ async function main() {
     const cmd = cmdWa ? readStr(cmdWa) : '';
     if (!cmd) return 0;
     if (!count) return spawnVfsChild(cmd, dirWa ? readStr(dirWa) : '', !!forceSpawn, showCmd);
+    if (CHILD_TRANSPORT === 'memory') throw new Error('memory VFS handoff does not support redirected pipe children');
     if (!EXE_PATH) return 0;
     const { ParentHub } = require('../lib/vlan-wire');
     if (ctx.vlanWire && !(ctx.vlanWire instanceof ParentHub)) {
@@ -4395,20 +4600,20 @@ async function main() {
     }
     ctx.vlanWire.addChild(child, ip);
     pipeChildren.push(child);
+    pipeChildClosures.push(new Promise(resolve => child.once('close', resolve)));
     const pid = (0x4000 + pipeChildren.length * 4) & 0xFFFF;
     const rec = { child, exited: false, exitCode: 259 };
     livePipeChildren.add(rec);
     pipeChildByPid.set(pid, rec);
+    let guestCode = null;
     child.on('message', msg => {
-      if (msg && msg.t === 'child-exit' && !rec.exited) {
-        rec.exitCode = msg.code >>> 0;
-        rec.exited = true;
-      }
+      if (msg && msg.t === 'child-exit') guestCode = msg.code >>> 0;
     });
     // An emulator that ends without a guest ExitProcess (a crash, a
     // --max-seconds stop) still ends the child process: report it as exited.
-    child.on('exit', code => {
-      if (!rec.exited) rec.exitCode = (code == null ? 1 : code) >>> 0;
+    child.on('close', code => {
+      rec.exitCode = (rec.terminationCode != null ? rec.terminationCode :
+        (guestCode != null ? guestCode : (code == null ? 1 : code))) >>> 0;
       rec.exited = true;
       livePipeChildren.delete(rec);
     });
@@ -4440,7 +4645,16 @@ async function main() {
     const title = readStr(titlePtr);
     logs.push(`[CreateWindow] hwnd=0x${hwnd.toString(16)} title="${title}" style=0x${style.toString(16)} pos=${x},${y} size=${cx}x${cy} menu=${menuId}`);
     ctx.recordWindowText(hwnd, title);
-    if (renderer) renderer.createWindow(hwnd, style, x, y, cx, cy, title, menuId);
+    if (renderer) {
+      renderer.createWindow(hwnd, style, x, y, cx, cy, title, menuId);
+      // Keep the same native process publication as host-window.create_window.
+      // D3DIM admits frames only for their owning process and instance.
+      const win = renderer.windows[hwnd];
+      if (win) {
+        win.processId = ctx.processId;
+        win._lookupProcess = ctx.windowLookupLifetime;
+      }
+    }
     return hwnd;
   };
 
@@ -4610,6 +4824,10 @@ async function main() {
   // Resolve the reader at call time so the optional observer below sees the
   // same mapped return as GetTickCount/timeGetTime/QueryPerformanceCounter.
   h.get_ticks = () => guestClock.ticks();
+  if (getArg('public-consumer-trace', '')) {
+    require('./public-consumer-observer').observePublicConsumers(h, () => instance.exports,
+      () => memory.buffer, translateGuest, getArg('public-consumer-trace', ''));
+  }
   // Independent of --trace-input-dispatch; no initialization or hooks by default.
   const mainSchedulerObserver = hasFlag('trace-main-scheduler')
     ? require('./main-scheduler-observer').createMainSchedulerObserver({ logs, isOpen: traceWindowOpen }) : null;
@@ -4651,7 +4869,12 @@ async function main() {
   // of the release's own posted follow-ups. Paint's tool buttons PostMessage
   // their clicks to the toolbox, so the toolbox's release landed after the
   // canvas press and took its capture. Floor 0 alone was not enough.
-  if (renderer) renderer._buttonHoldFloorMs = -1;
+  if (renderer) {
+    renderer._buttonHoldFloorMs = -1;
+    // Preserve a distinct hover pump for coordinate presses even though the
+    // CLI script/controller owns button release timing.
+    renderer._coordinatePressHoverMs = 30;
+  }
   // --wall-clock-ms pins the calendar's ORIGIN; the calendar then advances
   // with GUEST time. Freezing it outright was deterministic but not a clock:
   // GetSystemTime returned one instant for the whole run, so anything that
@@ -4664,6 +4887,7 @@ async function main() {
 
   // --- Override input for test injection ---
   let lastInputEvent = null;
+  let guardedInput = null;
   h.check_input = () => {
     if (mainSchedulerObserver) mainSchedulerObserver.hostInput();
     let evt = null;
@@ -4678,7 +4902,11 @@ async function main() {
     } else if (inputQueue && inputQueue.length > 0) {
       source = 'button-queue';
       // Delay button clicks while on "Installing Files" page (let extraction thread work)
-      if (installingFiles) return 0;
+      if (installingFiles) {
+        lastInputEvent = null;
+        if (renderer) renderer._activeInputEvent = null;
+        return 0;
+      }
       const id = inputQueue.shift();
       if (typeof id === 'object') { evt = id; } // allow full event objects in queue
       // Button-id form: WM_COMMAND from a menu, hwnd=0 → WAT routes to main_hwnd.
@@ -4689,9 +4917,21 @@ async function main() {
       source = 'renderer';
       evt = renderer.checkInput();
     }
-    if (!evt) return 0;
+    if (!evt) {
+      lastInputEvent = null;
+      if (renderer) renderer._activeInputEvent = null;
+      return 0;
+    }
     lastInputEvent = evt;
+    if (renderer) renderer._activeInputEvent = evt;
     inputConsumptionTrace.dequeue(evt, source);
+    // Host dequeue only issues a candidate token. Exact successful native USER
+    // return must confirm that token before this intent can be consumed.
+    if (guardedInput?.dequeued(evt) === false) {
+      lastInputEvent = null;
+      if (renderer) renderer._activeInputEvent = null;
+      return 0;
+    }
     const packed = (evt.wParam << 16) | (evt.msg & 0xFFFF);
     logs.push(`[check_input] msg=0x${evt.msg.toString(16)} wParam=0x${evt.wParam.toString(16)} lParam=0x${(evt.lParam >>> 0).toString(16)} packed=0x${packed.toString(16)}`);
     return packed;
@@ -4713,8 +4953,21 @@ async function main() {
     inputConsumptionTrace.route(focusHwnd, hwnd);
     return hwnd;
   };
+  h.check_input_token = () => guardedInput?.token(lastInputEvent) || 0;
   h.check_input_lparam = () => (lastInputEvent ? (lastInputEvent.lParam || 0) : 0);
   h.check_input_wparam = () => (lastInputEvent ? (lastInputEvent.wParam || 0) : 0);
+  // Match the browser host contract: the broker restores both metadata and
+  // renderer pointer/button snapshots around a slot's follow-up reads.
+  Object.defineProperty(h, 'inputEventScope', {
+    enumerable: false,
+    value: {
+      save: () => [lastInputEvent, renderer ? renderer._activeInputEvent || null : null],
+      restore: saved => {
+        lastInputEvent = saved[0];
+        if (renderer) renderer._activeInputEvent = saved[1];
+      },
+    },
+  });
   let lastMouseTracePos = -1;
   let lastMouseTraceButtons = -1;
   const lastAsyncMouseTrace = Object.create(null);
@@ -4829,6 +5082,7 @@ async function main() {
   h.com_initialize_thread = (reserved, flags, tid) =>
     threadManager.initializeComApartment(reserved, flags, tid);
   h.com_uninitialize_thread = (tid) => threadManager.uninitializeComApartment(tid);
+  h.com_is_initialized = (tid) => threadManager.isComApartmentInitialized(tid);
   h.exit_thread = (exitCode) => threadManager.exitThread(exitCode);
   h.get_exit_code_thread = (handle) => threadManager.getExitCodeThread(handle);
   h.terminate_thread = (handle, exitCode) => threadManager.terminateThread(handle, exitCode);
@@ -5039,21 +5293,48 @@ async function main() {
   }
   // MORROWIND_NAME_IMPORT_END
   if (serviceClock) batchClock.wrapImports(imports.host);
-  const nativeInstance = await WebAssembly.instantiate(wasmModule, imports);
-  const instance = serviceClock ? batchClock.wrapInstance(nativeInstance) : nativeInstance;
+  const cliObservation = CLI_NATIVE_OBSERVATION ? new (require('../lib/cli-observation-lease').CliObservationLease)({
+    memory, module: wasmModule,
+    paused: () => !stopped && controlFrozen && controlRunCredits === 0 && !controlStepWaiter,
+    threads: () => threadManager,
+  }) : null;
+  if (cliObservation) cliObservation.wrapImports(imports);
+  const nativeInstance = cliObservation ? cliObservation.instantiate(wasmModule, imports)
+    : await WebAssembly.instantiate(wasmModule, imports);
+  const instance = cliObservation ? nativeInstance
+    : serviceClock ? batchClock.wrapInstance(nativeInstance) : nativeInstance;
+  // Keep slice execution behind its owner before migrating the remaining
+  // startup/inspection/yield exports. Do not select a Worker here until those
+  // paths also stop mutating the local instance's guest registers.
+  const localMainOwner = require('../lib/guest-main-owner').createGuestMainOwner({ localExports: instance.exports });
+  const mainOwner = hasFlag('d3dim-render-owner') ? Object.freeze({ ...localMainOwner,
+    async run(steps) {
+      const result = localMainOwner.run(steps);
+      await d3dimExecutionOwner.flush();
+      await d3dimExecutionOwner.turn();
+      return result;
+    },
+  }) : localMainOwner;
+  if (hasFlag('d3dim-render-owner')) {
+    if (ctx.d3dimBackend !== 'software' || ctx.gpuStreamDump || WORKER_THREADS)
+      throw new Error('--d3dim-render-owner requires cooperative guest scheduling and software rendering without a stream dump');
+    d3dimExecutionOwner = new (require('../lib/cli-execution-owner').CliExecutionOwner)(wasmModule, memory);
+    ctx.createD3dimNodeOwner = callbacks => d3dimExecutionOwner.create(callbacks);
+    instance.exports.d3dim_gps_draw_kicks_enable(1);
+  }
   ctx.exports = instance.exports;
-  instance.exports.set_hwnd_base(processDesktop.hwndBase);
+  await mainOwner.call('set_hwnd_base', processDesktop.hwndBase);
   // Quiet runs silence the per-call API log from the first instruction, DLL
   // initialization included. Applied only after DllMain ran, the early calls
   // were logged (and so counted twice, by h.log and by $api_calls) and a
   // --trace-api-paused run printed them before it was switched on.
-  if (apiLogOff && instance.exports.set_api_log) instance.exports.set_api_log(0);
+  if (apiLogOff) await mainOwner.optionalCall('set_api_log', 0);
   // Process ANSI code page (ANSI_CODE_PAGE above), applied before the PE
   // is staged below. The WAT setter validates the page; pages without
   // conversion tables keep the historical identity conversion, so this is
   // observable only for CP950 today.
-  if (ANSI_CODE_PAGE && instance.exports.set_ansi_code_page) {
-    instance.exports.set_ansi_code_page(ANSI_CODE_PAGE);
+  if (ANSI_CODE_PAGE && mainOwner.supports('set_ansi_code_page')) {
+    await mainOwner.call('set_ansi_code_page', ANSI_CODE_PAGE);
     console.log(`[run] ANSI code page: ${ANSI_CODE_PAGE}`);
   }
   // CreateProcess children run under the page this process actually has
@@ -5074,8 +5355,8 @@ async function main() {
         APP_ENTRY && APP_ENTRY.expandedWorkerCodeCache === true);
     const wantHeavy = hasFlag('worker-heavy-code-cache')
       || (!hasFlag('no-worker-heavy-code-cache') && APP_ENTRY && APP_ENTRY.workerHeavyCodeCache === true);
-    if ((wantExpanded || wantHeavy) && instance.exports.set_page_index_layout) {
-      instance.exports.set_page_index_layout(wantExpanded ? 2 : 1);
+    if ((wantExpanded || wantHeavy) && mainOwner.supports('set_page_index_layout')) {
+      await mainOwner.call('set_page_index_layout', wantExpanded ? 2 : 1);
       console.log(wantExpanded
         ? '[cache] expanded-worker page-index layout: main 512 slots, workers 32 (624KiB code)'
         : '[cache] worker-heavy page-index layout: main 256 slots, workers 32');
@@ -5100,19 +5381,24 @@ async function main() {
         };
         return adapter;
       },
-      guestToWasm: pointer => instance.exports.guest_to_wasm(pointer >>> 0) >>> 0,
       getImageBase: () => instance.exports.get_image_base() >>> 0,
     });
   }
-  if (D3DIM_GPU) {
-    const {D3DIMGpu} = require('../lib/d3dim-gpu');
-    ctx.d3dCommands = new D3DIMGpu({
-      getExports: () => instance.exports,
-      getMemory: () => memory.buffer,
-      createCanvas,
-    });
-    instance.exports.d3dim_gpu_enable(1);
-  }
+  if (GL_GPS) instance.exports.gl_gps_enable(1);
+  // D3D9/D3D8 presents so far (09akg stat 4), for --cpu-window.
+  const d3d9Frames = () => instance.exports.d3d9_gps_stat
+    ? instance.exports.d3d9_gps_stat(4) >>> 0 : 0;
+  // D3D9/D3D8 draws so far (stat 0): draws per present, for --cpu-window.
+  const d3d9Draws = () => instance.exports.d3d9_gps_stat
+    ? instance.exports.d3d9_gps_stat(0) >>> 0 : 0;
+  // Main-instance retired guest blocks, for --cpu-window: a batch can end
+  // early on a yield, so batches are not a unit of guest work; this is, and
+  // tools/page-probes/measure-guest-rate.js reads the same counter in a browser.
+  const guestBlocks = () => instance.exports.get_blocks_now
+    ? instance.exports.get_blocks_now() >>> 0 : 0;
+  // --d3dim-lazy-sync: lazy Lock sync, the browser default (?no-lazy-sync
+  // turns it off there); the WAT default and the CLI default are off.
+  if (hasFlag('d3dim-lazy-sync')) instance.exports.d3dim_lazy_enable(1);
   if (GUEST_PAGE_STATS) {
     if (!instance.exports.reset_guest_page_stats || !instance.exports.get_guest_page_stat) {
       throw new Error('--guest-page-stats requires the offline artifact from ' +
@@ -5227,7 +5513,10 @@ async function main() {
     process.on(sig, () => {
       if (signalExitStarted) return;
       signalExitStarted = true;
+      childObservation?.fail('host cancellation: '+sig);
+      recordNativeExit.cancel(sig);
       terminationSignal = sig;
+      for (const rec of livePipeChildren) { rec.terminationCode = 1; rec.child.kill(sig); }
       console.log(`[signal] ${sig} requested orderly shutdown`);
       // Leave through the normal cleanup path. In particular, a controlled
       // recording owns an ffmpeg child plus buffered audio; process.exit()
@@ -5238,33 +5527,37 @@ async function main() {
       if (signalExitWake) signalExitWake();
     });
   }
-  if (instance.exports.set_process_id) instance.exports.set_process_id(ctx.processId);
-  if (instance.exports.set_desktop_color_depth) instance.exports.set_desktop_color_depth(APP_ENTRY?.desktopColorDepth === 8 ? 8 : 32);
-  if (NO_MMX && instance.exports.set_cpu_mmx) instance.exports.set_cpu_mmx(0);
+  if (CHILD_MEMORY) process.once('disconnect', () => {
+    if (!signalExitStarted) { signalExitStarted = true; terminationSignal = 'IPC_EOF'; stopped = true;
+      for (const rec of livePipeChildren) { rec.terminationCode = 1; rec.child.kill(); }
+      if (signalExitWake) signalExitWake(); }
+  });
+  await mainOwner.optionalCall('set_process_id', ctx.processId);
+  await mainOwner.optionalCall('set_desktop_color_depth', APP_ENTRY?.desktopColorDepth === 8 ? 8 : 32);
+  if (NO_MMX) await mainOwner.optionalCall('set_cpu_mmx', 0);
   // timeSetEvent callbacks on a winmm timer guest thread (the Windows model)
   // instead of the main thread's message pump. Shared memory, so set once.
   // On by default, as in the browser; `--no-mm-timer-thread` or an app's
   // `mmTimerThread: false` keeps the old main-thread delivery.
-  if (!hasFlag('no-mm-timer-thread') && (hasFlag('mm-timer-thread') || APP_ENTRY?.mmTimerThread !== false) &&
-      instance.exports.set_mm_timer_thread_mode) {
-    instance.exports.set_mm_timer_thread_mode(1);
+  if (!hasFlag('no-mm-timer-thread') && (hasFlag('mm-timer-thread') || APP_ENTRY?.mmTimerThread !== false)) {
+    await mainOwner.optionalCall('set_mm_timer_thread_mode', 1);
   }
-  if ((hasFlag('sse') || APP_ENTRY?.cpuSSE === true) && instance.exports.set_cpu_sse) {
-    instance.exports.set_cpu_sse(1);
+  if (hasFlag('sse') || APP_ENTRY?.cpuSSE === true) {
+    await mainOwner.optionalCall('set_cpu_sse', 1);
   }
-  if (VLAN_IP && instance.exports.set_vlan_local_ip) {
+  if (VLAN_IP && mainOwner.supports('set_vlan_local_ip')) {
     const octets = VLAN_IP.split('.').map(Number);
     if (octets.length !== 4 || octets.some(o => !(o >= 0 && o <= 255))) {
       console.error(`--vlan-ip: not an IPv4 address: ${VLAN_IP}`);
       process.exit(2);
     }
-    instance.exports.set_vlan_local_ip(octets.reduce((a, o) => ((a << 8) | o) >>> 0, 0) | 0);
+    await mainOwner.call('set_vlan_local_ip', octets.reduce((a, o) => ((a << 8) | o) >>> 0, 0) | 0);
     if (TRACE_NET) console.log(`[net] room address ${VLAN_IP}`);
   }
   {
     const nagle = VLAN_NAGLE_ARG !== null ? (parseInt(VLAN_NAGLE_ARG, 10) || 0)
       : (Number.isFinite(APP_ENTRY?.vlanNagleMs) ? APP_ENTRY.vlanNagleMs : 0);
-    if (nagle > 0 && instance.exports.set_vlan_nagle_ms) instance.exports.set_vlan_nagle_ms(nagle | 0);
+    if (nagle > 0) await mainOwner.optionalCall('set_vlan_nagle_ms', nagle | 0);
   }
   if (PIPE_STD && instance.exports.pipe_attach_std) {
     const byPort = new Map();
@@ -5316,7 +5609,6 @@ async function main() {
     // audio device, the GDI handles — comes from one shared list, so the two
     // hosts cannot quietly disagree about what a thread inherits.
     const workerCtx = Object.assign(processSharedCtx(ctx), {
-      d3d9Bridge: ctx.d3d9Bridge,
       getMemory: () => memory.buffer,
       renderer,
       onExit: () => {},
@@ -5324,12 +5616,16 @@ async function main() {
       traceHost: traceHostNames,
       hostCensus: HOST_CENSUS,
       exports: workerExportsProxy,
+      createD3dimNodeOwner: ctx.createD3dimNodeOwner,
+      onD3dimRenderYield: ctx.createD3dimNodeOwner ? owner => d3dimExecutionOwner.parkThread(tid, owner) : undefined,
       offerWaveCallback: waveCallbackRouting.offer,
       _debugReadFile: TRACE_API && !QUIET_FS,
       ioTraceTag: ctx.ioTraceTag,
       sharedGdi: base.gdi,  // the live GDI table, not the copy in ctx
       g2w: (addr) => translateGuest(addr, instance.exports.get_image_base(), memory.buffer),
     });
+    Object.defineProperty(workerCtx, 'guardedInput', { get: () => guardedInput });
+    workerCtx.nativeInputActor = () => workerInstance?.exports;
     Object.defineProperty(workerCtx, 'waveCallbackOwner', {
       get: () => waveCallbackRouting.owner(workerInstance?.exports, tid, WORKER_THREADS),
     });
@@ -5359,9 +5655,14 @@ async function main() {
     // metadata latch as the main instance.
     wh.check_input = mainSchedulerObserver
       ? () => mainSchedulerObserver.workerInput(tid, h.check_input) : h.check_input;
+    wh.check_input_token = h.check_input_token;
     wh.check_input_lparam = h.check_input_lparam;
     wh.check_input_wparam = h.check_input_wparam;
     wh.check_input_hwnd = h.check_input_hwnd;
+    Object.defineProperty(wh, 'inputEventScope', {
+      enumerable: false,
+      value: h.inputEventScope,
+    });
     // Child processes belong to the process, not to the thread that started
     // them: Windows Installer runs its custom-action EXEs (msiexec /D, /Y)
     // from its engine thread, and waits on them from there.
@@ -5437,6 +5738,7 @@ async function main() {
       },
       onCall: (name) => {
         if (apiCounts) apiCounts.set(name, (apiCounts.get(name) || 0) + 1);
+        if (apiThreadCensus) censusRecord(workerExports(), (tid | 0) + 1, name);
       },
       resolveComName: (id) => {
         const entry = apiTable[id];
@@ -5533,7 +5835,7 @@ async function main() {
   if (WORKER_THREADS) {
     // Real parallelism: LOCK-prefixed instructions must be atomic across the
     // worker_threads (07-decoder.wat $try_emit_locked, handler 499).
-    if (instance.exports.set_lock_atomic_mode) instance.exports.set_lock_atomic_mode(1);
+    await mainOwner.optionalCall('set_lock_atomic_mode', 1);
     const { GuestThreadHost } = require('../lib/guest-thread-host');
     const sigs = JSON.parse(fs.readFileSync(
       path.join(ROOT, 'lib', 'host-import-sigs.generated.json'), 'utf8')).sigs;
@@ -5675,10 +5977,14 @@ async function main() {
   // and has to be propagated like every other one.
   if (NO_SPIN_PARK) inheritWasm('set_spin_park_k', 0);
   else if (Number.isFinite(SPIN_PARK_K)) inheritWasm('set_spin_park_k', SPIN_PARK_K);
+  if (d3dimExecutionOwner) inheritWasm('d3dim_gps_draw_kicks_enable', 1);
 
   threadManager = new ThreadManager(wasmModule, memory, instance, makeWorkerImports, {
     strictServiceTime: serviceClock,
-    instantiateCooperative: serviceClock ? (module, imports) =>
+    instantiateCooperative: cliObservation ? (module, imports) => {
+      cliObservation.wrapImports(imports);
+      return cliObservation.instantiate(module, imports);
+    } : serviceClock ? (module, imports) =>
       batchClock.wrapInstance(new WebAssembly.Instance(module, imports)) : undefined,
     hwndBase: () => processDesktop.hwndBase,
     threadSnapshotSystemComplete: () => !threadSnapshotSystemIncomplete,
@@ -5708,7 +6014,6 @@ async function main() {
     // read synchronously, so this mostly matters to tests that mount an
     // async provider to mimic the browser's File-backed ISO reads.
     getVfs: () => ctx.vfs || null,
-    onRenderWait: token => ctx.waitD3DRender(token),
     hasMessage: () => !!(
       inputEvent ||
       (crossThreadMsgs && crossThreadMsgs.length) ||
@@ -5728,6 +6033,7 @@ async function main() {
   // Waits on a child process's handle (src/09d7-pipes.wat) ask the host
   // that started it.
   threadManager.processCtl = (op, pid, arg) => (ctx.processCtl ? ctx.processCtl(op, pid, arg) : -1);
+  if (d3dimExecutionOwner) threadManager.isExternallyParked = tid => d3dimExecutionOwner.isParked(tid);
   ctx.closeSyncHandle = handle => threadManager.closeSyncHandle(handle);
 
   const mem = new Uint8Array(memory.buffer);
@@ -5735,14 +6041,21 @@ async function main() {
   // MSVCRT data imports (__argc/__argv) can be resolved while load_pe walks
   // the executable import table. Seed process identity first so a lazy argv
   // block built during import resolution sees the real launcher metadata.
-  setExeDrive(instance.exports, EXE_GUEST_PATH || MEDIA_EXE);
-  setExeName(instance.exports, memory.buffer, EXE_PROCESS_NAME);
-  if (EXTRA_ARGS) {
-    setExtraCmdline(instance.exports, memory.buffer, EXTRA_ARGS);
-  }
+  await configureExeOwned(mainOwner, memory.buffer, {name: EXE_PROCESS_NAME,
+    drive: exeDriveForPath(EXE_GUEST_PATH || MEDIA_EXE), args: EXTRA_ARGS});
 
-  applyStartupShow(instance.exports, getArg('startup-show', undefined));
-  const { entry } = stageAndLoadPe(instance.exports, memory.buffer, exeBytes, console.log);
+  const startupShow = startupShowCommand(getArg('startup-show', undefined));
+  if (startupShow !== undefined) await mainOwner.call('set_startup_show', startupShow);
+  const { entry } = await stageAndLoadPeOwned(mainOwner, memory.buffer, exeBytes, console.log);
+  if (CHILD_MEMORY) {
+    const command = memoryLaunch.command;
+    if (typeof command !== 'string' || command.length > 383 || /[^\x01-\x7f]/.test(command))
+      throw new Error('invalid raw memory child command line');
+    const {get_staging: at} = await mainOwner.read(['get_staging']);
+    const bytes = new TextEncoder().encode(command);
+    new Uint8Array(memory.buffer, at, bytes.length).set(bytes);
+    if (!await mainOwner.call('set_raw_command_line', at, bytes.length)) throw new Error('raw memory child command line refused');
+  }
   // MORROWIND_NAME_ATTACH_BEGIN: loaded image, before any guest initializer.
   if (hasFlag('observe-morrowind-name')) {
     morrowindNameObserver = require('../lib/morrowind-name-observer').install({
@@ -5764,11 +6077,10 @@ async function main() {
     });
   }
   // MORROWIND_NAME_ATTACH_END
-  applyVirtualAllocTop(instance.exports, VIRTUAL_ALLOC_TOP_ARG !== null
-    ? Number(VIRTUAL_ALLOC_TOP_ARG) : (APP_ENTRY && APP_ENTRY.virtualAllocTop));
-  if (CS_STEAL_AFTER && instance.exports.set_cs_steal_after) {
-    instance.exports.set_cs_steal_after(CS_STEAL_AFTER);
-  }
+  const virtualAllocTop = VIRTUAL_ALLOC_TOP_ARG !== null
+    ? Number(VIRTUAL_ALLOC_TOP_ARG) : (APP_ENTRY && APP_ENTRY.virtualAllocTop);
+  if (virtualAllocTop) await mainOwner.optionalCall('set_virtual_alloc_top', virtualAllocTop >>> 0);
+  if (CS_STEAL_AFTER) await mainOwner.optionalCall('set_cs_steal_after', CS_STEAL_AFTER);
   if (Number.isFinite(SPIN_WORK_MAX)) inheritWasm('set_spin_work_max', SPIN_WORK_MAX);
   if (Number.isFinite(SPIN_REGS_CHECK)) inheritWasm('set_spin_regs_check', SPIN_REGS_CHECK);
   applyExeCompatibilityPatches(path.basename(EXE_PATH), instance.exports, memory.buffer);
@@ -5801,9 +6113,7 @@ async function main() {
   const requiredDlls = detectRequiredDlls(exeBytes);
 
   // Initialize DirectX COM vtable thunks (must be after load_pe sets image_base)
-  if (instance.exports.init_dx_com_thunks) {
-    instance.exports.init_dx_com_thunks();
-  }
+  await mainOwner.optionalCall('init_dx_com_thunks');
 
   // Queue environment overrides before loading DLLs: a CRT's DllMain snapshots
   // GetEnvironmentStrings while it initializes. The WAT export keeps this
@@ -5812,7 +6122,7 @@ async function main() {
     (ASSET_ENTRY && ASSET_ENTRY.environment) || {}));
   for (const [name, value] of PROCESS_ENVIRONMENT) processEnvironment.set(name, value);
   for (const [name, value] of processEnvironment) {
-    if (!setEnvironmentVariable(instance.exports, memory.buffer, name, value)) {
+    if (!await setEnvironmentVariableOwned(mainOwner, memory.buffer, name, value)) {
       throw new Error(`failed to set guest process environment variable ${name}`);
     }
     console.log(`Guest environment: ${name}=${JSON.stringify(value)}`);
@@ -5823,87 +6133,16 @@ async function main() {
   }
 
   // Set emulated Windows version
-  if (WINVER && instance.exports.set_winver) {
+  if (WINVER && mainOwner.supports('set_winver')) {
     const versions = { 'win98': 0xC0000A04, 'nt4': 0x05650004, 'win2k': 0x05650005, 'winxp': 0x0A280105 };
     const v = versions[WINVER.toLowerCase()] || parseInt(WINVER);
-    if (v) { instance.exports.set_winver(v); console.log('Windows version: ' + hex(v)); }
-  } else if (shouldReportNtForDlls(requiredDlls) && instance.exports.set_winver) {
+    if (v) { await mainOwner.call('set_winver', v); console.log('Windows version: ' + hex(v)); }
+  } else if (shouldReportNtForDlls(requiredDlls) && mainOwner.supports('set_winver')) {
     const v = 0x05650004;
-    instance.exports.set_winver(v);
+    await mainOwner.call('set_winver', v);
     console.log('Windows version: ' + hex(v) + ' (auto NT for MFC42U)');
   }
 
-  // Load DLLs: explicit --dlls=path1,path2,... or auto-detect from EXE imports
-  const dllArg = getArg('dlls', null);
-  const dllDir = path.join(path.dirname(EXE_PATH), 'dlls');
-  let dlls;
-  if (dllArg) {
-    dlls = dllArg.split(',').map(p => ({
-      name: path.basename(p.trim()),
-      bytes: readAssetBytes(p.trim()),
-    }));
-  } else {
-    // Auto-detect: scan EXE imports, load any DLLs found in test/binaries/dlls/
-    // Only load DLLs that work as real PE DLLs; others are handled by WAT stub
-    // handlers — the one list, shared with the browser (lib/dll-registry.js),
-    // as is the graph walk itself (lib/process-boot.js).
-    const exeDir = path.dirname(EXE_PATH);
-    const dllSearchDirs = [
-      dllDir,
-      exeDir,
-      path.join(exeDir, '..', 'Shared_DLLs'),  // MW3-style extracted layout
-      path.join(exeDir, '..', 'shared_dlls'),
-      path.join(__dirname, 'binaries', 'dlls'),
-    ];
-    const findDllFile = name => {
-      for (const dir of dllSearchDirs) {
-        const p = findHostFileCi(dir, name);
-        if (p) return p;
-      }
-      return null;
-    };
-    // App-local DLLs ship beside their exe, so a dependency named by another
-    // DLL is looked up in this app's own `files` list too — same rule the page
-    // applies (index.html appFileByName).
-    const appFileByName = new Map();
-    for (const f of ((ASSET_ENTRY && ASSET_ENTRY.files) || [])) {
-      const url = typeof f === 'string' ? f : (f && f.url);
-      if (url) appFileByName.set(url.split('/').pop().toLowerCase(), url);
-    }
-    dlls = await resolveDllGraph({
-      exeBytes,
-      seeds: [...((ASSET_ENTRY && ASSET_ENTRY.dlls) || []), ...DLL_SEED],
-      detectRequiredDlls,
-      onMissing: (name, spec, { seed } = {}) => {
-        // One the app declares (`dlls`, --dll-seed) is not optional: running
-        // on without it only moves the failure into a built-in stub.
-        // A setup failure, so a nonzero exit (no guest thread exists yet).
-        if (seed) {
-          console.error(`run.js: declared DLL not found: ${spec} (test/binaries is ` +
-            `gitignored: link it into a fresh worktree)`);
-          process.exit(1);
-        }
-        console.warn(`[dll] ${name} is loaded as a real PE ` +
-          `but is not on disk (${spec}); its imports fall to WAT stubs and an ordinal ` +
-          `import from it crashes as "<ord>". test/binaries/dlls is gitignored: copy it ` +
-          `into a fresh worktree.`);
-      },
-      loadSpec: (spec) => {
-        // Registry seeds arrive as repo-relative paths; the graph walk's own
-        // discoveries arrive as bare DLL names.
-        const name = spec.split('/').pop();
-        const p = spec.includes('/')
-          ? appAsset(spec)
-          : (findDllFile(name) || (appFileByName.has(name.toLowerCase())
-              ? appAsset(appFileByName.get(name.toLowerCase())) : null));
-        return (p && fs.existsSync(p)) ? {
-          name,
-          bytes: readAssetBytes(p),
-          path: capturedGuestPath(p) || besideExeGuestPath(p, name) || undefined,
-        } : null;
-      },
-    });
-  }
   // Register exe in moduleBases so `exe+0xVA` and basename-relative specs work.
   {
     const peOff = exeBytes[0x3C] | (exeBytes[0x3D] << 8) | (exeBytes[0x3E] << 16) | (exeBytes[0x3F] << 24);
@@ -5938,51 +6177,49 @@ async function main() {
     }
   }
   // A LoadLibraryA from inside a DllMain (UBER.DLL loading Myth's
-  // modules\TCPIP.DLL) is serviced in place: callDllMain cannot await. So is
+  // modules\TCPIP.DLL) uses the resident-byte resolver below. So does
   // one from inside a nested synchronous send ($wnd_send_message asks through
   // the service_load_library import), which cannot return to this loop either.
+  // Explicit system/runtime inputs must exist before a PE initializer can
+  // request them. Keep their final override pass below for manifest precedence.
+  const mountExplicitVfsFiles = () => {
+    if (!ctx.vfs) return;
+    for (const spec of VFS_MOUNT) {
+      const eq = spec.lastIndexOf('=');
+      if (eq <= 0) throw new Error(`--vfs-mount needs HOSTPATH=GUESTPATH, got: ${spec}`);
+      const hostPath = appAsset(spec.slice(0, eq).trim());
+      const guestPath = spec.slice(eq + 1).trim();
+      if (!guestPath) throw new Error(`--vfs-mount needs a guest path: ${spec}`);
+      const size = fs.statSync(hostPath).size;
+      const add = raw => {
+        let name = raw.toLowerCase().replace(/\//g, '\\');
+        if (!/^[a-z]:/.test(name)) name = 'c:\\' + name.replace(/^\\+/, '');
+        ctx.vfs.ensureParentDirs(name);
+        ctx.vfs.setLazyFile(name.slice(0, name.lastIndexOf('\\') + 1) + raw.replace(/^.*[\\/]/, ''), {
+          attrs: 0x20, size, load: () => new Uint8Array(readAssetBytes(hostPath)),
+        });
+      };
+      add(guestPath);
+      const base = guestPath.replace(/^.*[\\/]/, '').toLowerCase();
+      if (/\.(ttf|ttc|fon)$/.test(base)) add('c:\\windows\\fonts\\' + base);
+    }
+  };
+  mountExplicitVfsFiles();
+  if (CHILD_READONLY_CONTEXT || CHILD_MEMORY) {
+    const media = await require('../lib/readonly-media-context').restore(ctx.vfs, inheritedReadonly.contexts,readonlyPreparation);
+    process.on('exit', () => { for (const source of media) require('../lib/media-cli').closeMedia(source); });
+    // Native DLL initializers may read profiles relative to the inherited CD.
+    // Validate the real directory now, before invoking any PE DllMain.
+    if (GUEST_CWD && ctx.vfs.readOnlyDrives.has(GUEST_CWD.slice(0, 1).toLowerCase()) &&
+        !ctx.vfs.setCurrentDirectory(GUEST_CWD))
+      throw new Error(`working directory is not present in the inherited readonly media: ${GUEST_CWD}`);
+  }
   const onLoadLibraryYield = ex => serviceLoadLibraryYieldSync({
     exports: ex, memoryBuffer: memory.buffer, resourceHost: ctx, log: console.log,
     findDllSync: findRuntimeDllBytes, onLoadLibraryYield,
   });
   ctx.serviceLoadLibrary = () => onLoadLibraryYield(instance.exports);
   threadManager._serviceDllYield = onLoadLibraryYield;
-  if (dlls.length > 0) {
-    mountLoadedDllFiles(ctx.vfs, dlls);
-    const dllResults = loadDlls(instance.exports, memory.buffer, exeBytes, dlls, console.log, {
-      onLoadLibraryYield,
-      exeName: path.basename(EXE_PATH),
-      extraArgs: EXTRA_ARGS || '',
-      registerDllResources: (dllConfigs, results) => {
-        const { extractBitmapBytes } = require('../lib/dib');
-        ctx.dllResources = ctx.dllResources || {};
-        for (let i = 0; i < dllConfigs.length && i < results.length; i++) {
-          try {
-            const bitmapBytes = extractBitmapBytes(dllConfigs[i].bytes);
-            const count = Object.keys(bitmapBytes).length;
-            if (count > 0) {
-              ctx.dllResources[results[i].loadAddr] = { bitmapBytes };
-              console.log(`DLL resources: ${dllConfigs[i].name} has ${count} bitmaps`);
-            }
-          } catch (_) {}
-        }
-      },
-    });
-    if (dllResults) {
-      threadManager.setLoadedDlls(dllResults, (ex, base, entry, log, options) =>
-        callDllMain(ex, base, entry, log, { ...options, onLoadLibraryYield }));
-      for (const r of dllResults) {
-        const key = r.name.toLowerCase().replace(/\.[^.]+$/, '');
-        moduleBases[key] = { loadAddr: r.loadAddr, origBase: r.origBase };
-      }
-    }
-    stopped = false;
-    hostExitRequested = false;
-  }
-
-  // Resolve any module-relative address specs now that all module bases are known.
-  deferredResolveAddrs();
-
   // Put the exe where a running image expects to find itself; see lib/vfs-seed.js.
   if (ctx.vfs) {
     const exeName = seedExeImage(ctx.vfs, exeBytes, path.basename(EXE_PATH), EXE_GUEST_PATH).base;
@@ -6017,16 +6254,6 @@ async function main() {
       const size = fs.statSync(file.hostPath).size;
       addFile(file.guestPath, file.hostPath, size);
       addFontAlias(file.guestPath, file.hostPath, size);
-    }
-    for (const spec of VFS_MOUNT) {
-      const eq = spec.lastIndexOf('=');
-      if (eq <= 0) throw new Error(`--vfs-mount needs HOSTPATH=GUESTPATH, got: ${spec}`);
-      const hostPath = appAsset(spec.slice(0, eq).trim());
-      const guestPath = spec.slice(eq + 1).trim();
-      if (!guestPath) throw new Error(`--vfs-mount needs a guest path: ${spec}`);
-      const size = fs.statSync(hostPath).size;
-      addFile(guestPath, hostPath, size);
-      addFontAlias(guestPath, hostPath, size);
     }
     for (const lib of WIN16_LIBS) {
       const guestPath = `c:\\windows\\system\\${path.basename(lib).toLowerCase()}`;
@@ -6197,6 +6424,10 @@ async function main() {
         console.log('[app] ' + msg);
       }
     }
+    // Explicit --vfs-mount files go last, so one can replace a single file of
+    // a registered app's manifest for this run (e.g. a test INI over the
+    // app's own) without touching the files on disk.
+    mountExplicitVfsFiles();
     if (VFS_DRIVE) {
       const drive = VFS_DRIVE.replace(/:$/, '').toLowerCase();
       if (!/^[a-z]$/.test(drive)) throw new Error(`invalid --vfs-drive: ${VFS_DRIVE}`);
@@ -6234,11 +6465,12 @@ async function main() {
     // Read-only ISO 9660 mounts (docs/design-byo-media.md phase 3). A disc is
     // its own drive letter, so it never collides with the app manifest on C:.
     if (ISO_MOUNTS.length) {
-      const { mountIso } = require('../lib/iso9660');
+      const { mountIso } = require('../lib/readonly-media-context');
       let drive = (ISO_DRIVE || 'D').replace(/:$/, '').toUpperCase();
       for (const isoPath of ISO_MOUNTS) {
-        const result = mountIso(ctx.vfs, new Uint8Array(fs.readFileSync(isoPath)),
+        const result = mountIso(ctx.vfs, isoPath,
           { drive, prefer: ISO_PRIMARY ? 'primary' : 'joliet' });
+        process.on('exit', () => require('../lib/media-cli').closeMedia(result.media));
         console.log(`[iso] mounted ${isoPath} -> ${result.root} ` +
           `label="${result.volumeLabel}" (${result.fileCount} files, ` +
           `${result.iso.joliet ? 'Joliet' : 'primary'} names)`);
@@ -6305,6 +6537,8 @@ async function main() {
       const { analyzeMediaPaths } = require('../lib/media-cli');
       const media = await analyzeMediaPaths(MEDIA_MOUNTS, { exePath: MEDIA_EXE });
       const result = await media.plan.mount(ctx.vfs);
+      if (ctx.vfs.readOnlyDrives.has(media.plan.mountRoot?.slice(0, 1).toLowerCase()))
+        require('../lib/readonly-media-context').remember(ctx.vfs, media);
       const guestExe = media.candidate.path;
       const slash = guestExe.lastIndexOf('\\');
       const guestDir = slash >= 2 ? guestExe.slice(0, slash) : guestExe.slice(0, 3);
@@ -6331,7 +6565,15 @@ async function main() {
         `${hydrated.dirs} dir(s), ${hydrated.whiteouts} whiteout(s)` +
         (vfsOverlay.errors.length ? `, ${vfsOverlay.errors.length} error(s)` : ''));
       for (const error of vfsOverlay.errors) console.log(`[overlay] ${error.message}`);
+      if (vfsOverlay.errors.length) throw new Error('overlay hydration failed before DLL discovery');
       nextOverlayFlushAt = Date.now() + OVERLAY_FLUSH_MS;
+    }
+
+    if (CHILD_MEMORY) {
+      memoryChild.restore(ctx.vfs, require('../lib/storage'), memoryLaunch.snapshot);
+      memoryBefore = memoryChild.baseline(memoryLaunch.snapshot);
+      // Release the received file buffers after adopting the private VFS.
+      memoryLaunch.snapshot = null;
     }
 
     // Apply an explicit process cwd only after every mount, including the
@@ -6491,6 +6733,129 @@ async function main() {
     }
 
   }
+
+  // Discover and initialize DLLs only after all mounts, overlay and registry.
+  // Load DLLs: explicit --dlls=path1,path2,... or auto-detect from EXE imports
+  const dllArg = getArg('dlls', null);
+  const dllDir = path.join(path.dirname(EXE_PATH), 'dlls');
+  let dlls;
+  if (dllArg) {
+    dlls = dllArg.split(',').map(p => ({
+      name: path.basename(p.trim()),
+      bytes: readAssetBytes(p.trim()),
+    }));
+  } else {
+    // Auto-detect: scan EXE imports, load any DLLs found in test/binaries/dlls/
+    // Only load DLLs that work as real PE DLLs; others are handled by WAT stub
+    // handlers — the one list, shared with the browser (lib/dll-registry.js),
+    // as is the graph walk itself (lib/process-boot.js).
+    const exeDir = path.dirname(EXE_PATH);
+    const dllSearchDirs = [
+      dllDir,
+      exeDir,
+      path.join(exeDir, '..', 'Shared_DLLs'),  // MW3-style extracted layout
+      path.join(exeDir, '..', 'shared_dlls'),
+      path.join(__dirname, 'binaries', 'dlls'),
+    ];
+    const findDllFile = name => {
+      for (const dir of dllSearchDirs) {
+        const p = findHostFileCi(dir, name);
+        if (p) return p;
+      }
+      return null;
+    };
+    // App-local DLLs ship beside their exe, so a dependency named by another
+    // DLL is looked up in this app's own `files` list too — same rule the page
+    // applies (index.html appFileByName).
+    const appFileByName = new Map();
+    for (const f of ((ASSET_ENTRY && ASSET_ENTRY.files) || [])) {
+      const url = typeof f === 'string' ? f : (f && f.url);
+      if (url) appFileByName.set(url.split('/').pop().toLowerCase(), url);
+    }
+    dlls = await resolveDllGraph({
+      exeBytes,
+      isLoadable: name => require('../lib/dll-registry').isLoadableDll(name) ||
+        require('../lib/cli-mounted-private-dll').isMountedPrivateDll(ctx.vfs, name, EXE_PROCESS_GUEST_PATH),
+      seeds: [...((ASSET_ENTRY && ASSET_ENTRY.dlls) || []), ...DLL_SEED],
+      detectRequiredDlls,
+      onMissing: (name, spec, { seed } = {}) => {
+        // One the app declares (`dlls`, --dll-seed) is not optional: running
+        // on without it only moves the failure into a built-in stub.
+        // A setup failure, so a nonzero exit (no guest thread exists yet).
+        if (seed) {
+          console.error(`run.js: declared DLL not found: ${spec} (test/binaries is ` +
+            `gitignored: link it into a fresh worktree)`);
+          process.exit(1);
+        }
+        console.warn(`[dll] ${name} is loaded as a real PE ` +
+          `but is not on disk (${spec}); its imports fall to WAT stubs and an ordinal ` +
+          `import from it crashes as "<ord>". test/binaries/dlls is gitignored: copy it ` +
+          `into a fresh worktree.`);
+      },
+      loadSpec: (spec) => {
+        // Registry seeds arrive as repo-relative paths; the graph walk's own
+        // discoveries arrive as bare DLL names.
+        const name = spec.split('/').pop();
+        const installed = require('../lib/installed-dll-closure').findInstalledDll(
+          ctx.vfs, name, EXE_PROCESS_GUEST_PATH);
+        if (installed) return installed;
+        const p = spec.includes('/')
+          ? appAsset(spec)
+          : (findDllFile(name) || (appFileByName.has(name.toLowerCase())
+              ? appAsset(appFileByName.get(name.toLowerCase())) : null));
+        return (p && fs.existsSync(p)) ? {
+          name,
+          bytes: readAssetBytes(p),
+          path: capturedGuestPath(p) || besideExeGuestPath(p, name) || undefined,
+        } : null;
+      },
+    });
+  }
+  if (dlls.length > 0) {
+    // Installed modules retain their real guest identity. The legacy mount
+    // supplies root/system aliases only for host inputs with no guest path.
+    mountLoadedDllFiles(ctx.vfs, dlls.filter(dll => !dll.path));
+    if (ctx.vfs) for (const dll of dlls.filter(dll => dll.path)) {
+      const guest = ctx.vfs._resolvePath(dll.path);
+      if (!ctx.vfs.files.has(guest)) {
+        ctx.vfs.ensureParentDirs(guest);
+        ctx.vfs.files.set(guest, { data: dll.bytes, attrs: 0x20 });
+      }
+    }
+    const dllResults = await mainOwner.loadDlls(exeBytes, dlls, console.log, {
+      onLoadLibraryYield,
+      exeName: path.basename(EXE_PATH),
+      extraArgs: EXTRA_ARGS || '',
+      registerDllResources: (dllConfigs, results) => {
+        const { extractBitmapBytes } = require('../lib/dib');
+        ctx.dllResources = ctx.dllResources || {};
+        for (let i = 0; i < dllConfigs.length && i < results.length; i++) {
+          try {
+            const bitmapBytes = extractBitmapBytes(dllConfigs[i].bytes);
+            const count = Object.keys(bitmapBytes).length;
+            if (count > 0) {
+              ctx.dllResources[results[i].loadAddr] = { bitmapBytes };
+              console.log(`DLL resources: ${dllConfigs[i].name} has ${count} bitmaps`);
+            }
+          } catch (_) {}
+        }
+      },
+    });
+    if (dllResults) {
+      threadManager.setLoadedDlls(dllResults, (ex, base, entry, log, options) =>
+        callDllMain(ex, base, entry, log, { ...options, onLoadLibraryYield }));
+      for (const r of dllResults) {
+        const key = r.name.toLowerCase().replace(/\.[^.]+$/, '');
+        moduleBases[key] = { loadAddr: r.loadAddr, origBase: r.origBase };
+      }
+    }
+    stopped = false;
+    hostExitRequested = false;
+  }
+
+  // Resolve any module-relative address specs now that all module bases are known.
+  deferredResolveAddrs();
+
 
   // Return addresses up the EBP chain, as a one-line list. The existing walker
   // in the SEH dump caps EBP at 0x01A00000, which excludes any app whose stack
@@ -6777,13 +7142,11 @@ async function main() {
 
   // Arm shadow call-stack (--trace-callstack). Gated WAT-side so off-runs pay
   // zero cost in the hot path.
-  if (TRACE_CALLSTACK && instance.exports.set_callstack_enabled) {
-    instance.exports.set_callstack_enabled(1);
-  }
+  if (TRACE_CALLSTACK) await mainOwner.optionalCall('set_callstack_enabled', 1);
   // Arm --fault-null. Same deal: the WAT check sits in the $g2w miss path, so
   // an off-run never reaches it.
-  if (FAULT_NULL_MODE && instance.exports.set_fault_unmapped) {
-    instance.exports.set_fault_unmapped(FAULT_NULL_MODE);
+  if (FAULT_NULL_MODE && mainOwner.supports('set_fault_unmapped')) {
+    await mainOwner.call('set_fault_unmapped', FAULT_NULL_MODE);
     console.log(`[fault] ${FAULT_NULL ? '--fault-null' : 'app page-fault option'} armed (mode=${FAULT_NULL_MODE}: `
       + `${FAULT_NULL_MODE === 2 ? 'log and trap'
           : FAULT_NULL_MODE === 3 ? 'log and raise a guest access violation'
@@ -6792,24 +7155,14 @@ async function main() {
           : 'log and continue'})`);
   }
   // Exclude PE/DLL load from the offline translation-path census.
-  if (GUEST_PAGE_STATS) instance.exports.reset_guest_page_stats();
-  if (TRACE_WIN16_DDE && instance.exports.set_win16_dde_trace) {
-    instance.exports.set_win16_dde_trace(1);
-  }
-  if (TRACE_WIN16 && instance.exports.set_win16_trace) {
-    instance.exports.set_win16_trace(1);
-  }
-  experiments.applyMain(instance, { copySuperops: COPY_SUPEROPS, ctx });
-  if (apiLogOff && instance.exports.set_api_log) instance.exports.set_api_log(0);
-  if (FLIP_VSYNC && instance.exports.set_flip_vsync) {
-    instance.exports.set_flip_vsync(1);
-  }
-  if (PRESENT_CAP && instance.exports.set_present_cap) {
-    instance.exports.set_present_cap(PRESENT_CAP);
-  }
-  if (instance.exports.set_present_pace_mode) {
-    instance.exports.set_present_pace_mode(PRESENT_PACE_MODE);
-  }
+  if (GUEST_PAGE_STATS) await mainOwner.call('reset_guest_page_stats');
+  if (TRACE_WIN16_DDE) await mainOwner.optionalCall('set_win16_dde_trace', 1);
+  if (TRACE_WIN16) await mainOwner.optionalCall('set_win16_trace', 1);
+  await experiments.applyMainOwned(mainOwner, { copySuperops: COPY_SUPEROPS, ctx });
+  if (apiLogOff) await mainOwner.optionalCall('set_api_log', 0);
+  if (FLIP_VSYNC) await mainOwner.optionalCall('set_flip_vsync', 1);
+  if (PRESENT_CAP) await mainOwner.optionalCall('set_present_cap', PRESENT_CAP);
+  await mainOwner.optionalCall('set_present_pace_mode', PRESENT_PACE_MODE);
   // --trace-win16 prints where the loader placed each task segment, so a
   // linear EIP or return address from the trace can be written as the
   // { seg, off } that lib/apps.js and other durable notes need.
@@ -6829,23 +7182,17 @@ async function main() {
         + 'is not a loaded Win16 segment; not marked');
     }
   }
-  if (LOGICAL_FRAME && LOGICAL_FRAME.address && instance.exports.set_logical_frame) {
-    instance.exports.set_logical_frame(LOGICAL_FRAME.address, LOGICAL_FRAME.pace);
+  if (LOGICAL_FRAME && LOGICAL_FRAME.address && mainOwner.supports('set_logical_frame')) {
+    await mainOwner.call('set_logical_frame', LOGICAL_FRAME.address, LOGICAL_FRAME.pace);
     console.log(`[present] ${LOGICAL_FRAME.label} step 0x${LOGICAL_FRAME.address.toString(16)} marked`
       + (LOGICAL_FRAME.pace ? `, cap ${PRESENT_CAP}/s paces once per step` : ', counted only'));
   }
-  if (instance.exports.set_spin_park_k) {
-    if (NO_SPIN_PARK) instance.exports.set_spin_park_k(0);
-    else if (Number.isFinite(SPIN_PARK_K)) instance.exports.set_spin_park_k(SPIN_PARK_K);
-  }
-  if (instance.exports.set_spin_work_max && Number.isFinite(SPIN_WORK_MAX)) instance.exports.set_spin_work_max(SPIN_WORK_MAX);
-  if (instance.exports.set_spin_regs_check && Number.isFinite(SPIN_REGS_CHECK)) instance.exports.set_spin_regs_check(SPIN_REGS_CHECK);
-  if (TRACE_FPU && instance.exports.set_fpu_trace) {
-    instance.exports.set_fpu_trace(1);
-  }
-  if (TRACE_CODE_WRITES && instance.exports.set_code_write_trace) {
-    instance.exports.set_code_write_trace(TRACE_CODE_WRITES_ALL ? 2 : 1);
-  }
+  if (NO_SPIN_PARK) await mainOwner.optionalCall('set_spin_park_k', 0);
+  else if (Number.isFinite(SPIN_PARK_K)) await mainOwner.optionalCall('set_spin_park_k', SPIN_PARK_K);
+  if (Number.isFinite(SPIN_WORK_MAX)) await mainOwner.optionalCall('set_spin_work_max', SPIN_WORK_MAX);
+  if (Number.isFinite(SPIN_REGS_CHECK)) await mainOwner.optionalCall('set_spin_regs_check', SPIN_REGS_CHECK);
+  if (TRACE_FPU) await mainOwner.optionalCall('set_fpu_trace', 1);
+  if (TRACE_CODE_WRITES) await mainOwner.optionalCall('set_code_write_trace', TRACE_CODE_WRITES_ALL ? 2 : 1);
   const dumpCallstack = (label, e) => {
     if (!TRACE_CALLSTACK || !e || !e.get_callstack_depth) return;
     const depth = e.get_callstack_depth() | 0;
@@ -7024,17 +7371,12 @@ async function main() {
   // callback: Heroes II hung ten batches after its main menu this way. host.js
   // has always made this exemption (_isMainExecutionSuspended); the CLI has to
   // agree or the browser and the harness run different schedulers.
-  // --trace-render-wait: opt in to bounded software-D3D wait attribution.
-  // Legacy render-park waits/counters remain active without this diagnostic.
-  const renderWaitAttribution = hasFlag('trace-render-wait') ? createRenderWaitAttribution() : null;
-  if (renderWaitAttribution) ctx.renderWaitAttribution = renderWaitAttribution.stats;
-  let mainRenderWait = null;
-  const mainExecutionSuspended = (path = 'probe') => {
+  const mainExecutionSuspended = async (path = 'probe') => {
     const observation = mainSchedulerObserver?.begin(path, tickState.batch);
     const finish = (value, reason) => observation ? observation.finish(value, reason) : value;
     const ex = instance.exports;
     if (threadManager.isMainNamedEventWaiting()) return finish(true, 'named-event');
-    let yieldReason = ex.get_yield_reason();
+    let yieldReason = await mainOwner.call('get_yield_reason');
     if (observation) observation.yield(yieldReason);
     if (serviceClock && (yieldReason === 13 || yieldReason === 14)) {
       const deadline = yieldReason === 13 ? ex.get_vblank_deadline_ms() : ex.get_spin_deadline_ms();
@@ -7042,30 +7384,8 @@ async function main() {
       ex.clear_yield();
       yieldReason = 0;
     }
-    if (yieldReason === 16) {
-      const token = ex.get_d3d_render_token() | 0;
-      if (!mainRenderWait || mainRenderWait.token !== token) {
-        const wait = {token,done:false,polls:0,since:tickState.batch|0}; mainRenderWait = wait;
-        renderWaitAttribution?.begin(wait, ctx.d3d9Bridge?.requests.get(token));
-        wait.promise = Promise.resolve().then(() => ctx.waitD3DRender(token))
-          .catch(error => { renderWaitAttribution?.reject(wait); console.error('[render]',error); })
-          .then(() => { wait.done = true; renderWaitAttribution?.settle(wait); });
-      }
-      if (!mainRenderWait.done) {
-        // A request the bridge already calls done should release main within
-        // a few event-loop turns. Morrowind once sat on one for 150k+ batches
-        // until its yield was cleared by hand; say so the first time it
-        // happens rather than letting it read as a slow scene.
-        const record = ctx.d3d9Bridge && ctx.d3d9Bridge.requests.get(token);
-        if (++mainRenderWait.polls === 1000 && record && record.done)
-          console.log(`[render] main parked on completed request ${token} for 1000 checks ` +
-            `(since batch ${mainRenderWait.since}); the wait never observed it`);
-        return finish(true, 'render');
-      }
-      mainRenderWait = null; ex.clear_yield();
-    }
     if (threadManager._renderSendTargets.has(ex)) return finish(true, 'render-send');
-    yieldReason = ex.get_yield_reason();
+    yieldReason = await mainOwner.call('get_yield_reason');
     if (observation) observation.yield(yieldReason);
     if (yieldReason === 10 && (threadManager.backend === 'worker' ||
         !threadManager.resolveCooperativeThreadSend(ex))) return finish(true, 'thread-send');
@@ -7083,7 +7403,7 @@ async function main() {
     // instead (see mainSleepWallWait).
     // A Sleep main made earlier in this batch (between thread slices) has not
     // been through checkMainYield yet; record its deadline now.
-    threadManager.noteMainSleep();
+    await threadManager.noteMainSleepOwned(mainOwner);
     if (!serviceClock && !REAL_TICK_SLEEPS && threadManager.isMainSleeping(observation?.sleep) &&
         !(observation ? observation.live(threadManager.hasLiveThreads()) : threadManager.hasLiveThreads())) {
       if (observation) observation.fastForward();
@@ -7091,44 +7411,39 @@ async function main() {
     }
     if (threadManager.isMainSleeping(observation?.sleep)) return finish(true, 'sleep');
     if (!threadManager.isMainThreadSuspended()) return finish(false, 'runnable');
-    return finish(!(ex.is_mm_timer_callback_active && (ex.is_mm_timer_callback_active() | 0)),
+    return finish(!(await mainOwner.optionalCall('is_mm_timer_callback_active') | 0),
       'suspend-count-or-mm-timer');
   };
-
-  // A main thread parked on a software D3D request (yield 16) used to cost a
-  // whole batch per check: mainExecutionSuspended() said "parked", run() was
-  // skipped, and the loop counted the batch -- tickState.batch advances the
-  // guest clock by TICK_MS_PER_BATCH while the render worker is still
-  // rasterizing. UT2003/UT2004 read as "stuck forever in the first
-  // DrawIndexedPrimitive" this way: 1500 batches spent ~1490 of them parked,
-  // one per event-loop turn, and a --max-batches budget ran out with the
-  // guest 30 draws in. The browser has no such unit (host.js just yields to
-  // the event loop), so wait here, in wall time, for the one request the
-  // guest is actually blocked on. --no-render-park-wait restores the old
-  // batch-per-check behaviour for an A/B.
-  const RENDER_PARK_WAIT = !hasFlag('no-render-park-wait');
-  // skippedBatches: batches whose run() was skipped because main was still
-  // parked on a render request -- the number the fix drives to zero, and
-  // what test/test-d3d-render-park-batches.js reads through ctx.
-  const renderParkStats = ctx.renderParkStats = { waits: 0, wallMs: 0, skippedBatches: 0 };
-  const awaitMainRenderPark = async () => {
-    if (!RENDER_PARK_WAIT) return;
+  // The batch loop's synchronous fast path. With a local main owner every
+  // owner call above is a plain export call and settles at once, yet each
+  // `await` still suspends and resumes this whole closure -- about 0.57 ms of
+  // interpreter time a batch on Spelunky HD across the ~15 settled awaits.
+  // syncMain selects the same calls, in the same order, without the awaits;
+  // it is off whenever an owner can actually be asynchronous (a Worker main,
+  // the --d3dim-render-owner run wrapper) or --trace-main-scheduler wraps it.
+  const syncMain = mainOwner.kind === 'local' && !mainSchedulerObserver && !d3dimExecutionOwner;
+  const mainExecutionSuspendedSync = () => {
     const ex = instance.exports;
-    if (ex.get_yield_reason() !== 16) return;
-    mainExecutionSuspended();
-    const wait = mainRenderWait;
-    if (!wait || wait.done) return;
-    const started = Date.now();
-    renderWaitAttribution?.parkStart(wait, started);
-    let renderParkDeadline = false;
-    while (!wait.done && !stopped) {
-      await Promise.race([wait.promise, new Promise(r => setTimeout(r, 100))]);
-      if (deadlineMs && Date.now() > deadlineMs) { renderParkDeadline = true; break; }
+    if (threadManager.isMainNamedEventWaiting()) return true;
+    let yieldReason = mainOwner.call('get_yield_reason');
+    if (serviceClock && (yieldReason === 13 || yieldReason === 14)) {
+      const deadline = yieldReason === 13 ? ex.get_vblank_deadline_ms() : ex.get_spin_deadline_ms();
+      if (batchClock.batchTicks() <= (deadline >>> 0)) return true;
+      ex.clear_yield();
+      yieldReason = 0;
     }
-    const renderParkEnded = Date.now();
-    renderParkStats.waits++; renderParkStats.wallMs += renderParkEnded - started;
-    renderWaitAttribution?.parkEnd(wait, renderParkEnded,
-      stopped ? 'stopped' : (renderParkDeadline ? 'deadline' : 'pending'));
+    if (threadManager._renderSendTargets.has(ex)) return true;
+    yieldReason = mainOwner.call('get_yield_reason');
+    if (yieldReason === 10 && (threadManager.backend === 'worker' ||
+        !threadManager.resolveCooperativeThreadSend(ex))) return true;
+    threadManager.noteMainSleepLocal(mainOwner);
+    if (!serviceClock && !REAL_TICK_SLEEPS && threadManager.isMainSleeping() &&
+        !threadManager.hasLiveThreads()) {
+      tickState.pausedMs += threadManager.mainSleepRemaining();
+    }
+    if (threadManager.isMainSleeping()) return true;
+    if (!threadManager.isMainThreadSuspended()) return false;
+    return !(mainOwner.optionalCall('is_mm_timer_callback_active') | 0);
   };
 
   let lastSchedSig = null;
@@ -7412,9 +7727,12 @@ async function main() {
   const waitForControlBatch = async () => {
     while (controlFrozen && controlRunCredits <= 0 && !stopped) {
       const pausedAt = deadlineMs ? Date.now() : 0;
-      await new Promise(resolve => {
-        controlWake = resolve;
-      });
+      if (cliObservation) cliObservation.parked = true;
+      try {
+        await new Promise(resolve => { controlWake = resolve; });
+      } finally {
+        if (cliObservation) cliObservation.parked = false;
+      }
       if (deadlineMs) deadlineMs += Date.now() - pausedAt;
     }
     if (!stopped) controlPreviousBatchRan = true;
@@ -7441,20 +7759,59 @@ async function main() {
   };
   const controlSnapshot = () => {
     const we = instance.exports;
-    const windows = renderer ? Object.values(renderer.windows).map(w => ({
+    let windows = renderer ? Object.values(renderer.windows).map(w => {
+      const e = w.wasm?.exports || we;
+      return ({
       hwnd: '0x' + ((w.hwnd >>> 0) || 0).toString(16),
       x: w.x | 0, y: w.y | 0, w: w.w | 0, h: w.h | 0,
       visible: !!w.visible, isChild: !!w.isChild, title: w.title || '',
-    })) : [];
+      live: !!e.wnd_lookup_live?.(w.hwnd),
+      generation: String(e.wnd_lookup_generation?.(w.hwnd) || 0),
+      processId: e.get_process_id?.() >>> 0,
+      threadId: e.get_window_thread?.(w.hwnd) >>> 0,
+      owner: '0x' + ((e.wnd_get_owner?.(w.hwnd) || 0) >>> 0).toString(16),
+      parent: '0x' + ((e.wnd_get_parent?.(w.hwnd) || 0) >>> 0).toString(16),
+      style: e.wnd_get_style_export?.(w.hwnd) >>> 0,
+      controlClass: e.ctrl_get_class?.(w.hwnd) >>> 0,
+      controlId: e.ctrl_get_id?.(w.hwnd) >>> 0,
+      buttonFlags: e.ctrl_get_class?.(w.hwnd)===1 ? e.button_get_flags?.(w.hwnd) >>> 0 : null,
+      screenX: e.wnd_window_screen_x?.(w.hwnd) | 0,
+      screenY: e.wnd_window_screen_y?.(w.hwnd) | 0,
+    }); }) : [];
+    if(renderer)windows=require('../lib/cli-native-user-windows').withNativeUserChildren(windows,renderer,memory);
     return {
       batch: tickState.batch | 0,
       eip: '0x' + (we.get_eip() >>> 0).toString(16),
       quit: we.get_quit_flag ? !!we.get_quit_flag() : false,
       yieldReason: we.get_yield_reason ? we.get_yield_reason() | 0 : 0,
       focus: '0x' + ((we.get_focus_hwnd ? we.get_focus_hwnd() : 0) >>> 0).toString(16),
+      focusTopLevel: '0x' + ((we.wnd_top_level?.(we.get_focus_hwnd?.() || 0) || 0) >>> 0).toString(16),
+      focusWindow: {
+        hwnd: '0x' + ((we.get_focus_hwnd?.() || 0) >>> 0).toString(16),
+        generation: String(we.wnd_lookup_generation?.(we.get_focus_hwnd?.() || 0) || 0),
+        live: !!we.wnd_lookup_live?.(we.get_focus_hwnd?.() || 0),
+        processId: we.get_process_id?.() >>> 0,
+        threadId: we.get_window_thread?.(we.get_focus_hwnd?.() || 0) >>> 0,
+      },
       mainHwnd: '0x' + ((we.get_main_hwnd ? we.get_main_hwnd() : 0) >>> 0).toString(16),
+      capture: '0x' + ((we.get_capture_hwnd?.() || 0) >>> 0).toString(16),
+      modalHwnd: '0x' + ((we.modal_dialog_hwnd?.() || we.dialogbox_hwnd?.() || 0) >>> 0).toString(16),
+      // Only the native common-dialog pump plus the actual USER control class
+      // identify a live MessageBox. An arbitrary ownerless renderer window
+      // cannot manufacture this record or the HWND generation/thread identity.
+      nativeMessageBox: (() => {
+        const h = we.modal_dialog_hwnd?.() || 0;
+        if (!h || we.ctrl_get_class?.(h) !== 16 || !we.wnd_lookup_live?.(h)) return null;
+        return { hwnd: '0x' + (h >>> 0).toString(16),
+          generation: String(we.wnd_lookup_generation(h)), processId: we.get_process_id() >>> 0,
+          threadId: we.get_window_thread(h) >>> 0, controlClass: 16 };
+      })(),
+      physicalUp: !(renderer?._mouseButtonsMask || Object.values(renderer?._physicalKeys || {}).some(Boolean)),
+      nativeDialogBox: require('../lib/cli-native-user-windows').nativeDialogBoxIdentity(instance,threadManager),
+      nativeProcess: { pid: process.pid, executable: EXE_PROCESS_GUEST_PATH || EXE_PATH },
       screen: renderer && renderer.canvas
         ? { w: renderer.canvas.width | 0, h: renderer.canvas.height | 0 } : null,
+      pointerMapping: renderer ? require('../lib/cli-native-pointer-coordinates').captureMapping(renderer) : null,
       frozen: {
         frozen: controlFrozen,
         tickMs: batchClock.getTickMsPerBatch(),
@@ -7502,6 +7859,7 @@ async function main() {
       return out;
     },
     releaseInput: () => {
+      guardedInput.abandon('native fault retained');
       const state = { renderer, inputQueue, inputEvent, scheduledInput, crossThreadMsgs };
       const result = require('../lib/cli-fault-input').releaseFaultInput(state);
       inputEvent = state.inputEvent;
@@ -7509,6 +7867,7 @@ async function main() {
     },
     persist: require('../lib/native-fault-latch').persistNativeFault,
   });
+  if (cliObservation) cliObservation.bindThreads(threadManager);
   threadManager.nativeFaultLatch = nativeFault;
   const terminateNativeFault = cmd => {
     const result = nativeFault.terminate(cmd);
@@ -7523,8 +7882,135 @@ async function main() {
     wakeControlLoop();
     return result;
   };
-  const handleControlCommand = (cmdIn) => {
+  let reviewedSceneBindAttempted = false, reviewedSceneLease = null, nativeSceneLease = null;
+  const nativeScene = require('../lib/cli-native-scene');
+  const reviewedContexts = nativeScene.createReviewedContexts();
+  const nativeCaptureReceipts = require('../lib/cli-native-capture-receipt').createCaptureReceipts({authority:()=>cliInputSnapshot()});
+  let nativeSceneContract = null;
+  const cliInputSnapshot = require('../lib/cli-input-owner').createCliInputSnapshot({
+      instance, memory, renderer, getDevice: () => ctx.d3dCommands,
+      getThreadManager: () => threadManager,
+    });
+  const reviewedWindow = (s, hwnd) => s.windows.find(w => w.hwnd === hwnd);
+  const sameReviewedWindow = (a, b) => a && b &&
+    ['hwnd', 'generation', 'processId', 'threadId', 'owner', 'parent', 'title', 'visible', 'isChild', 'live']
+      .every(k => a[k] === b[k]);
+  // A permanent reviewed-context binding pins the native owner, while each
+  // fresh intent below still verifies every caption/control/focus field. An
+  // ordinary SetWindowText after a completed intent does not replace an HWND.
+  const sameReviewedOwner = (a, b) => a && b &&
+    ['hwnd', 'generation', 'processId', 'threadId', 'owner', 'parent', 'visible', 'isChild', 'live']
+      .every(k => a[k] === b[k]);
+  guardedInput = require('../lib/cli-guarded-input').createGuardedInput({
+    nativeDelivery: true, nativeProofRequired: true,
+    captureNativeControl: (event,intent) => require('../lib/cli-native-user-windows').captureNativeButton(event,intent,controlSnapshot(),instance,threadManager),
+    confirmNativeControl: (fence,event) => require('../lib/cli-native-user-windows').confirmNativeButton(fence,event),
+    captureDelivery: () => nativeScene.reviewedContext(controlSnapshot()),
+    validateDelivery: expected => JSON.stringify(nativeScene.reviewedContext(controlSnapshot())) === JSON.stringify(expected),
+    validateIntent: (intent,event,held=[]) => {
+      if (event.charCode !== undefined) require('../lib/cli-native-printable').validatePrintable(event,controlSnapshot(),renderer);
+      if (!nativeSceneLease) return true;
+      if (nativeSceneContract === nativeScene.REVIEWED_CONTEXT) {
+        try { reviewedContexts.verify(controlSnapshot(),intent.review,intent.event,intent.nonce); return true; }
+        catch { return false; }
+      }
+      const current=controlSnapshot();
+      if (held.length) {
+        // Only a consumed prefix of this server-owned finite chord may explain
+        // physicalUp=false. Every other context operand remains unchanged.
+        const actual=Object.entries(renderer._physicalKeys||{}).filter(([,down])=>down).map(([k])=>Number(k)).sort((a,b)=>a-b);
+        if (renderer._mouseButtonsMask || current.physicalUp ||
+            JSON.stringify(actual)!==JSON.stringify([...held].sort((a,b)=>a-b)) || intent?.physicalUp!==true) return false;
+        current.physicalUp=true;
+      }
+      if (!nativeScene.matches(current, intent)) return false;
+      // A reviewed native intent can pin its complete composited frame as
+      // well as its USER identities. Check again at consumption: paint may
+      // change while input waits even though HWND/focus remain unchanged.
+      if (intent.pngSHA256 !== undefined) {
+        if (!/^[a-f0-9]{64}$/.test(intent.pngSHA256)) return false;
+        const paint = require('crypto').createHash('sha256').update(canvasToPng(renderer.canvas)).digest('hex');
+        if (paint !== intent.pngSHA256) return false;
+      }
+      return true;
+    },
+    snapshot: () => {
+      let current = cliInputSnapshot();
+      if (nativeSceneLease) {
+        if (nativeSceneContract === nativeScene.REVIEWED_CONTEXT) {
+          current=nativeScene.reviewedOwnerSnapshot(current,controlSnapshot(),nativeSceneLease,instance,threadManager);
+        } else {
+          const s=controlSnapshot(), main=reviewedWindow(s,s.mainHwnd);
+          current.healthy=current.healthy && sameReviewedWindow(main,nativeSceneLease.main) &&
+            JSON.stringify(s.nativeProcess)===JSON.stringify(nativeSceneLease.nativeProcess) &&
+            JSON.stringify(s.screen)===JSON.stringify(nativeSceneLease.screen);
+          current.refs.nativeSceneMainGeneration=main?.generation;
+        }
+      }
+      if (reviewedSceneLease) {
+        const s = controlSnapshot(), lease = reviewedSceneLease;
+        const main = reviewedWindow(s, lease.main.hwnd), modal = lease.modal && reviewedWindow(s, lease.modal.hwnd);
+        const insideModal = value => {
+          let h = parseInt(value, 16) >>> 0;
+          const e = instance.exports, seen = new Set();
+          while (h && !seen.has(h)) {
+            if (h === parseInt(lease.modal.hwnd, 16)) return true;
+            seen.add(h); h = e.wnd_get_parent(h) >>> 0;
+          }
+          return false;
+        };
+        current.healthy = current.healthy && sameReviewedWindow(main, lease.main) &&
+          (!lease.modal || (sameReviewedWindow(modal, lease.modal) && s.modalHwnd === modal.hwnd &&
+            insideModal(s.focus) && (s.capture === '0x0' || insideModal(s.capture)) &&
+            (!lease.nativeMessageBox || (JSON.stringify(s.nativeMessageBox) === JSON.stringify(lease.nativeMessageBox) &&
+              s.focusWindow.live && s.focusWindow.processId === main.processId &&
+              s.focusWindow.threadId === main.threadId))));
+        // Native generations protect against recycled HWNDs even if a renderer
+        // window object survives. The original physical-release refs stay exact.
+        current.refs.reviewedMainGeneration = main?.generation;
+        current.refs.reviewedModalGeneration = modal?.generation;
+        current.refs.reviewedModalWindow = lease.modal ? renderer?.windows[parseInt(lease.modal.hwnd, 16)] : null;
+      }
+      return current;
+    },
+    cleanup: (refs, ev) => {
+      if (ev.action === 'keydown') refs.up.call(refs.renderer, ev.code);
+      if (ev.action === 'mousedown') refs.mouseUp.call(refs.renderer, ev.x, ev.y, 1);
+    },
+  });
+  ctx.guardedInput = guardedInput;
+  ctx.nativeInputActor = () => instance.exports;
+  // takeInput itself publishes async key state. Guard queued delivery before
+  // that effect, including callers other than h.check_input.
+  if (renderer) {
+    const take = renderer.takeInput;
+    renderer.takeInput = function(...args) { guardedInput.sweep(); return take.apply(this, args); };
+  }
+  const applyGuardedInput = ev => {
+    if (ev.action === 'keydown') {
+      renderer.handleKeyDown(ev.code);
+      if (ev.charCode !== undefined) renderer.handleKeyPress(ev.charCode);
+    }
+    else if (ev.action === 'keyup') renderer.handleKeyUp(ev.code);
+    else if (ev.action === 'mousemove') renderer.handleMouseMove(ev.x, ev.y);
+    else if (ev.action === 'mousedown') renderer.handleMouseDown(ev.x, ev.y, 1);
+    else if (ev.action === 'mouseup') renderer.handleMouseUp(ev.x, ev.y, 1);
+    else throw new Error('unsupported guarded input');
+  };
+  const handleControlCommand = cmdIn => {
+    if (!cliObservation) return executeControlCommand(cmdIn);
+    if (cliObservation.state !== 'open') throw new Error('observation command admission closed');
+    // Observation must not count its own boundary wait as an outstanding command.
+    if (cmdIn?.action === 'native-observe') return executeControlCommand(cmdIn);
+    const action = typeof cmdIn === 'object' && cmdIn?.action;
+    if (action && !['ping', 'snapshot', 'frozen', 'step', 'quit'].includes(action))
+      throw new Error('command unsupported in CLI native observation mode');
+    return cliObservation.command(() => executeControlCommand(cmdIn));
+  };
+  const executeControlCommand = (cmdIn) => {
     const cmd = typeof cmdIn === 'string' ? { cmd: cmdIn } : (cmdIn || {});
+    if (stopped && childObservation.begun && cmd.action !== 'guarded-release')
+      throw new Error('launcher guest retired; only prearmed physical release is admitted');
     if (cmd.action === 'fault-status') return nativeFault.status();
     if (cmd.action === 'fault-arm') {
       if (!controlFrozen || workerThreadHost || threadManager.workerBackend)
@@ -7551,6 +8037,139 @@ async function main() {
     // the native action, not as an input entry that would fail to parse.
     if (!cmd.action && /^(ping|snapshot|quit)$/.test(native)) {
       cmd.action = native;
+    }
+    if (cliObservation) {
+      if (!['ping', 'snapshot', 'frozen', 'step', 'quit', 'native-observe'].includes(cmd.action))
+        throw new Error('command unsupported in CLI native observation mode');
+      if (cmd.action === 'native-observe') return cliObservation.run(instance, (exports, owned) =>
+        require('../tools/pawn-cli-observation.cjs').observeNative(exports, memory, owned, cmd));
+    }
+    if (cmd.action === 'guarded-bind') {
+      if (reviewedSceneBindAttempted) throw new Error('reviewed scene binding is permanent; no replay/rebind');
+      if (cmd.reviewedScene?.contract === nativeScene.REVIEWED_CONTEXT) {
+        reviewedSceneBindAttempted=true;
+        const verified=reviewedContexts.verify(controlSnapshot(),cmd.reviewedScene);
+        nativeSceneLease=verified.context; nativeSceneContract=verified.contract;
+        const binding=guardedInput.bind();
+        childObservation.bind(binding);
+        return {...binding,contract:nativeSceneContract};
+      }
+      if (cmd.reviewedScene?.route === 'native-scene-v1') {
+        reviewedSceneBindAttempted=true;
+        const expected=cmd.reviewedScene, s=controlSnapshot();
+        if (expected.receipt) nativeCaptureReceipts.verify(s,expected);
+        else {
+          if (!nativeScene.matches(s,expected.snapshot)) throw new Error('reviewed native scene changed before binding');
+          const paint=require('crypto').createHash('sha256').update(canvasToPng(renderer.canvas)).digest('hex');
+          if (paint!==expected.pngSHA256) throw new Error('reviewed native paint changed');
+        }
+        nativeSceneLease=nativeScene.context(s);
+        return guardedInput.bind();
+      }
+      if (cmd.reviewedScene) {
+        reviewedSceneBindAttempted = true;
+        const expected = cmd.reviewedScene, s = controlSnapshot();
+        const main = reviewedWindow(s, s.mainHwnd), modal = expected.modal && reviewedWindow(s, expected.modal.hwnd);
+        const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+        if (!main?.live || !main.visible || main.isChild || main.generation === '0' || !main.processId ||
+            !sameReviewedWindow(main, expected.main) || !same(s.nativeProcess, expected.nativeProcess) ||
+            !same(s.screen, expected.screen) || s.mainHwnd !== expected.main.hwnd ||
+            !s.physicalUp || s.capture !== '0x0' || s.focus !== expected.focus ||
+            !same(s.focusWindow, expected.focusWindow) || s.quit || s.eip === '0x0')
+          throw new Error('reviewed native main/process/window/focus/physical state changed');
+        const nullOwnerMessageBox = expected.modalRoute === 'null-owner-message-box';
+        const nativeBox = s.nativeMessageBox;
+        const preciseNativeBox = nullOwnerMessageBox && modal?.owner === '0x0' &&
+          nativeBox && same(nativeBox, expected.nativeMessageBox) && nativeBox.controlClass === 16 &&
+          nativeBox.hwnd === modal.hwnd && nativeBox.generation === modal.generation &&
+          nativeBox.processId === main.processId && nativeBox.threadId > 0 &&
+          nativeBox.threadId === main.threadId && nativeBox.threadId === modal.threadId &&
+          nativeBox.threadId === s.focusWindow.threadId;
+        if (!main.title.trim()) {
+          if (!modal?.live || !modal.visible || modal.isChild || !modal.title.trim() ||
+              modal.hwnd === main.hwnd || modal.generation === '0' || modal.processId !== main.processId ||
+              (nullOwnerMessageBox ? !preciseNativeBox : modal.owner !== main.hwnd) || s.modalHwnd !== modal.hwnd ||
+              s.focusTopLevel !== modal.hwnd || !s.focusWindow.live ||
+              s.focusWindow.generation === '0' || s.focusWindow.processId !== main.processId ||
+              !sameReviewedWindow(modal, expected.modal))
+            throw new Error('untitled main requires the exact current native owned modal');
+        } else if (expected.modal || expected.modalRoute) throw new Error('unexpected reviewed modal binding');
+        const paint = require('crypto').createHash('sha256').update(canvasToPng(renderer.canvas)).digest('hex');
+        if (paint !== expected.pngSHA256) throw new Error('reviewed native paint changed');
+        reviewedSceneLease = { main: { ...main }, modal: modal ? { ...modal } : null,
+          nativeMessageBox: nullOwnerMessageBox ? { ...nativeBox } : null };
+      }
+      return guardedInput.bind();
+    }
+    if (cmd.action === 'native-child-arm') {
+      const verified=reviewedContexts.verify(controlSnapshot(),cmd.reviewedScene);
+      return childObservation.arm(cmd,verified,controlSnapshot());
+    }
+    if (cmd.action === 'native-child-attest')
+      return childObservation.attest(cmd,nativeScene.startupReadiness(controlSnapshot(),cliInputSnapshot(),instance,threadManager));
+    if (cmd.action === 'native-startup-readiness')
+      return nativeScene.startupReadiness(controlSnapshot(),cliInputSnapshot(),instance,threadManager);
+    if (cmd.action === 'guarded-status') return guardedInput.status(cmd.nonce);
+    if (cmd.action === 'native-scene-capture') {
+      if (!cmd.path) throw new Error('native capture needs a complete PNG path');
+      return nativeCaptureReceipts.capture(controlSnapshot,()=>{
+        // Match ordinary queued PNG capture: native window back canvases may
+        // be current while the composited display remains untouched.
+        if (typeof renderer.repaint === 'function') renderer.repaint();
+        return canvasToPng(renderer.canvas);
+      },bytes=>fs.writeFileSync(cmd.path,bytes,{flag:'wx'}));
+    }
+    if (cmd.action === 'native-reviewed-capture' || cmd.action === 'native-presentation-capture') {
+      if (!cmd.path) throw new Error('reviewed capture needs a complete PNG path');
+      if (cmd.action === 'native-presentation-capture') {
+        // Public presentation and capture share this synchronous dispatch.
+        // A pending scene allocates no capture, lease or input. Never retry a
+        // refused capture; the caller retains its original observation bound.
+        const ready=nativeScene.startupReadiness(controlSnapshot(),cliInputSnapshot(),instance,threadManager);
+        if (!ready.ready) return {contract:'native-presentation-pending-v1',pending:true,failures:ready.failures};
+      }
+      return reviewedContexts.capture(controlSnapshot,()=>{
+        presentForRead();
+        return require('../lib/cli-native-pointer-coordinates').encodeReviewedCanvas(renderer,canvas=>
+          typeof canvas.toBufferSync==='function'?canvas.toBufferSync('png'):canvas.toBuffer('image/png'));
+      },bytes=>fs.writeFileSync(cmd.path,bytes,{flag:'wx'}));
+    }
+    if (cmd.action === 'guarded-release') return guardedInput.release(cmd.owner);
+    if (cmd.action === 'guarded-key-chord') {
+      if (!nativeSceneLease || nativeSceneContract===nativeScene.REVIEWED_CONTEXT || controlFrozen)
+        throw Error('finite chord requires running whole-native-scene binding');
+      if (!Array.isArray(cmd.keys) || cmd.keys.some(key=>!/^keydown:\d{1,3}$/.test(key)))
+        throw Error('invalid finite key chord');
+      const events=cmd.keys.map(key=>parseInputEntries([`${tickState.batch | 0}:${key}`])[0]);
+      return guardedInput.compound(cmd.guard,events,(event,ticket)=>{
+        const ev={...event,guardedTicket:ticket};
+        let at=scheduledInput.findIndex(e=>e.batch>ev.batch);
+        if(at<0)at=scheduledInput.length;
+        scheduledInput.splice(at,0,ev);
+      });
+    }
+    if (cmd.action === 'guarded-input') {
+      const evs = parseInputEntries([`${tickState.batch | 0}:${String(cmd.cmd || '')}`]);
+      if (evs.length !== 1 || !/^(keydown|keyup|mousemove|mousedown|mouseup)$/.test(evs[0].action))
+        throw new Error('unsupported guarded input; use one key or pointer edge');
+      const ev = evs[0];
+      if (['keydown', 'keyup'].includes(ev.action) ?
+          !Number.isInteger(ev.code) || ev.code < 1 || ev.code > 255 :
+          !Number.isFinite(ev.x) || !Number.isFinite(ev.y)) throw new Error('invalid guarded input arguments');
+      if (ev.charCode !== undefined) require('../lib/cli-native-printable').validatePrintable(ev,controlSnapshot(),renderer);
+      if (nativeSceneContract===nativeScene.REVIEWED_CONTEXT) {
+        // Bind the actual parsed edge and nonce, never caller-provided event data.
+        cmd.guard={...cmd.guard,intent:{review:cmd.guard?.intent?.review,event:{action:ev.action,code:ev.code,charCode:ev.charCode,x:ev.x,y:ev.y},nonce:cmd.guard?.nonce}};
+      }
+      const ticket = guardedInput.prepare(cmd.guard, ev);
+      childObservation.begin(cmd.guard);
+      if (ticket.state === 'QUEUED') {
+        ev.guardedTicket = ticket;
+        let at = scheduledInput.findIndex(e => e.batch > ev.batch);
+        if (at < 0) at = scheduledInput.length;
+        scheduledInput.splice(at, 0, ev);
+      }
+      return controlFrozen ? guardedInput.receipt(ticket) : guardedInput.wait(ticket);
     }
     if (cmd.action === 'ping') {
       return {
@@ -7679,6 +8298,7 @@ async function main() {
         fps: derivedFps,
         ffmpeg: FFMPEG_PATH,
         startGuestMs: batchClock.batchTicks(),
+        scale: cmd.scale === undefined ? 1 : Number(cmd.scale),
       });
       return { recording: true, ...videoRecorder.summary(), everyNSteps: videoEvery };
     }
@@ -7723,6 +8343,7 @@ async function main() {
       port: CONTROL_PORT, host: CONTROL_HOST,
       onCommand: handleControlCommand, log: line => console.log(line),
     }) : null;
+    if (server) server.server.once('listening',()=>childObservation.ready());
     if (CONTROL_STDIN) {
       const rl = require('readline').createInterface({ input: process.stdin, terminal: false });
       let stdinCommands = Promise.resolve();
@@ -7766,6 +8387,7 @@ async function main() {
   let controlClosed = false;
   const closeControl = () => {
     if (control && !controlClosed) {
+      guardedInput.close();
       control.close();
       controlClosed = true;
     }
@@ -7806,6 +8428,14 @@ async function main() {
   const executionStartedAt = performance.now();
   for (let batch = 0; batch < MAX_BATCHES && !stopped; batch++) {
     processDesktop.poll();
+    // drain() is a no-op until a COM runtime exists. The fast path skips the
+    // settled await but keeps one microtask turn per batch, here, where the
+    // first of the old settled awaits gave it: promise continuations a host
+    // import started during the previous batch still run before this one.
+    if (mainOwner.kind === 'local') {
+      if (!syncMain || ctx.comInterfaces.runtime) await ctx.comInterfaces.drain();
+      else await null;
+    }
     traceGateBatch = batch;
     if (deadlineMs && Date.now() >= deadlineMs) {
       traceGateBatch = -1; // why the run stopped is not per-batch trace output
@@ -7813,11 +8443,11 @@ async function main() {
       break;
     }
     for (const w of CPU_WINDOWS) {
-      if (!w.cpu && !w.done && batch >= w.start) { w.cpu = process.cpuUsage(); w.wall = performance.now(); }
+      if (!w.cpu && !w.done && batch >= w.start) { w.cpu = process.cpuUsage(); w.wall = performance.now(); w.d9 = d3d9Frames(); w.draws = d3d9Draws(); w.blocks = guestBlocks(); }
       else if (w.cpu && !w.done && batch >= w.stop) {
         const d = process.cpuUsage(w.cpu);
         w.done = true;
-        console.log(`[cpu-window] batches ${w.start}..${w.stop}: user ${(d.user / 1e6).toFixed(3)}s sys ${(d.system / 1e6).toFixed(3)}s wall ${((performance.now() - w.wall) / 1000).toFixed(3)}s`);
+        console.log(`[cpu-window] batches ${w.start}..${w.stop}: user ${(d.user / 1e6).toFixed(3)}s sys ${(d.system / 1e6).toFixed(3)}s wall ${((performance.now() - w.wall) / 1000).toFixed(3)}s d3d9-presents ${d3d9Frames() - w.d9} draws ${d3d9Draws() - w.draws} blocks ${(guestBlocks() - w.blocks) >>> 0}`);
       }
     }
     if (cpuProf) {
@@ -7873,7 +8503,7 @@ async function main() {
     tickState.callsInBatch = 0;
     waveCallbackRouting.restoreMainWait();
     if (ctx.pumpAudioCompletions) ctx.pumpAudioCompletions();
-    if (ctx.pumpWaveCallbacks) await ctx.pumpWaveCallbacks();
+    if (ctx.pumpWaveCallbacks && (!syncMain || !ctx.waveCallbacksIdle?.())) await ctx.pumpWaveCallbacks();
     // --control: give the event loop a turn every batch so the control
     // server's socket callbacks fire and settled replies flush. Without this
     // the loop is synchronous end to end — the same mechanism that keeps
@@ -7885,17 +8515,23 @@ async function main() {
       await new Promise(resolve => setImmediate(resolve));
     }
     if (control) {
+      if (cliObservation) cliObservation.finishBatch();
       finishPreviousControlBatch();
       await new Promise(resolve => setImmediate(resolve));
       liveLogsStart = logs.length;
       await waitForControlBatch();
       if (stopped) break;
+      if (cliObservation) cliObservation.enterBatch();
     }
     batchesRun = batch + 1;
     let injectedInputThisBatch = false;
     // Inject scheduled input events at the right batch
     while (scheduledInput.length && scheduledInput[0].batch <= batch) {
       const ev = scheduledInput.shift();
+      if (ev.guardedTicket) {
+        guardedInput.consume(ev.guardedTicket, applyGuardedInput);
+        continue;
+      }
       diagnosticActionSequence++;
       inputConsumptionTrace.schedule(ev);
       injectedInputThisBatch = true;
@@ -10107,6 +10743,7 @@ async function main() {
         logs.push(`[input] ime-commit text=${JSON.stringify(ev.text)} at batch ${batch}`);
       } else if (ev.action === 'keydown' && renderer && renderer.handleKeyDown) {
         renderer.handleKeyDown(ev.code);
+        if (ev.charCode !== undefined) renderer.handleKeyPress(ev.charCode);
         logs.push(`[input] keydown vk=${ev.code} at batch ${batch}`);
       } else if (ev.action === 'keyup' && renderer && renderer.handleKeyUp) {
         renderer.handleKeyUp(ev.code);
@@ -10614,6 +11251,7 @@ async function main() {
       continue;
     }
 
+    if (GPS_TEX_DIAG && batch === 0 && instance.exports.gps_tex_diag) instance.exports.gps_tex_diag(1);
     // WASM-level breakpoint: set once
     if (breakAddrs.length === 1 && batch === 0 && instance.exports.set_bp) {
       instance.exports.set_bp(breakAddrs[0]);
@@ -10719,11 +11357,10 @@ async function main() {
         const ms = Math.max(0, Math.ceil(threadManager.mainSleepRemaining()));
         if (ms > 0) await new Promise(r => setTimeout(r, ms));
       }
-      await awaitMainRenderPark();
       // An external event can change only while real time passes. Park the
       // host asynchronously between probes; runnable guest siblings still
       // receive their ordinary slices below, and main's guest frame stays put.
-      if (threadManager.isMainNamedEventWaiting()) {
+      if (threadManager.isMainNamedEventWaiting() || threadManager.isMainNativeProcessWaiting()) {
         await new Promise(resolve => setTimeout(resolve, 4));
       }
       // A main thread parked in GetMessage is otherwise resumed only by the
@@ -10737,21 +11374,27 @@ async function main() {
       // first: the [input] markers are buffered, and output the guest prints
       // directly (--trace-host) while handling that input must follow them.
       flushLogs();
-      if (instance.exports.get_yield_reason && instance.exports.get_yield_reason() === 7) {
-        threadManager.checkMainYield();
+      if (syncMain) {
+        if (mainOwner.call('get_yield_reason') === 7) threadManager.checkMainMessageWaitLocal(mainOwner);
+      } else if (await mainOwner.call('get_yield_reason') === 7) {
+        await threadManager.checkMainMessageWaitOwned(mainOwner);
       }
-      if (!mainExecutionSuspended('ordinary')) {
+      if (syncMain ? !mainExecutionSuspendedSync() : !await mainExecutionSuspended('ordinary')) {
+        if (stopped) break;
         try {
-        if (mainSchedulerObserver) mainSchedulerObserver.run('ordinary', () => instance.exports.run(BATCH_SIZE));
-        else instance.exports.run(BATCH_SIZE);
+        const slice = syncMain ? mainOwner.run(BATCH_SIZE) : mainSchedulerObserver
+          ? await mainSchedulerObserver.run('ordinary', () => mainOwner.run(BATCH_SIZE))
+          : await mainOwner.run(BATCH_SIZE);
+        if (mainOwner.kind === 'local' && ctx.exports.get_yield_reason() === 23)
+          await ctx.comInterfaces.service();
+        if (mainOwner.kind === 'worker') await threadManager.noteMainSleepOwned(mainOwner, slice);
         } catch (error) {
           if (!nativeFault.capture(error, instance.exports,
             { schedulerSlot: 0, main: true }, 'ordinary')) throw error;
         }
-        await nativeFault.wait();
+        if (nativeFault.isHeld()) await nativeFault.wait();
         if (stopped) break;
       }
-      else if (instance.exports.get_yield_reason() === 16) renderParkStats.skippedBatches++;
     } catch (e) {
       flushLogs();
       console.log(`\n*** CRASH at batch ${batch}: ${e.message}`);
@@ -11003,89 +11646,14 @@ async function main() {
     // for a chunk the host has not read yet. ReadFile parked with its stdcall
     // frame restored and EIP on the thunk, so filling the chunk and clearing
     // the yield re-enters the same call, which then takes the cache hit.
-    if (instance.exports.get_yield_reason() === 12) {
-      const pending = ctx.vfs && ctx.vfs.getPendingRead(1);
-      if (TRACE_YIELD) {
-        console.log(`[yield] T0 reason=12 (io_wait) ` +
-          (pending ? `path=${pending.path} off=${pending.offset} len=${pending.length}` : 'no pending record'));
-      }
-      if (pending) {
-        // Fail loudly rather than spinning: a provider that cannot deliver is
-        // a mount bug, and a silent retry loop would look like a hang.
-        await ctx.vfs.fillPendingRead(pending);
-        // The VFS owns identity-guarded completion. A worker may have installed
-        // a newer pending request while the main guest awaited this fill.
-      }
-      instance.exports.clear_yield();
-    }
-    if (instance.exports.get_yield_reason() === 16) mainExecutionSuspended();
+    // Fast path: both helpers begin by reading the yield and return false for
+    // any other reason; read it here and await only when one will act.
+    if (!syncMain || mainOwner.call('get_yield_reason') === 12)
+      await serviceMainIoWait(mainOwner, ctx.vfs, TRACE_YIELD ? console.log : null);
 
-    // Handle the vertical-blank yield (yield_reason=13). A DirectDraw call
-    // parked with its stdcall frame intact and EIP on the thunk, so advancing
-    // the clock past the boundary and clearing the yield re-enters the same
-    // call, which then finds the vblank has happened and returns DD_OK.
-    if (!serviceClock && instance.exports.get_yield_reason() === 13) {
-      const deadline = instance.exports.get_vblank_deadline_ms
-        ? instance.exports.get_vblank_deadline_ms() >>> 0 : 0;
-      // Charge against the batch BASE, not the last value handed out: the
-      // per-call step inside a batch is capped at the next base, so lifting
-      // only the last tick can leave the base short and re-park forever.
-      // +1 so the boundary is strictly passed rather than exactly met.
-      const owed = ((deadline + 1) - batchClock.batchTicks()) | 0;
-      if (owed > 0) {
-        tickState.pausedMs += owed;
-        VBLANK.guestMsAdded += owed;
-      }
-      VBLANK.waits++;
-      if (TRACE_YIELD) {
-        console.log(`[yield] T0 reason=13 (vblank_wait) due=${deadline} ` +
-          `now=${tickState.lastTick} charged=${Math.max(0, owed)}ms`);
-      }
-      instance.exports.clear_yield();
-    }
-
-    // Handle the spin parks (yield_reason 14 = clock, 15 = empty PeekMessage).
-    // Both parked with the stdcall frame intact and EIP on the thunk, so
-    // clearing the yield re-enters the same call.
-    //
-    // WHAT IS DELIBERATELY *NOT* DONE HERE: guest time is not charged by
-    // default. The headless clock already advances TICK_MS_PER_BATCH per batch
-    // and a park ends its batch, so the very next batch hands the guest a new
-    // millisecond -- the wait resolves on the schedule the run asked for, and
-    // the clock is left exactly as --tick-ms-per-batch defined it. Charging
-    // the way the vblank park does would be a real distortion here rather than
-    // a correction: a vblank deadline is ~17ms away and needs the lift, while
-    // a clock park's deadline is the NEXT MILLISECOND, which at
-    // --tick-ms-per-batch=1 is already where the next batch lands. Paying it
-    // anyway would run the guest clock at two to three times the requested
-    // rate and silently rewrite every GetTickCount-delta the app computes --
-    // exactly the kind of perturbation that would move GTA2's
-    // GetTickCount/Sleep/GetTickCount startup probe.
-    //
-    // The one case that does need a lift is a run with no batch step at all
-    // (--tick-ms-per-batch=0), where nothing else would ever move the clock.
-    {
-      const spinYield = instance.exports.get_yield_reason();
-      // An empty PeekMessage has no clock deadline. Re-enter it under both
-      // clocks so newly queued input can reach the handler.
-      if (spinYield === 15 || (!serviceClock && spinYield === 14)) {
-        const deadline = (spinYield === 14 && instance.exports.get_spin_deadline_ms)
-          ? instance.exports.get_spin_deadline_ms() >>> 0 : 0;
-        let owed = 0;
-        if (spinYield === 14 && batchClock.getTickMsPerBatch() <= 0) {
-          owed = ((deadline + 1) - batchClock.batchTicks()) | 0;
-          if (owed > 0) tickState.pausedMs += owed; else owed = 0;
-        }
-        if (spinYield === 14) SPIN_PARK.clockWaits++; else SPIN_PARK.peekWaits++;
-        SPIN_PARK.guestMsAdded += owed;
-        if (TRACE_YIELD) {
-          console.log(`[yield] T0 reason=${spinYield} `
-            + `(${spinYield === 14 ? 'clock_spin' : 'peek_spin'}) due=${deadline} `
-            + `now=${tickState.lastTick} charged=${owed}ms`);
-        }
-        instance.exports.clear_yield();
-      }
-    }
+    if (!syncMain || [13, 14, 15].includes(mainOwner.call('get_yield_reason')))
+      await serviceMainTimingWait(mainOwner, {batchClock, tickState, serviceClock,
+        vblank: VBLANK, spin: SPIN_PARK, trace: TRACE_YIELD ? console.log : null});
 
     // Handle the virtual LAN net_wait yield (yield_reason=8). The guest is
     // parked inside a blocking socket call with EIP still on the thunk, so
@@ -11219,20 +11787,26 @@ async function main() {
         // --threads-serial means nothing runs beside a guest thread, main
         // included, or the switch would not answer the question it exists for.
         if (THREADS_SERIAL) await workerSlices;
-        else if (s < THREAD_SLICES - 1 && !stopped && !mainExecutionSuspended('worker-interleaved')) {
+        else if (s < THREAD_SLICES - 1 && !stopped && (syncMain
+            ? !mainExecutionSuspendedSync() : !await mainExecutionSuspended('worker-interleaved'))) {
+          if (stopped) break;
           // Main keeps running WHILE they do — the CLI's version of host.js
           // awaiting the main slice and the thread slices together.
           try {
             try {
-            if (mainSchedulerObserver) mainSchedulerObserver.run('worker-interleaved', () => instance.exports.run(BATCH_SIZE));
-            else instance.exports.run(BATCH_SIZE);
+            const slice = syncMain ? mainOwner.run(BATCH_SIZE) : mainSchedulerObserver
+              ? await mainSchedulerObserver.run('worker-interleaved', () => mainOwner.run(BATCH_SIZE))
+              : await mainOwner.run(BATCH_SIZE);
+            if (mainOwner.kind === 'local' && ctx.exports.get_yield_reason() === 23)
+              await ctx.comInterfaces.service();
+            if (mainOwner.kind === 'worker') await threadManager.noteMainSleepOwned(mainOwner, slice);
             } catch (error) {
               if (!nativeFault.capture(error, instance.exports,
                 { schedulerSlot: 0, main: true }, 'worker-interleaved')) throw error;
             }
-            await nativeFault.wait();
+            if (nativeFault.isHeld()) await nativeFault.wait();
             if (stopped) break;
-          } catch (e) { /* reported below */ }
+          } catch (e) { throw e; /* never continue a guest whose handler unwound */ }
         }
         ran = await workerSlices;
         if (!ran || stopped || !threadManager.hasActiveThreads()) break;
@@ -11270,7 +11844,8 @@ async function main() {
       const workerStartMs = TRACE_BATCH_TIMING ? Date.now() : 0;
       for (let s = 0; s < slices; s++) {
         const sliceStats = threadManager.runSlice(BATCH_SIZE);
-        await nativeFault.wait();
+        if (d3dimExecutionOwner) await d3dimExecutionOwner.turn();
+        if (nativeFault.isHeld()) await nativeFault.wait();
         if (stopped) break;
         if (sliceStats && sliceStats.steps) workerStepsTotal += sliceStats.steps;
         // Re-run main between live worker slices so producer/consumer pairs
@@ -11278,18 +11853,30 @@ async function main() {
         // loop; repeatedly re-entering the main message pump here can drain
         // creation-time paints before an app has finished its first layout.
         if (s < slices - 1 && !stopped && threadManager.hasActiveThreads() &&
-            !mainExecutionSuspended('cooperative-interleaved')) {
+            (syncMain ? !mainExecutionSuspendedSync() : !await mainExecutionSuspended('cooperative-interleaved'))) {
+          if (stopped) break;
           try {
             try {
-            if (mainSchedulerObserver) mainSchedulerObserver.run('cooperative-interleaved', () => instance.exports.run(BATCH_SIZE));
-            else instance.exports.run(BATCH_SIZE);
+            const slice = syncMain ? mainOwner.run(BATCH_SIZE) : mainSchedulerObserver
+              ? await mainSchedulerObserver.run('cooperative-interleaved', () => mainOwner.run(BATCH_SIZE))
+              : await mainOwner.run(BATCH_SIZE);
+            if (mainOwner.kind === 'local' && ctx.exports.get_yield_reason() === 23)
+              await ctx.comInterfaces.service();
+            if (mainOwner.kind === 'worker') await threadManager.noteMainSleepOwned(mainOwner, slice);
             } catch (error) {
               if (!nativeFault.capture(error, instance.exports,
                 { schedulerSlot: 0, main: true }, 'cooperative-interleaved')) throw error;
             }
-            await nativeFault.wait();
+            if (nativeFault.isHeld()) await nativeFault.wait();
             if (stopped) break;
-          } catch (e) { break; }
+          } catch (e) {
+            // Never swallow a host error thrown through the guest: the wasm
+            // stack unwound mid-handler, so its stdcall frame was never
+            // popped and EIP sits at the block entry. Continuing re-ran the
+            // block on the unpopped frame (Diablo II's D3D draw, later "AV at
+            // EIP 0x100").
+            throw e;
+          }
         }
       }
       if (TRACE_BATCH_TIMING) {
@@ -11346,10 +11933,6 @@ async function main() {
         await new Promise(resolve => setImmediate(resolve));
       }
     }
-    // Render worker replies also require a real event-loop turn; Promise-only
-    // CLI batches starve message delivery even though their guest is parked.
-    if (ctx.d3d9Bridge && ctx.d3d9Bridge.requests.size)
-      await new Promise(resolve => setImmediate(resolve));
     // A parked socket call is not the only way to be waiting on the wire. An
     // app using WSAAsyncSelect never blocks in winsock at all: it sits in its
     // message pump expecting to be told, so nothing above would ever yield and
@@ -11362,7 +11945,10 @@ async function main() {
     // The same for a --spawn-processes child: its end (and the merge of what
     // it left behind) arrives as a child-process event, so a parent parked in
     // WaitForSingleObject on it would otherwise spin until its own run ended.
-    else if ((batch & 63) === 0 && ctx.hasLiveChildren && ctx.hasLiveChildren()) {
+    // The child also owes its parent a turn for termination signals and IPC,
+    // even when it has no children, wire or asynchronous render requests.
+    else if ((batch & 63) === 0 && (SPAWNED_CHILD ||
+        (ctx.hasLiveChildren && ctx.hasLiveChildren()))) {
       await new Promise(resolve => setImmediate(resolve));
     }
     if (AUDIO_EXIT_BYTES > 0 && ctx._audioOutFd !== undefined) {
@@ -11401,9 +11987,31 @@ async function main() {
         if (ctx.pumpAudioCompletions) ctx.pumpAudioCompletions();
       }
     }
+    // A queued press held behind the renderer's hover floor (takeInput) is a
+    // deadline of its own. A main thread parked in GetMessage re-polls once
+    // per batch, retiring a few blocks, so the idle rule above never sees it
+    // idle and the service clock creeps ~1ms a batch toward the 30ms floor --
+    // RegEdit on WAT common controls sat on a click for the whole run. While
+    // the guest is only waiting for messages, let that time pass at once.
+    // Yield 7 is GetMessage's empty-poll park (1, a blocking wait); the idle
+    // rule above sees the held input as a pending message and returns 0.
+    const parkedReason = instance.exports.get_yield_reason();
+    if (serviceClock && renderer && renderer.inputHoldDeadlineMs &&
+        (parkedReason === 7 || parkedReason === 1)) {
+      const now = batchClock.batchTicks();
+      const inputDue = renderer.inputHoldDeadlineMs();
+      if (Number.isFinite(inputDue) && inputDue > now)
+        batchClock.advanceIdle(Math.ceil(inputDue) - now);
+    }
     // Check if main thread is waiting on an event
-    await threadManager.resolveMainThreadSend();
-    if (threadManager.checkMainYield()) {
+    // resolveMainThreadSend() returns false at once without a Worker backend.
+    if (!syncMain || threadManager.workerBackend) await threadManager.resolveMainThreadSend();
+    if (syncMain) {
+      if (mainOwner.call('get_yield_reason') === 7) threadManager.checkMainMessageWaitLocal(mainOwner);
+      else threadManager.checkMainYield();
+    } else if (await mainOwner.call('get_yield_reason') === 7
+        ? await threadManager.checkMainMessageWaitOwned(mainOwner)
+        : threadManager.checkMainYield()) {
       // Main thread still waiting — don't advance EIP check
     }
 
@@ -11512,12 +12120,6 @@ if (VERBOSE) {
       } else if (threadManager.isMainNamedEventWaiting()) {
         // An owned finite authority continuation is intentional inactivity.
         stuckCount = 0;
-      } else if (ex.get_yield_reason() === 16 && ctx.d3d9Bridge &&
-          ctx.d3d9Bridge.requests.has(ex.get_d3d_render_token() | 0)) {
-        // The render worker owns a live continuation. An unchanged guest CPU
-        // while it runs is intentional; normal wall deadlines still apply.
-        // Do not exempt an orphaned yield with no corresponding request.
-        stuckCount = 0;
       } else if (ex.win16_pump_parked && ex.win16_pump_parked()) {
         // A 16-bit modal dialog or message box with no message to handle waits
         // on a continuation slot with every register unchanged. That is the
@@ -11576,20 +12178,53 @@ if (VERBOSE) {
     if (!w.cpu || w.done) continue;
     const d = process.cpuUsage(w.cpu);
     w.done = true;
-    console.log(`[cpu-window] batches ${w.start}..run end (asked ${w.stop}): user ${(d.user / 1e6).toFixed(3)}s sys ${(d.system / 1e6).toFixed(3)}s wall ${((performance.now() - w.wall) / 1000).toFixed(3)}s`);
+    console.log(`[cpu-window] batches ${w.start}..run end (asked ${w.stop}): user ${(d.user / 1e6).toFixed(3)}s sys ${(d.system / 1e6).toFixed(3)}s wall ${((performance.now() - w.wall) / 1000).toFixed(3)}s d3d9-presents ${d3d9Frames() - w.d9} draws ${d3d9Draws() - w.draws} blocks ${(guestBlocks() - w.blocks) >>> 0}`);
   }
   // The control server would otherwise hold the process open; unref lets a
   // reply resolved in the final batch still flush while the exit path prints.
+  await childObservation.drainRelease();
   closeControl();
   if (cpuProf && cpuProf.session) await cpuProf.stop(MAX_BATCHES);
-  if (ctx.d3dCommands && D3DIM_GPU) {
-    const d = ctx.d3dCommands.snapshot();
-    console.log(`[d3dim-gpu] draws=${d.draws} triangles=${d.triangles} clears=${d.clears} ` +
-      `fallbacks=${d.fallbacks} errors=${d.errors} fences=${d.fences} syncs=${d.syncs} ` +
-      `uploads=${d.uploads} uploadRows=${d.uploadRows} textureUploads=${d.textureUploads} drawMs=${d.drawMs.toFixed(1)} ` +
-      `syncMs=${d.syncMs.toFixed(1)} uploadMs=${d.uploadMs.toFixed(1)} textureMs=${d.textureMs.toFixed(1)}`);
-    ctx.d3dCommands.stop();
-    ctx.d3dCommands = null;
+  // Shared GPU-stream accounting, same indices for every API (gps_stat).
+  if (instance.exports.gps_stat) {
+    const GPS_APIS = { 1: 'glide', 2: 'd3dim', 3: 'gl', 4: 'd3d9' };
+    const SHARED = ['frames', 'draws', 'readbacks', 'readbackBytes', 'uploads', 'uploadBytes', 'declines', 'syncs'];
+    const DIAG = { 16: 'fills', 17: 'distinctPerFrameSum', 18: 'evictUsedThisFrame', 19: 'dropRelease', 20: 'dropEvict',
+      21: 'dropWrite', 22: 'dropPalette', 23: 'dropDescriptor', 24: 'dropUntracked', 25: 'repeatRelease',
+      26: 'repeatEvict', 27: 'repeatWrite', 28: 'repeatPalette', 29: 'repeatDescriptor', 30: 'repeatUntracked',
+      31: 'repeatLive' };
+    for (const [api, name] of Object.entries(GPS_APIS)) {
+      const st = i => instance.exports.gps_stat(Number(api), i) >>> 0;
+      if (![0, 1, 2, 4].some(i => st(i))) continue;
+      const f = st(0), per = n => f ? (n / f).toFixed(2) : 'n/a';
+      console.log(`[gps] ${name} ${SHARED.map((n, i) => `${n}=${st(i)}`).join(' ')}` +
+        ` readbacks/frame=${per(st(2))} uploads/frame=${per(st(4))}`
+        + (st(8) ? ` lazy armed=${st(8)} touched=${st(9)} untouched=${st(10)} overwritten=${st(11)}` : ''));
+      if (GPS_TEX_DIAG) console.log(`[gps] ${name} tex-diag ` +
+        Object.entries(DIAG).map(([i, n]) => `${n}=${st(Number(i))}`).join(' '));
+    }
+  }
+  // Once D3DIM opened its ring (an app that never drew prints nothing).
+  if (instance.exports.d3dim_gps_stat
+      && [0, 6, 7, 9, 10, 13].some(i => instance.exports.d3dim_gps_stat(i))) {
+    const st = i => instance.exports.d3dim_gps_stat(i) >>> 0;
+    const names = ['draws', 'fallbacks', 'readbacks', 'readbackRows', 'uploads', 'uploadRows', 'presents',
+      'syncs', 'textureUploads', 'clears', 'flips', 'bltPresents', 'points', 'fences', 'declined', 'primitives'];
+    console.log('[d3dim-gps] ' + names.map((n, i) => `${n}=${st(i)}`).join(' '));
+    // Readbacks by CPU-access site (src/09abg-d3dim-gps.wat d3dim_gps_stat).
+    const sites = ['global', 'getDC', 'bltSrc', 'bltDst', 'lock', 'texLoad', 'swDraw', 'release', 'cpuPresent',
+      'parkLand', 'prepare', 'texFromRT', 'retarget', 'capture', 'lazy', 'other'];
+    console.log('[d3dim-gps] readback sites ' + sites.map((n, i) => `${n}=${st(16 + i)}`).join(' ')
+      + ` gpuBltFastKeyed=${st(32)} gpuBltFastUpload=${st(33)} readbackBytes=${st(34)}`
+      + ` lazyLocks armed=${instance.exports.get_d3dim_lazy_armed?.() ?? 0}`
+      + ` touched=${instance.exports.get_d3dim_lazy_touched?.() ?? 0}`
+      + ` untouched=${instance.exports.get_d3dim_lazy_untouched?.() ?? 0}`
+      + ` overwritten=${st(43)} texEdgeVerified=${st(44)} getDCDeferred=${st(45)}`);
+    // Software declines by reason ($d3g_decline).
+    const why = ['stageArg', 'texture', 'zfunc', 'blendFactor', 'noDepth', 'clearTarget', 'clearBackground'];
+    console.log('[d3dim-gps] decline reasons ' + why.map((n, i) => `${n}=${st(35 + i)}`).join(' '));
+    const bridge = ctx.getD3dimBridge && ctx.getD3dimBridge();
+    if (bridge && bridge.stats) console.log('[d3dim-gps] bridge ' + JSON.stringify(bridge.stats));
   }
   if (ctx.d3dCommands) {
     ctx.d3dCommands.fence();
@@ -11927,11 +12562,6 @@ if (VERBOSE) {
 
   console.log(`\nStats: ${apiTotal()} API calls, ${batchesRun} batches`
     + ` in ${executionElapsedSeconds.toFixed(3)}s (${(batchesRun / Math.max(executionElapsedSeconds,0.001)).toFixed(0)} batches/s)`);
-  if (renderParkStats.waits || renderParkStats.skippedBatches)
-    console.log(`render park: main waited on ${renderParkStats.waits} software D3D requests `
-      + `(${renderParkStats.wallMs}ms wall), ${renderParkStats.skippedBatches} batches skipped while parked`);
-  renderWaitAttribution?.close(deadlineMs && Date.now() > deadlineMs ? 'deadline' : 'stopped');
-  if (renderWaitAttribution?.stats.requests) console.log(renderWaitAttribution.summary());
   if (PRESENT_CAP && instance.exports.get_present_paced_count) {
     console.log(`present pacing (main instance): cap ${PRESENT_CAP}/s ${PRESENT_PACE_MODE ? 'smooth' : 'deadline'}, `
       + `${instance.exports.get_present_paced_count()} frames slept `
@@ -11944,6 +12574,7 @@ if (VERBOSE) {
   reportPresentFrames();
   reportMmx();
   reportGuestPageStats();
+  if (apiThreadCensus) console.log(apiThreadCensus.report());
 
   // --reg-export writes what the run left in the registry/INI store, which is
   // what a browser tab would have kept in localStorage. Feed it back with
@@ -12356,7 +12987,6 @@ if (VERBOSE) {
       console.log(`  ${String(c.count).padStart(pad)}  T${c.slot}  ${c.name}`);
     }
   }
-
   if (apiCounts) {
     const sorted = [...apiCounts.entries()].sort((a, b) => b[1] - a[1]);
     const shown = sorted.slice(0, API_COUNTS_TOP);
@@ -12738,55 +13368,14 @@ if (VERBOSE) {
   }
 
   if (GL_CENSUS) {
-    // Which GL entry points did this app really use? The counters are
-    // load-immune, so this is readable on a busy box where no timing is.
-    const GLCompat = require('../lib/gl-compat');
-    const stats = GLCompat.stats;
-    const ops = stats.ops;
-    const names = GLCompat.OP_NAMES || GLCompat.CALLS;
-    const seen = [];
-    for (let i = 0; i < ops.length; i++) {
-      if (ops[i]) seen.push([names[i] || `op${i}`, ops[i], i]);
-    }
-    seen.sort((a, b) => b[1] - a[1]);
-    const total = seen.reduce((n, entry) => n + entry[1], 0);
-    console.log(`[gl-census] ${seen.length} distinct GL entry point(s), ${total} call(s)`);
-    for (const [name, count, index] of seen) {
-      console.log(`  ${String(count).padStart(10)}  ${name} (#${index})`);
-    }
-    // Geometry does NOT show up as glBegin/glVertex in the list above once the
-    // encoder packs a span: it arrives as one packed-draw record carrying many
-    // vertices. Print the executor's own counters beside the histogram so a
-    // run that draws plenty can never read as a run that draws nothing.
-    console.log(`[gl-census] packed spans enqueued=${stats.enqueued} draws=${stats.draws}` +
-      ` vertices=${stats.drawVertices} presents=${stats.presents}` +
-      ` frontFlushes=${stats.frontFlushes}`);
-    // The families src/09a8f-gl-matrix.wat cannot mirror yet. A zero here is
-    // what licenses a consumer to trust the WAT state for THIS app; it is not
-    // a general claim, which is exactly why it is printed per run.
-    // This list is EMPTY for the first time: gluPerspective/gluLookAt/
-    // gluOrtho2D, then glPushAttrib/glPopAttrib, all grew mirrors. It is kept
-    // rather than deleted because it is the shape the next gap gets reported
-    // in, and because an empty list and a missing check print differently
-    // below.
-    //
-    // With nothing in it the latch beside it is the only reading that can
-    // move, and it still can: the mirror caps the attribute stack at GL's
-    // required minimum of 16 and latches on a deeper push, because a dropped
-    // push leaves every later pop restoring the wrong nesting level.
-    const UNMIRRORED = [];
-    const used = UNMIRRORED.filter(name => {
-      const index = GLCompat.CALL_INDEX[name];
-      return index !== undefined && ops[index];
-    });
-    // The WAT mirror's own verdict, which is the one that counts: the JS list
-    // above says what was called, this says whether the mirror noticed. They
-    // are printed together because a disagreement is itself the finding.
+    // WAT's own readings: the GL mirror's untrusted latch and the software
+    // rasterizer's counters. (The JS per-entry-point histogram went with the
+    // JS GL transport; --host-census / --trace-api count calls.)
+    const GLCalls = require('../lib/gl-command-stream').CALLS;
     const latched = instance.exports.gl_mtx_untrusted
       ? instance.exports.gl_mtx_untrusted() | 0 : -1;
-    const latchedName = latched > 0 ? (GLCompat.CALLS[latched] || `op${latched}`) : '';
-    console.log(`[gl-census] unmirrored families used: ${used.length ? used.join(', ') : 'none'}` +
-      `; WAT untrusted latch: ${latched < 0 ? 'export missing'
+    const latchedName = latched > 0 ? (GLCalls[latched] || `op${latched}`) : '';
+    console.log(`[gl-census] WAT untrusted latch: ${latched < 0 ? 'export missing'
         : latched === 0 ? 'clear' : `${latchedName} (#${latched})`}`);
     // The WAT software rasterizer (src/09a8g-gl-raster.wat): what it drew and
     // what it had to drop for want of near-plane clipping, so a black frame
@@ -12813,8 +13402,81 @@ if (VERBOSE) {
         (sw.gl_sw_bitmap && sw.gl_sw_bitmap() ? ` bitmap=0x${(sw.gl_sw_bitmap() >>> 0).toString(16)}` : ''));
     }
   }
+  // Glide on GPU stream v2 (src/09a8h-glide.wat glide_gps_stat): counters,
+  // then LFB requests by site as requests/readbacks. Only once a ring drew,
+  // presented or served an LFB request.
+  if (instance.exports.glide_gps_stat
+      && [0, 1, 2, 16, 17, 18, 19, 20].some(i => instance.exports.glide_gps_stat(i))) {
+    const st = i => instance.exports.glide_gps_stat(i) >>> 0;
+    const names = ['presents', 'draws', 'clears', 'readbacks', 'readback-rows', 'rt-uploads',
+      'rt-upload-rows', 'tex-uploads', 'syncs', 'lfb-refused', 'lfb-no-readback', 'lfb-swapped'];
+    const sites = ['lockRead', 'lockWrite', 'readRegion', 'writeRegion', 'writeRegion3'];
+    const perFrame = n => st(0) ? (n / st(0)).toFixed(2) : 'n/a';
+    console.log(`[glide-gps] ${names.map((n, i) => `${n}=${st(i)}`).join(' ')}` +
+      ` readbacks/frame=${perFrame(st(3))} rt-uploads/frame=${perFrame(st(5))}` +
+      ` tex-uploads/frame=${perFrame(st(7))}`);
+    console.log('[glide-gps] lfb requests/readbacks by site ' +
+      sites.map((n, i) => `${n}=${st(16 + i)}/${st(24 + i)}`).join(' '));
+  }
+  // The last Glide frame the executor presented (a CLI --png does not
+  // composite the Glide layer): its hash compares runs across builds.
+  const glideCanvas = ctx.glideBridge && ctx.glideBridge.layer && ctx.glideBridge.layer.canvas;
+  const glideFrame = glideCanvas && glideCanvas.getContext && glideCanvas.getContext('2d');
+  if (glideFrame && glideCanvas.width && glideCanvas.height) {
+    const px = glideFrame.getImageData(0, 0, glideCanvas.width, glideCanvas.height).data;
+    console.log(`[glide-gps] last-frame ${glideCanvas.width}x${glideCanvas.height} presents=` +
+      `${ctx.glideBridge.stats.presents} sha256=` +
+      require('node:crypto').createHash('sha256').update(px).digest('hex'));
+  }
+  // Only a run that opened the GL ring (glg_mem: gl_gps_stat answers 0
+  // before it) has anything to report.
+  if (GL_GPS && (instance.exports.gl_gps_stat(4) || instance.exports.gl_gps_stat(0)
+      || instance.exports.gl_gps_stat(3) || instance.exports.gl_gps_stat(14))) {
+    // src/09a8gt-gl-gps.wat gl_gps_stat: counters, decline reasons 16+r,
+    // readback sites 48+s.
+    const st = i => instance.exports.gl_gps_stat(i) >>> 0;
+    const names = ['draws', 'tris', 'span-quads', 'clears', 'presents', 'readbacks', 'readback-rows',
+      'rt-uploads', 'rt-upload-rows', 'tex-uploads', 'gpu-frames', 'sw-frames', 'syncs', 'tex-hits',
+      'declines', 'declined-frames'];
+    const reasons = [];
+    for (let r = 1; r < 32; r++) if (st(16 + r)) reasons.push(`${r}:${st(16 + r)}`);
+    const sites = [];
+    for (let s = 0; s < 16; s++) if (st(48 + s)) sites.push(`${s}:${st(48 + s)}`);
+    console.log(`[gl-gps] ${names.map((n, i) => `${n}=${st(i)}`).join(' ')}` +
+      ` decline-reasons=${reasons.join(',') || 'none'} readback-sites=${sites.join(',') || 'none'}` +
+      ` front-presents=${st(64)} cpu-stencil-pixels=${st(65)} canon-declines=${st(66)}` +
+      ` mip-chains=${st(72)} mip-level-uploads=${st(73)} mip-chain-hits=${st(74)} mip-incomplete=${st(75)} mip-log-overruns=${st(76)}` +
+      ` active=${instance.exports.gl_gps_active()}`);
+  }
+  if (instance.exports.d3d9_gps_stat && instance.exports.d3d9_gps_stat(14)) {
+    // src/09akg-d3d9-gps.wat d3d9_gps_stat: counters, decline reasons 16+r,
+    // readback sites 48+s (0 lock, 1 getdc, 2 rtdata, 3 capture). The old JS
+    // path's counters (5 old-frames, 13 old-fail, 64+ old-present, 79-81
+    // handovers) went with it; '' keeps the numbering and is not printed.
+    const st = i => instance.exports.d3d9_gps_stat(i) >>> 0;
+    const names = ['draws', 'prims', 'clears', 'presents', 'gpu-frames', '', 'readbacks',
+      'rt-uploads', 'tex-uploads', 'tex-hits', 'shaders', 'syncs', 'declines', '', 'opens', 'dead'];
+    const reasons = [];
+    for (let r = 1; r < 32; r++) if (st(16 + r)) reasons.push(`${r}:${st(16 + r)}`);
+    const sites = [];
+    for (let s = 0; s < 16; s++) if (st(48 + s)) sites.push(`${s}:${st(48 + s)}`);
+    console.log(`[d3d9-gps] ${names.map((n, i) => n && `${n}=${st(i)}`).filter(Boolean).join(' ')}` +
+      ` decline-reasons=${reasons.join(',') || 'none'} readback-sites=${sites.join(',') || 'none'}` +
+      ` buffer-draws=${st(74)} buffer-uploads=${st(72)} buffer-hits=${st(73)}` +
+      ` lock-current=${st(76)} lock-fills=${st(77)} uploads-folded=${st(78)}` +
+      ` active=${instance.exports.d3d9_gps_active()}`);
+  }
 
   if (PNG_OUT && renderer) {
+    // GPU stream D3DIM presents without reading back: land every GPU target
+    // in its DIB before reading surfaces out of memory.
+    if (instance.exports.d3dim_gps_sync_all) instance.exports.d3dim_gps_sync_all();
+    if (GL_GPS) instance.exports.gl_gps_sync_front();
+    if (instance.exports.d3d9_gps_stat && instance.exports.d3d9_gps_stat(14)) {
+      instance.exports.d3d9_gps_sync_front();
+      const st = i => instance.exports.d3d9_gps_stat(i) >>> 0;
+      console.log(`[d3d9-gps] capture: executor-readback=${st(51)} placed-present-kept=${st(70)}`);
+    }
     const { mem, surfaces } = getDxSurfaceManifest();
     const wantSlot = DX_SLOT === null ? null : (parseInt(DX_SLOT, 10) | 0);
     // Software GL drawing into a PFD_DRAW_TO_BITMAP DIB leaves only helper
@@ -12831,7 +13493,11 @@ if (VERBOSE) {
       && ex.gl_sw_front()) ? (ex.gl_sw_slot() | 0) : null;
     const glFront = glFrontSlot === null ? null
       : (surfaces.find(s => s.slot === glFrontSlot) || null);
-    const surface = (PNG_CANVAS || (glBitmapOnly && wantSlot === null)) ? null
+    // A windowed D3D8/9 Present that moved, cropped or stretched its source
+    // (GameMaker 7 aspect-fits a 448x448 room into a 640x480 client) leaves
+    // the back buffer unlike the window: capture the screen, not the DIB.
+    const d3dPlaced = wantSlot === null && !!(ex.d3d9_gps_present_placed && ex.d3d9_gps_present_placed());
+    const surface = (PNG_CANVAS || d3dPlaced || (glBitmapOnly && wantSlot === null)) ? null
       : (wantSlot === null ? (glFront || chooseDxPresentationSurface(surfaces, mem))
         : (surfaces.find(s => s.slot === wantSlot) || null));
     if (wantSlot !== null && !surface) {
@@ -13002,19 +13668,35 @@ if (VERBOSE) {
   processDesktop.retire();
   // The launcher guest can exit while real child hosts still use its desktop.
   // Keep the authority until those OS processes close their transports.
-  await Promise.all(pipeChildren.filter(c => c.exitCode === null && c.signalCode === null)
-    .map(c => new Promise(resolve => c.once('exit', resolve))));
+  if (!hostExitRequested || terminationSignal) {
+    for (const rec of livePipeChildren) { rec.terminationCode = 1; rec.child.kill(); }
+  }
+  await Promise.all(pipeChildClosures);
+  if (CHILD_MEMORY) {
+    if (!terminationSignal && hostExitRequested && !memoryInput.error) {
+      const snapshot = memoryChild.capture(ctx.vfs, require('../lib/storage'));
+      await memoryChild.send(process, CHILD_STATE_TOKEN, 'completion', {
+        normalExit: true, exitCode: memoryGuestExitCode,
+        delta: memoryChild.delta(memoryBefore, snapshot),
+      });
+    }
+    memoryInput.dispose();
+  }
   await processDesktop.close();
   // A --vlan-wire run is a forked child, and an open IPC channel keeps node
   // alive after everything else has finished: the run printed its Stats, hit
   // --max-seconds, and then sat resident forever with its 512 MiB guest until
   // the parent killed it. Every two-process test used to kill its seats for
   // exactly this reason. The run is over, so hang up the wire.
-  if (VLAN_WIRE && process.connected) process.disconnect();
+  if ((VLAN_WIRE || SPAWNED_CHILD) && process.connected) process.disconnect();
   });
 }
 
 main().catch(async e => {
+  memoryInput?.dispose();
+  if (CHILD_MEMORY && process.connected) process.disconnect();
+  childObservation?.fail('runner error: '+e.message);
+  recordNativeExit.cancel('runner error');
   process.exitCode = process.exitCode || 1;
   console.error(e);
   // The threads have to be stopped either way

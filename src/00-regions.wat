@@ -171,6 +171,8 @@
     (owner "09c0-window-table.wat:$menu_data_reset_slot"))
   (region.declare $WND_DLG_RECORDS (stride 0x20 (count $MAX_WINDOWS)) (align 0x00000010)
     (owner "01-header.wat:$WND_DLG_RECORDS"))
+  (region.declare $NATIVE_DIALOGBOX_IDENTITIES (size 0x00002000) (align 0x00000010)
+    (owner "13-exports.wat:$native_dialogbox_begin"))
   ;; Four dwords of cross-instance waveOut identity in the 16-byte hole
   ;; between WND_DLG_RECORDS and SCROLL_TABLE. Declared rather than spelled
   ;; (region.end $WND_DLG_RECORDS): it is its own object, and an adjacency is
@@ -270,7 +272,7 @@
   ;; map is the middle of $D3DIM_AUX. Nothing hand-places bytes in here and no
   ;; offset into it is ever written down — that is the entire point. Growing it
   ;; is a one-line edit and the compiler says exactly how many bytes short it is.
-  (region.declare $WATX_STRING_POOL (size 0x00002200) (align 0x00000010)
+  (region.declare $WATX_STRING_POOL (size 0x00002C00) (align 0x00000010)
     (owner "01-header.wat:$WATX_STRING_POOL"))
   (region.declare $DI_DIK_VK_TABLE (size 0x00000100) (align 0x00000100)
     (owner "09a8-handlers-directx.wat:$DI_DIK_VK_TABLE"))
@@ -516,11 +518,16 @@
     (owner "08-pe-loader.wat:$kernel32_ensure_locked"))
   (region.declare $STATIC_SYS_DLL_IMAGES (size 0x00000100) (align 0x00000100)
     (owner "08-pe-loader.wat:$static_sys_dll_ensure_locked"))
+  ;; RT_DIALOG section copied into the builtin COMCTL32 module image.
+  (region.declare $COMCTL32_DIALOG_RSRC (size 0x00000300) (align 0x00000010)
+    (owner "08-pe-loader.wat:$comctl32_install_resources"))
   (region.declare $DLL_SYNTHETIC_REFS (size 0x00000100) (align 0x00000100)
     (owner "09a0-handlers-base.wat:$dll_synthetic_reference"))
   (region.declare $DLL_LIFECYCLE_TABLE (size 0x00001000) (align 0x00000100)
     (stride 0x40 (count $DLL_TABLE_CAPACITY))
     (owner "08b-dll-loader.wat:$dll_lifecycle_row"))
+  (region.declare $COM_DLL_AUTO_ROOTS (size 0x00000300) (align 0x00000100)
+    (owner "09a7b-ole.wat:$com_dll_auto_retain"))
   (region.declare $GDI_BITMAP_TEXT_LAYOUT (size 0x00021000) (align 0x00001000)
     (owner "10b-gdi-font.wat:$GDI_BITMAP_TEXT_LAYOUT"))
   (region.declare $GDI_BITMAP_TEXT_PREFIX (size 0x00011000) (align 0x00001000)
@@ -556,6 +563,9 @@
   (region.declare $GDI_NEAREST_CACHE (size 0x00008000) (align 0x00001000)
     (stride 0x8 (count $GDI_NEAREST_CACHE_SLOTS)) (size-is-power-of-2)
     (owner "10g-gdi-raster.wat:$GDI_NEAREST_CACHE"))
+  ;; Process-owned LS registrations: 24 notification transactions, 128 pairs.
+  (region.declare $WIN16_LS_CONNECTIONS (size 0x00012200) (align 0x00000010)
+    (owner "08c-ne-loader.wat:$win16_ls_record"))
   (region.declare $WIN16_PROCESS_ARENA (size 0x000000D0) (align 0x00000004)
     (owner "08c-ne-loader.wat:$win16_arena_base"))
   (region.declare $WIN16_THUNK_TABLE (size 0x00002000) (align 0x00001000)
@@ -680,7 +690,7 @@
     (owner "09a4b-handlers-cursor-icon.wat:$icon_intern_sized"))
   (region.declare $ICON_SIZE_TABLE (size 0x00000800) (align 0x00000100)
     (owner "09a4b-handlers-cursor-icon.wat:$icon_slot_size_set"))
-  (region.declare $CURSOR_TABLE (size 0x00000300) (align 0x00000100)
+  (region.declare $CURSOR_TABLE (size 0x00000400) (align 0x00000100)
     (stride $CURSOR_TABLE_STRIDE (count 32))
     (owner "09a4b-handlers-cursor-icon.wat:$cursor_slot_record"))
   (region.declare $CURSOR_MASK_DESC (size 0x00000050) (align 0x00000100)
@@ -963,6 +973,11 @@
     (owner "09a8-handlers-directx.wat:$dx_aux_ref_add"))
   (region.declare $DX_VTBL_REGISTRY (size 0x0000014c)
     (owner "09a8-handlers-directx.wat:$dx_vtable_registry_reset"))
+  ;; Wasm address of the per-slot chain index over COM_WRAPPERS_AUX (128KB in
+  ;; the DIB arena, built once the pool is large), 0 until then. Shared, so
+  ;; every thread instance walks the same chains.
+  (region.declare $COM_AUX_INDEX (size 0x00000004) (align 0x00000004)
+    (owner "09a8-handlers-directx.wat:$dx_aux_index_locked"))
   (region.declare $VSOCK_TABLE (size 0x00004000) (align 0x00001000)
     (stride $VSOCK_REC_SIZE (count $VSOCK_MAX))
     (owner "09d-winsock.wat:$vsock_rec"))
@@ -1091,12 +1106,28 @@
   (region.declare $CRT_OVERRIDE_TABLE (size 0x00000400) (align 0x00000010)
     (owner "09a6-handlers-crt.wat:$CRT_OVERRIDE_TABLE"))
   ;; Glide 2 process-shared board, lock, immutable stream and packet staging.
-  ;; Fixed state uses 532 bytes; streams, texture payloads and LFB live on heap.
-  (region.declare $GLIDE_STATE (size 0x00000220) (align 0x00000010)
+  ;; Fixed state uses 532 bytes plus 128 bytes of GPS accounting
+  ;; (glide_gps_stat); streams, texture payloads and LFB live on heap.
+  (region.declare $GLIDE_STATE (size 0x000002A0) (align 0x00000010)
     (owner "09a8h-glide.wat:$GLIDE_STATE"))
-  ;; Lazy surface barriers shared by guest instances, never initialized by data.
+  ;; GPU stream v2 ring directory: 8 x 192-byte GpsRing entries (header,
+  ;; completion slots, producer words), then 8 x 128 bytes of per-API stats
+  ;; (gps_stat) and 64 bytes of texture-diagnostic control. Ring bytes,
+  ;; arenas and diagnostic tables are heap memory.
+  (region.declare $GPU_STREAM (size 0x00000A40) (align 0x00000040)
+    (owner "09a8gs-gpu-stream.wat:$GPU_STREAM"))
+  ;; D3DIM deferred-GPU-work and GPU-present words shared by guest instances,
+  ;; never initialized by data (+0..+12, the old lazy-Lock words, unused).
   (region.declare $D3DIM_LAZY_SHARED (size 0x00000020) (align 0x00000010)
     (owner "09ab-handlers-d3dim-core.wat:$D3DIM_LAZY_SHARED"))
+  ;; GPU-stream lazy CPU-access table (mutex, armed count, eight entries)
+  ;; shared by guest instances and every GPS producer, never initialized by data.
+  (region.declare $GPS_LAZY (size 0x00000200) (align 0x00000040)
+    (owner "09a8gv-gps-coherence.wat:$GPS_LAZY"))
+  ;; D3DIM GPU stream v2 producer: recursive lock, producer block and ring
+  ;; handle, shared by every guest thread. The block itself is heap memory.
+  (region.declare $D3DIM_GPS (size 0x00000040) (align 0x00000010)
+    (owner "09abg-d3dim-gps.wat:$D3DIM_GPS"))
 
   (region.declare $GETMESSAGE_HOOKS (size 0x00000100) (align 0x00000010)
     (owner "09a-handlers4-late.wat:$getmessage_hook_state"))
@@ -1155,3 +1186,35 @@
   ;; Process writer registry and bounded CPU store records. No object leases.
   (region.declare $WRITER_SESSION (size 0x00004000) (align 128)
     (owner "03-registers.wat:$writer_note"))
+
+  ;; D3D9/D3D8 texture upload decode (GPU stream v2 slice 9.1). +0 is the
+  ;; process-wide source of level content identities, +4 the decode band's
+  ;; owner lock. The band holds one run of decoded A8B8G8R8 rows (4 rows of a
+  ;; 2048-wide level), copied out by the host while it holds the lock. One
+  ;; band, not one per thread: the map has ~52 KB left below GUEST_PAGE_TABLE.
+  (region.declare $D3D9_TEXTURE_SERIAL (size 0x8) (align 0x4)
+    (owner "09ae-d3d9-resources.wat:$d3d9_texture_touch"))
+  (region.declare $D3D9_TEXTURE_DECODE (size 0x00008000) (align 0x00001000)
+    (owner "09ae-d3d9-resources.wat:$d3d9_texture_decode_scratch"))
+
+  ;; Optional constructor-derived diagnostic; appended to preserve old bases.
+  (region.declare $SELECTIVE_WATCH (size 0x00000080) (align 128)
+    (owner "13-exports.wat:$selective_watch_check"))
+
+  ;; Immutable after first use; shared memory is the emulated process lifetime.
+  ;; Kept outside instance globals so every guest thread uses the same secret.
+  (region.declare $POINTER_SECRET (size 4) (align 4)
+    (owner "09a0b-handlers-base-late.wat:$pointer_secret"))
+
+  ;; Process lifetime registration plus private, per-thread callback custody.
+  (region.declare $TOP_EXCEPTION_FILTER (size 4) (align 4)
+    (owner "11-seh.wat:$top_exception_filter"))
+  (region.declare $TOP_FILTER_CONTEXTS (size 0x4000) (align 128)
+    (owner "11-seh.wat:$top_filter_frame"))
+
+  ;; TrackMouseEvent: one tracking record per guest thread (tid 0..16), as
+  ;; USER keeps one per queue. Shared memory so a destroy on any instance can
+  ;; end tracking of the dying window; appended to preserve old bases.
+  (region.declare $TME_THREAD_STATE (size 0x440) (align 0x10)
+    (stride 0x40 (count 17))
+    (owner "09a5-handlers-window.wat:$tme_addr"))

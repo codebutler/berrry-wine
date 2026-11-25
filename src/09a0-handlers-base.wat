@@ -134,14 +134,17 @@
     (if (i32.eq (local.get $idx) (i32.const 47)) (then (return "wintrust")))
     (if (i32.eq (local.get $idx) (i32.const 48)) (then (return "ws2_32")))
     (if (i32.eq (local.get $idx) (i32.const 49)) (then (return "wsock32")))
+    ;; DirectMusic's COM object is implemented by the dispatcher. Publish the
+    ;; component through the same module identity/refcount path as DirectInput.
+    (if (i32.eq (local.get $idx) (i32.const 50)) (then (return "dmusic")))
     ;; The shell's two DLLs map their real file when the system directory has
     ;; one, and are otherwise the builtin modules their WAT handlers already
     ;; serve for static imports. Without these slots a LoadLibrary of either
     ;; failed with ERROR_MOD_NOT_FOUND even though GetProcAddress on the
     ;; builtin would resolve, and a delay-load import of SHELL32 died with
     ;; exception 0xC06D007E.
-    (if (i32.eq (local.get $idx) (i32.const 50)) (then (return "shell32")))
-    (if (i32.eq (local.get $idx) (i32.const 51)) (then (return "shlwapi")))
+    (if (i32.eq (local.get $idx) (i32.const 51)) (then (return "shell32")))
+    (if (i32.eq (local.get $idx) (i32.const 52)) (then (return "shlwapi")))
     (if (i32.ge_u (local.get $idx) (i32.const 11)) (then (return "")))
     (local.set $entry (global.get $STATIC_SYS_DLL_NAMES))
     (block $done (loop $skip
@@ -428,7 +431,7 @@
     (br_if $gpa (i32.lt_u (local.get $arg1) (i32.const 0x10000)))
     ;; Allocate hint(2) + name in guest heap
     (local.set $tmp (call $guest_strlen (local.get $arg1)))
-    (local.set $v (call $heap_alloc (i32.add (local.get $tmp) (i32.const 3)))) (local.set $v_wa (call $g2w (local.get $v))) ;; 2 hint + name + NUL
+    (local.set $v (call $heap_alloc (i32.add (local.get $tmp) (i32.const 4)))) (local.set $v_wa (call $g2w (local.get $v))) ;; 2 hint + name + 'A' + NUL
     ;; Write hint = 0
     (i32.store16 (local.get $v_wa) (i32.const 0))
     ;; Copy name string
@@ -444,6 +447,18 @@
         (then (local.set $i (call $glide3_named_api (local.get $name_wa)))))))
     (if (i32.eq (local.get $i) (i32.const -1))
       (then (local.set $i (call $lookup_api_id (i32.add (local.get $v_wa) (i32.const 2))))))
+    ;; COMCTL32 4.72 exports three pre-Unicode names unsuffixed, as aliases of
+    ;; the ANSI entry points. WinHelp resolves PropertySheet,
+    ;; CreatePropertySheetPage and ImageList_LoadImage by those names and
+    ;; quits instead of opening Help Topics when any is NULL.
+    (if (i32.and (i32.eq (local.get $i) (i32.const 0xFFFF))
+          (i32.or (call $str_eq (local.get $name_wa) "PropertySheet")
+            (i32.or (call $str_eq (local.get $name_wa) "CreatePropertySheetPage")
+                    (call $str_eq (local.get $name_wa) "ImageList_LoadImage"))))
+      (then
+        (i32.store16 (i32.add (local.get $v_wa) (i32.add (local.get $tmp) (i32.const 2)))
+          (i32.const 0x41)) ;; "A\0"
+        (local.set $i (call $lookup_api_id (i32.add (local.get $v_wa) (i32.const 2))))))
     (if (i32.eq (local.get $i) (i32.const 0xFFFF))
       (then (br $gpa))) ;; return 0 — function not found
     ;; SDL retries failed WGL extension lookups through GetProcAddress. A name
@@ -1495,6 +1510,12 @@
         (return (i32.const 0))))
     (local.set $base (i32.and (local.get $lctype) (i32.const 0xFFFF)))
     (local.set $flags (i32.and (local.get $lctype) (i32.const 0xFFFF0000)))
+    ;; LOCALE_SABBREVLANGNAME: the Windows abbreviation for this en-US
+    ;; locale is ENU. Resource clients concatenate it into a DLL filename.
+    ;; Use the shared A/W writer for counts, flags and buffer validation.
+    (if (i32.eq (local.get $base) (i32.const 0x0003))
+      (then (return (call $locale_write_text "ENU" (local.get $flags)
+        (local.get $out_g) (local.get $cch) (local.get $wide)))))
     ;; These string LCType values admit only NOUSEROVERRIDE and USE_CP_ACP.
     ;; RETURN_NUMBER (and every other bit) is invalid for string data.
     (if (i32.and
@@ -1765,9 +1786,12 @@
       (then (return (i32.const 1))))
     (if (i32.eqz (call $guest_name_is_static_system_dll (local.get $name)))
       (then (return (i32.const 0))))
+    ;; COMCTL32 is not exempt: its controls are WAT wndprocs and the real PE
+    ;; is no longer loadable (lib/dll-registry.js), so a LoadLibrary of it --
+    ;; WinHelp's, after it SearchPathA's the placeholder file -- takes the
+    ;; builtin handle instead of a native map the loader refuses.
     (i32.eqz (i32.or
-      (i32.or (call $dll_name_match (local.get $name) "ole32.dll")
-              (call $dll_name_match (local.get $name) "comctl32.dll"))
+      (call $dll_name_match (local.get $name) "ole32.dll")
       (i32.or
         (i32.or (call $dll_name_match (local.get $name) "d3drm.dll")
                 (call $dll_name_match (local.get $name) "oleaut32.dll"))
@@ -1782,6 +1806,20 @@
   ;; - a3d.dll: Aureal's A3D audio driver, installed only with an Aureal card.
   ;;   Trespasser loads it, finds no A3dCreate in our handle, frees it and
   ;;   calls through NULL; with a NULL module it uses DirectSound.
+  ;; Windows system DLLs that lib/dll-registry.js prefers to load from a real
+  ;; file (so they have no static identity slot) but whose exports we also
+  ;; dispatch by API name. Those files are not redistributable and never ship
+  ;; on a public deploy, so there the bare name must still load: WordPad and
+  ;; MSPaint 98 delay-load SHELL32 and raise 0xC06D007E on a NULL handle.
+  ;; They keep the legacy image-base handle GetProcAddress resolves by name.
+  (func $loadlib_emulated_when_absent (param $name i32) (result i32)
+    (if (i32.and (call $loadlib_name_is_qualified (local.get $name))
+          (i32.eqz (call $loadlib_path_in_system_dirs (local.get $name))))
+      (then (return (i32.const 0))))
+    (i32.or (call $dll_name_match (local.get $name) "shell32.dll")
+      (i32.or (call $dll_name_match (local.get $name) "shlwapi.dll")
+              (call $dll_name_match (local.get $name) "setupapi.dll"))))
+
   (func $loadlib_absent_on_win98 (param $name i32) (result i32)
     (i32.or (call $dll_name_match (local.get $name) "msi.dll")
             (call $dll_name_match (local.get $name) "a3d.dll")))
@@ -1902,7 +1940,8 @@
     ;; No native file and no implemented system module: LoadLibrary fails
     ;; with ERROR_MOD_NOT_FOUND, even for a bare .dll name. A nonzero EXE
     ;; handle would suppress the caller's own optional-driver retry path.
-    (if (i32.eqz (local.get $tmp))
+    (if (i32.and (i32.eqz (local.get $tmp))
+          (i32.eqz (call $loadlib_emulated_when_absent (local.get $arg0))))
       (then
         (i32.store (global.get $reg_base) (i32.const 0))
         (global.set $last_error (i32.const 126))
@@ -3839,6 +3878,7 @@
 
   ;; 17: MulDiv
   (func $handle_MulDiv (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $quotient i64)
     ;; RichEdit uses 32767 twips as an internal "effectively infinite" size
     ;; sentinel. Letting the generic pixel conversion through turns that into
     ;; a thousands-pixel document/font metric and WordPad scrolls typed text
@@ -3855,9 +3895,17 @@
         (return)))
     (if (i32.eqz (local.get $arg2))
     (then (i32.store offset=0 (global.get $reg_base) (i32.const -1)))
-    (else (i32.store offset=0 (global.get $reg_base) (i32.wrap_i64 (i64.div_s
-    (i64.mul (i64.extend_i32_s (local.get $arg0)) (i64.extend_i32_s (local.get $arg1)))
-    (i64.extend_i32_s (local.get $arg2)))))))
+    (else
+      (local.set $quotient (i64.div_s
+        (i64.mul (i64.extend_i32_s (local.get $arg0)) (i64.extend_i32_s (local.get $arg1)))
+        (i64.extend_i32_s (local.get $arg2))))
+      ;; Check the signed result before narrowing; wrapping hides overflow.
+      (i32.store offset=0 (global.get $reg_base)
+        (if (result i32) (i32.or
+              (i64.lt_s (local.get $quotient) (i64.const -2147483648))
+              (i64.gt_s (local.get $quotient) (i64.const 2147483647)))
+          (then (i32.const -1))
+          (else (i32.wrap_i64 (local.get $quotient)))))))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))) (return)
   )
 
@@ -4509,6 +4557,9 @@
   ;; 26: CloseHandle(hObject) — 1 arg stdcall
   (func $handle_CloseHandle (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $console_result i32)
+    ;; A waitable timer's deadline goes with its last handle; the event itself
+    ;; is closed by the sync-object path below.
+    (drop (call $waitable_timer_cancel (local.get $arg0)))
     (if (i32.or
           (i32.eq (i32.and (local.get $arg0) (i32.const 0xFFFF0000)) (i32.const 0x00E60000))
           (i32.eq (i32.and (local.get $arg0) (i32.const 0xFFFF0000)) (i32.const 0x00E40000)))
@@ -5442,6 +5493,23 @@
   (global $PROCESS_HEAP_HANDLE i32 (i32.const 0x00BEEF00))
   (global $PRIVATE_HEAP_MAGIC i32 (i32.const 0x50414548)) ;; "HEAP"
 
+  ;; Shared heap handles resolve through the system authority. The tag routes
+  ;; stale capabilities to that authority too; it never grants validity itself.
+  (func $shared_heap_handle (param $handle i32) (result i32)
+    (i32.eq (i32.and (local.get $handle) (i32.const 0xff000000)) (i32.const 0xd5000000)))
+
+  (func $shared_heap_api (param $op i32) (param $a i32) (param $b i32) (param $c i32) (param $d i32) (result i32)
+    (local $value i32) (local $error i32)
+    (local.set $value (call $host_shared_heap (local.get $op) (local.get $a) (local.get $b) (local.get $c) (local.get $d)))
+    ;; API failure travels with the result, never in mutable host error state
+    ;; shared by browser CPUs. This prefix is outside every successful value.
+    (if (i32.eq (i32.and (local.get $value) (i32.const 0xff000000)) (i32.const 0xf0000000)) (then
+      (local.set $error (i32.and (local.get $value) (i32.const 0xffffff)))
+      (global.set $last_error (local.get $error))
+      (return (if (result i32) (i32.eq (local.get $op) (i32.const 6))
+        (then (i32.const -1)) (else (i32.const 0))))))
+    (local.get $value))
+
   (func $heap_api_handle_valid (param $handle i32) (result i32)
     (if (i32.eq (local.get $handle) (global.get $PROCESS_HEAP_HANDLE))
       (then (return (i32.const 1))))
@@ -5451,6 +5519,8 @@
 
   ;; 33: HeapCreate(flOptions, dwInitialSize, dwMaximumSize) — 3 args stdcall
   (func $handle_HeapCreate (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (if (i32.ne (i32.and (local.get $arg0) (i32.const 0x04000000)) (i32.const 0)) (then
+      (call $toolhelp_return (call $shared_heap_api (i32.const 1) (local.get $arg0) (local.get $arg1) (local.get $arg2) (i32.const 0)) (i32.const 3)) (return)))
     (i32.store offset=0 (global.get $reg_base) (call $heap_alloc (i32.const 8)))
     (if (i32.load offset=0 (global.get $reg_base))
       (then
@@ -5462,6 +5532,8 @@
 
   ;; 34: HeapDestroy(hHeap) → BOOL. The process heap cannot be destroyed.
   (func $handle_HeapDestroy (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (if (call $shared_heap_handle (local.get $arg0)) (then
+      (call $toolhelp_return (call $shared_heap_api (i32.const 2) (local.get $arg0) (i32.const 0) (i32.const 0) (i32.const 0)) (i32.const 1)) (return)))
     (if (i32.and
           (i32.ne (local.get $arg0) (global.get $PROCESS_HEAP_HANDLE))
           (call $heap_api_handle_valid (local.get $arg0)))
@@ -5479,6 +5551,8 @@
   ;; 35: HeapAlloc
   (func $handle_HeapAlloc (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $record i32) (local $ptr i32)
+    (if (call $shared_heap_handle (local.get $arg0)) (then
+      (call $toolhelp_return (call $shared_heap_api (i32.const 3) (local.get $arg0) (local.get $arg1) (local.get $arg2) (i32.const 0)) (i32.const 3)) (return)))
     (if (i32.eqz (call $heap_api_handle_valid (local.get $arg0)))
       (then
         (global.set $last_error (i32.const 6)) ;; ERROR_INVALID_HANDLE
@@ -5499,6 +5573,8 @@
 
   ;; 36: HeapFree
   (func $handle_HeapFree (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (if (call $shared_heap_handle (local.get $arg0)) (then
+      (call $toolhelp_return (call $shared_heap_api (i32.const 4) (local.get $arg0) (local.get $arg1) (local.get $arg2) (i32.const 0)) (i32.const 3)) (return)))
     (if (i32.or (i32.eqz (call $heap_api_handle_valid (local.get $arg0)))
                 (i32.eqz (local.get $arg2)))
       (then
@@ -5506,6 +5582,9 @@
         (i32.store offset=0 (global.get $reg_base) (i32.const 0))
         (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))
         (return)))
+    (if (call $shared_heap_address (local.get $arg2)) (then
+      (global.set $last_error (i32.const 87))
+      (call $toolhelp_return (i32.const 0) (i32.const 3)) (return)))
     (if (i32.eqz (call $toolhelp_alloc_remove (local.get $arg0) (local.get $arg2))) (then
       (global.set $last_error (i32.const 87))
       (call $toolhelp_return (i32.const 0) (i32.const 3)) (return)))
@@ -5531,12 +5610,19 @@
   ;; copy — there is nothing better to be had without knowing its size.
   (func $handle_HeapReAlloc (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $tmp i32) (local $old_usable i32) (local $copy i32) (local $record i32)
+    (if (call $shared_heap_handle (local.get $arg0)) (then
+      (call $toolhelp_return (call $shared_heap_api (i32.const 5) (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $arg3)) (i32.const 4)) (return)))
     (if (i32.eqz (call $heap_api_handle_valid (local.get $arg0)))
       (then
         (global.set $last_error (i32.const 6)) ;; ERROR_INVALID_HANDLE
         (i32.store offset=0 (global.get $reg_base) (i32.const 0))
         (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 20)))
         (return)))
+    ;; A private heap cannot adopt a system-heap allocation. In particular,
+    ;; never pass its address to the private block-header reader below.
+    (if (call $shared_heap_address (local.get $arg2)) (then
+      (global.set $last_error (i32.const 87))
+      (call $toolhelp_return (i32.const 0) (i32.const 4)) (return)))
     (local.set $record (call $toolhelp_alloc_reserve (local.get $arg0) (local.get $arg2)))
     (if (i32.eqz (local.get $record)) (then
       (call $toolhelp_return (i32.const 0) (i32.const 4)) (return)))
@@ -5609,6 +5695,14 @@
   ;; NULL reserves return 64KB-granularity bases; commits are page-aligned.
   (func $handle_VirtualAlloc (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $size i32) (local $new_top i32)
+    ;; The system heap reservation has no process-private sparse backing.
+    (if (i32.and (i32.ne (local.get $arg0) (i32.const 0))
+          (i32.and (i32.lt_u (local.get $arg0) (i32.const 0x81000000))
+            (i64.gt_u (i64.add (i64.extend_i32_u (local.get $arg0))
+              (i64.extend_i32_u (local.get $arg1))) (i64.const 0x80000000))))
+      (then
+        (global.set $last_error (i32.const 487))
+        (call $toolhelp_return (i32.const 0) (i32.const 4)) (return)))
     (if (i32.eqz (call $guest_page_protection_valid (local.get $arg3)))
       (then
         (global.set $last_error (i32.const 87)) ;; ERROR_INVALID_PARAMETER
@@ -6479,52 +6573,13 @@
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))) (return)
   )
 
-  ;; 55: UnhandledExceptionFilter(ExceptionInfo) -> LONG
-  ;;
-  ;; The last stop for an exception nobody claimed. A CRT reaches here from its
-  ;; own __except filter -- msvcrt's _XcptFilter tail is literally
-  ;; `push [ebp+0xc]; call [UnhandledExceptionFilter]` -- so arriving here means
-  ;; a fault already happened somewhere else and every registered handler
-  ;; declined it. Trapping here used to report this function as the
-  ;; unimplemented API, which named the messenger instead of the fault; the
-  ;; exception code and faulting address are the only useful facts and they are
-  ;; in the record the caller just passed, so report those.
-  ;;
-  ;;   EXCEPTION_POINTERS { EXCEPTION_RECORD* ExceptionRecord; CONTEXT* Context; }
-  ;;   EXCEPTION_RECORD   { DWORD Code; DWORD Flags; EXCEPTION_RECORD* Nested;
-  ;;                        PVOID Address; DWORD NumberParameters; ... }
-  ;;
-  ;; Returns EXCEPTION_EXECUTE_HANDLER, which is what the real API returns on a
-  ;; machine with no debugger attached once its fault dialog is dismissed: the
-  ;; caller's __except block runs and the process terminates through its own
-  ;; shutdown path rather than dying mid-instruction.
-  ;;
-  ;; Not yet done: re-entering a filter installed by SetUnhandledExceptionFilter.
-  ;; Windows calls that filter from here and returns what it returns. Doing so
-  ;; needs a continuation thunk to resume this handler after guest code runs
-  ;; (the CACA000x mechanism), and every filter we have actually seen installed
-  ;; is a CRT's own terminate path, which reaches the same place this does. The
-  ;; filter is still stored and still round-trips through the setter, so nothing
-  ;; here has to be undone when that trampoline exists.
+  ;; Invoke the process filter on this thread. CONTINUE_SEARCH selects the
+  ;; existing host diagnostic/default EXECUTE_HANDLER policy (no debugger).
   (func $handle_UnhandledExceptionFilter (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $rec i32) (local $rec_wa i32)
-    ;; arg0 is EXCEPTION_POINTERS*. A null pointer, or a null ExceptionRecord
-    ;; inside it, is legal input -- report what is known and skip the rest
-    ;; rather than dereferencing it.
-    (if (local.get $arg0)
-      (then (local.set $rec (i32.load (call $g2w (local.get $arg0))))))
-    (if (local.get $rec)
-      (then (local.set $rec_wa (call $g2w (local.get $rec))) (call $host_unhandled_exception
-              (i32.load (local.get $rec_wa))                  ;; ExceptionCode
-              (i32.load offset=4 (local.get $rec_wa))         ;; ExceptionFlags
-              (i32.load offset=12 (local.get $rec_wa))        ;; ExceptionAddress
-              (global.get $unhandled_exception_filter)))
-      (else (call $host_unhandled_exception
-              (i32.const 0) (i32.const 0) (i32.const 0)
-              (global.get $unhandled_exception_filter))))
-    (i32.store offset=0 (global.get $reg_base) (i32.const 1))  ;; EXCEPTION_EXECUTE_HANDLER
-    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))  ;; stdcall, 1 arg
-  )
+    (if (call $top_filter_begin (local.get $arg0) (i32.const 0)) (then (return)))
+    (call $top_filter_default (local.get $arg0))
+    (i32.store (global.get $reg_base) (i32.const 1))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8))))
 
   ;; 56: GetCurrentProcess — return pseudo-handle -1 (0xFFFFFFFF)
   (func $handle_GetCurrentProcess (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
@@ -6598,10 +6653,25 @@
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4))) (return)
   )
 
-  ;; GetDoubleClickTime() → UINT. Win32 default is 500 ms unless customized.
+  ;; GetDoubleClickTime() → UINT. Current process/session interval, initially 500 ms.
+  (global $double_click_time (mut i32) (i32.const 500))
   (func $handle_GetDoubleClickTime (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (i32.store offset=0 (global.get $reg_base) (i32.const 500))
+    (i32.store offset=0 (global.get $reg_base) (global.get $double_click_time))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
+  )
+
+  ;; SetDoubleClickTime(UINT milliseconds) → BOOL. Zero restores the default;
+  ;; Microsoft documents that values above 5000 ms are clamped to 5000 ms.
+  (func $handle_SetDoubleClickTime (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (global.set $double_click_time
+      (if (result i32) (i32.eqz (local.get $arg0))
+        (then (i32.const 500))
+        (else
+          (if (result i32) (i32.gt_u (local.get $arg0) (i32.const 5000))
+            (then (i32.const 5000))
+            (else (local.get $arg0))))))
+    (i32.store offset=0 (global.get $reg_base) (i32.const 1))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
   )
 
   ;; 59: FindResourceA

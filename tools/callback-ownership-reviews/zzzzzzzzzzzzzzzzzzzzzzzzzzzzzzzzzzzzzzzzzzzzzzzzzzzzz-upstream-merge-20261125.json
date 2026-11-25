@@ -1,0 +1,170 @@
+{
+  "version": 1,
+  "revisions": [
+    {
+      "file": "host.js",
+      "name": "host-file",
+      "baseSHA256": "186cff6e19750a796324846127a06f6fa783ad39d96e288d4b9ac15c30e645d7",
+      "sha256": "30810fad80d83ac1fafbe34d89f621032cf3c8bcc7b714afb8b29ed715c2bd6f",
+      "reason": "Merge of upstream main into the fork (20261125): the producer is the union of both sides' independent edits, each already reviewed on its own side. No new EIP write, callback frame, guest stack, HWND lifetime, hook or message delivery was introduced by the merge itself; callback ownership remains pending."
+    },
+    {
+      "file": "lib/guest-thread-host.js",
+      "name": "host-file",
+      "baseSHA256": "95e2d0d0d0af71d809b01940b9e7859db727e87570ae90549a49a2bdb804c343",
+      "sha256": "8d6f12f323978b33b17b131759cc0e6873604720037cb8cdbf42bfb8eb0ddc5c",
+      "reason": "Merge of upstream main into the fork (20261125): the producer is the union of both sides' independent edits, each already reviewed on its own side. No new EIP write, callback frame, guest stack, HWND lifetime, hook or message delivery was introduced by the merge itself; callback ownership remains pending."
+    },
+    {
+      "file": "lib/guest-worker.js",
+      "name": "host-file",
+      "baseSHA256": "25e3d8fbcf51c39bfb0f170e99702fb64a958a6ed74b53b54647c95d862a85cf",
+      "sha256": "932370d6fe3cdf2d0b81b085fcf6a4ce5fc0033e39f12fa30f69753f8fd5cb2d",
+      "reason": "Merge of upstream main into the fork (20261125): the producer is the union of both sides' independent edits, each already reviewed on its own side. No new EIP write, callback frame, guest stack, HWND lifetime, hook or message delivery was introduced by the merge itself; callback ownership remains pending."
+    },
+    {
+      "file": "lib/host-imports.js",
+      "name": "host-file",
+      "baseSHA256": "9233a491c885b5a91e7992a177c4a60191f77f73299eedd20ff41c4a4955664d",
+      "sha256": "a4525bd4ad3b85909f064ba1f540534f7cb0c6020006a86734e8b567cff8f4e0",
+      "reason": "Merge of upstream main into the fork (20261125): the producer is the union of both sides' independent edits, each already reviewed on its own side. No new EIP write, callback frame, guest stack, HWND lifetime, hook or message delivery was introduced by the merge itself; callback ownership remains pending."
+    },
+    {
+      "file": "lib/process-boot.js",
+      "name": "host-file",
+      "baseSHA256": "0dd4b7d3a67d5e43aeea307015cde31b9dbc21d870f18fccdf0a968149341d57",
+      "sha256": "bd3ca909953038711aaaa24dee9096c8b24a5bdb7e273fc738d025bea483aa64",
+      "reason": "Merge of upstream main into the fork (20261125): the producer is the union of both sides' independent edits, each already reviewed on its own side. No new EIP write, callback frame, guest stack, HWND lifetime, hook or message delivery was introduced by the merge itself; callback ownership remains pending."
+    },
+    {
+      "file": "lib/renderer-input.js",
+      "name": "host-file",
+      "baseSHA256": "4739ee0132337d1d1551c936da6632332174baff9a2dff44216904038ac4cdb8",
+      "sha256": "a47f18a628e57dabfb7462a9f3faf7e3bc70e63809dca0e0cb838d8b1f806a55",
+      "reason": "Merge of upstream main into the fork (20261125): the producer is the union of both sides' independent edits, each already reviewed on its own side. No new EIP write, callback frame, guest stack, HWND lifetime, hook or message delivery was introduced by the merge itself; callback ownership remains pending."
+    },
+    {
+      "file": "lib/renderer.js",
+      "name": "host-file",
+      "baseSHA256": "5fe5591cbead4188dbde1b4f7766bd24254845923690f5e23e945d2d1fc96d1a",
+      "sha256": "1660880827dafec43256ba5532f1afee33bf691f951cfcbc788a57c5bd377bd5",
+      "reason": "Merge of upstream main into the fork (20261125): the producer is the union of both sides' independent edits, each already reviewed on its own side. No new EIP write, callback frame, guest stack, HWND lifetime, hook or message delivery was introduced by the merge itself; callback ownership remains pending."
+    },
+    {
+      "file": "lib/thread-manager.js",
+      "name": "host-file",
+      "baseSHA256": "45f55a67e3148b47f046f4e509bf52a0e0636a5e46bf2257f10045c9010823b1",
+      "sha256": "baa6bac14e3d4f62409687184ed2a94db8a75050557ba9bb2c80c4c4b139343d",
+      "reason": "Merge of upstream main into the fork (20261125): the producer is the union of both sides' independent edits, each already reviewed on its own side. No new EIP write, callback frame, guest stack, HWND lifetime, hook or message delivery was introduced by the merge itself; callback ownership remains pending."
+    },
+    {
+      "file": "src/09a-handlers1-user.wat",
+      "name": "$handle_DialogBoxParamA",
+      "baseSHA256": "c08da8f4c33135fea46a3ff44ad4edaa4310b5bd16099bc7e52dae12522726ba",
+      "sha256": "7aabbf879cb10d34fe2503493f8da0bbbacf689106780f2883d1f61387995db1",
+      "reason": "Merge of upstream main into the fork (20261125): the producer is the union of both sides' independent edits, each already reviewed on its own side. No new EIP write, callback frame, guest stack, HWND lifetime, hook or message delivery was introduced by the merge itself; callback ownership remains pending."
+    },
+    {
+      "file": "src/09a5-handlers-window.wat",
+      "name": "$handle_CreateWindowExA",
+      "baseSHA256": "0ec587e3cd5f67564918c165bb97551ba9ab980b96ae2daf98e9fa5351a83dc7",
+      "sha256": "bdca74c11ab70df75a437b482a81494ea11e44587f343010a8bf16ff9e71998f",
+      "reason": "Merge of upstream main into the fork (20261125): the producer is the union of both sides' independent edits, each already reviewed on its own side. No new EIP write, callback frame, guest stack, HWND lifetime, hook or message delivery was introduced by the merge itself; callback ownership remains pending."
+    },
+    {
+      "file": "src/09a5-handlers-window.wat",
+      "name": "$handle_SendMessageA",
+      "baseSHA256": "252e1d7dae1d4b169e457e1ad5f548a86b6efdc7116d5bfd0afd522143336863",
+      "sha256": "fa2557a4442807adf83c8f0573315a995e6edf12617f182585937fcff915422a",
+      "reason": "Merge of upstream main into the fork (20261125): the producer is the union of both sides' independent edits, each already reviewed on its own side. No new EIP write, callback frame, guest stack, HWND lifetime, hook or message delivery was introduced by the merge itself; callback ownership remains pending."
+    },
+    {
+      "file": "src/09a5-handlers-window.wat",
+      "name": "$show_window_core",
+      "baseSHA256": "6f65067139dbe4bc184ecba600faed7613f8900330ef6f7f4d952b20ebf35d4a",
+      "sha256": "3e9969c36c230f0bc452e312701d301725e0a192d7f0d91c0591c514f806d3e0",
+      "reason": "Merge of upstream main into the fork (20261125): the producer is the union of both sides' independent edits, each already reviewed on its own side. No new EIP write, callback frame, guest stack, HWND lifetime, hook or message delivery was introduced by the merge itself; callback ownership remains pending."
+    },
+    {
+      "file": "src/09a5b-handlers-window-late.wat",
+      "name": "$handle_CallWindowProcA",
+      "baseSHA256": "675eca7bd8ab1ba3f7ba3a7c76926bd859da1fe8662acec19a7b0d7b96181b29",
+      "sha256": "0ebe82ff2b6fa41de589e43ef30b728b70357ac5f6f2b2cbaa8e452fc62d9afd",
+      "reason": "Merge of upstream main into the fork (20261125): the producer is the union of both sides' independent edits, each already reviewed on its own side. No new EIP write, callback frame, guest stack, HWND lifetime, hook or message delivery was introduced by the merge itself; callback ownership remains pending."
+    },
+    {
+      "file": "src/09b-dispatch.wat",
+      "name": "$win32_dispatch_inner",
+      "baseSHA256": "ffaa595e5f9b89e0b71475b06b3a7a45e2cb578b5379e1fd13bcf9faf6061629",
+      "sha256": "fb18e96395da360fdf8ebacdfce81b6113ef253afbe4c75cd2d502d3e0306eac",
+      "reason": "Merge of upstream main into the fork (20261125): the producer is the union of both sides' independent edits, each already reviewed on its own side. No new EIP write, callback frame, guest stack, HWND lifetime, hook or message delivery was introduced by the merge itself; callback ownership remains pending."
+    },
+    {
+      "file": "src/09c3a-dialog-runtime.wat",
+      "name": "$modal_pump_step",
+      "baseSHA256": "ba6e03afc40cb01a1940f520fd68b884bda81f8f4654ed9a21005fb9b777d15a",
+      "sha256": "36088898f19e2d2d54b5d5aae029d76b298c91cc9d088cbdf2076ac7106aae24",
+      "reason": "Merge of upstream main into the fork (20261125): the producer is the union of both sides' independent edits, each already reviewed on its own side. No new EIP write, callback frame, guest stack, HWND lifetime, hook or message delivery was introduced by the merge itself; callback ownership remains pending."
+    },
+    {
+      "file": "src/09c3a-dialog-runtime.wat",
+      "name": "$wnd_destroy_children",
+      "baseSHA256": "58beb6135c238455fff1a7a9be5ec06815bec7540e4ba98927573c3c253ce652",
+      "sha256": "860e7622c091c322492801a7b0bf55885850f2d31371bccb7a912d20f5d85e11",
+      "reason": "Merge of upstream main into the fork (20261125): the producer is the union of both sides' independent edits, each already reviewed on its own side. No new EIP write, callback frame, guest stack, HWND lifetime, hook or message delivery was introduced by the merge itself; callback ownership remains pending."
+    },
+    {
+      "file": "src/09c3a-dialog-runtime.wat",
+      "name": "$wnd_send_message_inner",
+      "baseSHA256": "490542202a7a0e7c3f9b3a873859db62f047b3e0ebf0c6d14d7673a7354854fb",
+      "sha256": "2d1222dc46753a4ce6ebe11294375714e4f89890fea6854b77f31ebea4c1733d",
+      "reason": "Merge of upstream main into the fork (20261125): the producer is the union of both sides' independent edits, each already reviewed on its own side. No new EIP write, callback frame, guest stack, HWND lifetime, hook or message delivery was introduced by the merge itself; callback ownership remains pending."
+    },
+    {
+      "file": "src/09c5-menu.wat",
+      "name": "$menu_activate",
+      "baseSHA256": "f44bc402c2295cdb016c8f3eb118d715e14c57c12fd4d793e519d9a16e14759f",
+      "sha256": "b68d826dc6255981e7403862630e4e5c9189f1e4e33bd8df1c3566cd6d526adf",
+      "reason": "Merge of upstream main into the fork (20261125): the producer is the union of both sides' independent edits, each already reviewed on its own side. No new EIP write, callback frame, guest stack, HWND lifetime, hook or message delivery was introduced by the merge itself; callback ownership remains pending."
+    },
+    {
+      "file": "src/09c5-menu.wat",
+      "name": "$menu_hover_from_point",
+      "baseSHA256": "6415ef461cdf26276685671ff84c915a61c5fa4270e3ab1e4cff34e545488446",
+      "sha256": "2ff20c5db1a64e3891f1ea1bf2675f3aba0317875ee396526748933b9f75674f",
+      "reason": "Merge of upstream main into the fork (20261125): the producer is the union of both sides' independent edits, each already reviewed on its own side. No new EIP write, callback frame, guest stack, HWND lifetime, hook or message delivery was introduced by the merge itself; callback ownership remains pending."
+    },
+    {
+      "file": "src/13-exports.wat",
+      "name": "export:resume_message_wait",
+      "baseSHA256": "7ca351abbc0f119e4d4e130a7e5d1ac956bab84095b5dea42cf1d3714090a7ba",
+      "sha256": "b7477c18e6cc89eded55292572935270421a7cc9f6e93813a70d6d0225fc0b89",
+      "reason": "Merge of upstream main into the fork (20261125): the producer is the union of both sides' independent edits, each already reviewed on its own side. No new EIP write, callback frame, guest stack, HWND lifetime, hook or message delivery was introduced by the merge itself; callback ownership remains pending."
+    },
+    {
+      "file": "src/13-exports.wat",
+      "name": "export:wnd_destroy_thread_windows",
+      "baseSHA256": "13f766cba7f94eab9b4e87262a90368729e47ca277029b7c6a887f0dc3f224c0",
+      "sha256": "c449fbe4715c3f3d34eae0b7ba2bde151353d879224d6cad5beecdab26efecaf",
+      "reason": "Merge of upstream main into the fork (20261125): the producer is the union of both sides' independent edits, each already reviewed on its own side. No new EIP write, callback frame, guest stack, HWND lifetime, hook or message delivery was introduced by the merge itself; callback ownership remains pending."
+    }
+  ],
+  "additions": [
+    {
+      "file": "src/13-exports.wat",
+      "name": "export:test_enable_scroll_bar",
+      "writes": 0,
+      "boundaryCalls": [
+        "$enable_scroll_bar_core"
+      ],
+      "exports": [
+        "test_enable_scroll_bar"
+      ],
+      "targets": [],
+      "sha256": "1e0b9306b198a1b621d5e44aca00ec4e19c25a04b6652a1f51be16cc4f981738",
+      "kind": "test-entry",
+      "reason": "Exported test entry can reach an EIP write or nested execution; no ownership exemption.",
+      "ownership": "pending"
+    }
+  ]
+}

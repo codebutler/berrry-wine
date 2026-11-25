@@ -1274,7 +1274,8 @@
         (param $left i32) (param $top i32) (param $right i32) (param $bottom i32)
         (param $brush i32) (result i32)
     (local $x0 i32) (local $y0 i32) (local $x1 i32) (local $y1 i32)
-    (local $y i32) (local $color i32) (local $wrote i32)
+    (local $y i32) (local $wrote i32)
+    (local $dx i32) (local $dy i32) (local $inner_left i32) (local $inner_right i32)
     (if (i32.eqz (call $gdi_shape_desc_valid (local.get $desc)))
       (then (return (i32.const 0))))
     (if (i32.eqz (call $gdi_brush_valid (local.get $brush)))
@@ -1286,32 +1287,34 @@
     (if (i32.or (i32.le_s (local.get $x1) (local.get $x0))
           (i32.le_s (local.get $y1) (local.get $y0)))
       (then (return (i32.const 1))))
-    (local.set $wrote (call $gdi_brush_fill_span (local.get $hdc) (local.get $desc)
-      (local.get $y0) (local.get $x0) (local.get $x1) (local.get $brush) (i32.const 13)))
-    (if (i32.gt_s (local.get $y1) (i32.add (local.get $y0) (i32.const 1)))
-      (then (local.set $wrote (i32.or (local.get $wrote)
-        (call $gdi_brush_fill_span (local.get $hdc) (local.get $desc)
-          (i32.sub (local.get $y1) (i32.const 1)) (local.get $x0) (local.get $x1)
-          (local.get $brush) (i32.const 13))))))
-    (local.set $y (i32.add (local.get $y0) (i32.const 1)))
+    ;; FrameRect's border is one logical unit, with at least one device pixel.
+    (local.set $dx (i32.sub (call $gdi_line_map_x (local.get $desc)
+      (i32.add (local.get $left) (i32.const 1))) (local.get $x0)))
+    (local.set $dy (i32.sub (call $gdi_line_map_y (local.get $desc)
+      (i32.add (local.get $top) (i32.const 1))) (local.get $y0)))
+    (if (i32.lt_s (local.get $dx) (i32.const 1)) (then (local.set $dx (i32.const 1))))
+    (if (i32.lt_s (local.get $dy) (i32.const 1)) (then (local.set $dy (i32.const 1))))
+    (local.set $inner_left (i32.add (local.get $x0) (local.get $dx)))
+    (if (i32.gt_s (local.get $inner_left) (local.get $x1))
+      (then (local.set $inner_left (local.get $x1))))
+    (local.set $inner_right (i32.sub (local.get $x1) (local.get $dx)))
+    (if (i32.lt_s (local.get $inner_right) (local.get $inner_left))
+      (then (local.set $inner_right (local.get $inner_left))))
+    (local.set $y (local.get $y0))
     (block $sides_done (loop $sides
-      (br_if $sides_done (i32.ge_s (local.get $y) (i32.sub (local.get $y1) (i32.const 1))))
-      (local.set $color (call $gdi_brush_sample
-        (local.get $hdc) (local.get $brush) (local.get $x0) (local.get $y)))
-      (if (i32.le_u (local.get $color) (i32.const 0xFFFFFF))
+      (br_if $sides_done (i32.ge_s (local.get $y) (local.get $y1)))
+      (if (i32.or (i32.lt_s (local.get $y) (i32.add (local.get $y0) (local.get $dy)))
+            (i32.ge_s (local.get $y) (i32.sub (local.get $y1) (local.get $dy))))
         (then (local.set $wrote (i32.or (local.get $wrote)
-          (call $gdi_shape_put_pixel (local.get $hdc) (local.get $desc)
-            (local.get $x0) (local.get $y) (local.get $color) (i32.const 13))))))
-      (if (i32.gt_s (local.get $x1) (i32.add (local.get $x0) (i32.const 1)))
-        (then
-          (local.set $color (call $gdi_brush_sample
-            (local.get $hdc) (local.get $brush)
-            (i32.sub (local.get $x1) (i32.const 1)) (local.get $y)))
-          (if (i32.le_u (local.get $color) (i32.const 0xFFFFFF))
-            (then (local.set $wrote (i32.or (local.get $wrote)
-              (call $gdi_shape_put_pixel (local.get $hdc) (local.get $desc)
-                (i32.sub (local.get $x1) (i32.const 1)) (local.get $y)
-                (local.get $color) (i32.const 13))))))))
+          (call $gdi_brush_fill_span (local.get $hdc) (local.get $desc)
+            (local.get $y) (local.get $x0) (local.get $x1) (local.get $brush) (i32.const 13)))))
+        (else
+          (local.set $wrote (i32.or (local.get $wrote)
+            (call $gdi_brush_fill_span (local.get $hdc) (local.get $desc)
+              (local.get $y) (local.get $x0) (local.get $inner_left) (local.get $brush) (i32.const 13))))
+          (local.set $wrote (i32.or (local.get $wrote)
+            (call $gdi_brush_fill_span (local.get $hdc) (local.get $desc)
+              (local.get $y) (local.get $inner_right) (local.get $x1) (local.get $brush) (i32.const 13))))))
       (local.set $y (i32.add (local.get $y) (i32.const 1)))
       (br $sides)))
     (if (local.get $wrote)
@@ -1975,6 +1978,8 @@
       (then (return (i32.const 0))))
     (if (i32.gt_u (call $gdi_object_style (local.get $pen)) (i32.const 6))
       (then (return (i32.const 0))))
+    (if (i32.eq (call $gdi_object_style (local.get $pen)) (i32.const 5))
+      (then (return (i32.const 1))))
     (local.set $width (local.get $device_width))
     (local.set $record (call $gdi_object_record (local.get $pen)))
     (if (local.get $record)
@@ -2137,6 +2142,8 @@
           (local.get $pen) (local.get $rop2) (local.get $device_width)))
       (then (return (i32.const 0))))
     (if (i32.eq (local.get $pen) (i32.const 0x30018)) (then (return (i32.const 1))))
+    (if (i32.eq (call $gdi_object_style (local.get $pen)) (i32.const 5))
+      (then (return (i32.const 1))))
     (local.set $x0 (call $gdi_line_map_x (local.get $desc) (local.get $from_x)))
     (local.set $y0 (call $gdi_line_map_y (local.get $desc) (local.get $from_y)))
     (local.set $x1 (call $gdi_line_map_x (local.get $desc) (local.get $to_x)))
@@ -3699,6 +3706,13 @@
           (select (i32.eqz (local.get $count)) (i32.lt_u (local.get $count) (i32.const 2))
             (local.get $from_current)))
       (then (return (i32.const 0))))
+    (local.set $dc (call $gdi_dc_state_entry (local.get $hdc) (i32.const 0)))
+    (if (i32.eqz (local.get $dc)) (then (return (i32.const 0))))
+    ;; An invisible pen still completes the call: Polyline preserves the
+    ;; current position and PolylineTo's handler advances it to the last point.
+    (if (i32.eq (call $gdi_object_style
+          (load.field.memarg GdiDcState pen (local.get $dc))) (i32.const 5))
+      (then (return (i32.const 1))))
     (if (local.get $from_current)
       (then
         (local.set $from_x (call $gdi_dc_get_field
@@ -3724,7 +3738,6 @@
     (local.set $desc (global.get $GDI_LINE_DESC))
     (local.set $rop2 (call $gdi_dc_get_rop2 (local.get $hdc)))
     (local.set $width (i32.load offset=28 (local.get $desc)))
-    (local.set $dc (call $gdi_dc_state_entry (local.get $hdc) (i32.const 0)))
     (if (local.get $dc)
       (then
         (local.set $pen (i32.load offset=4 (local.get $dc)))
@@ -6066,6 +6079,13 @@
       (then (return (i32.const 0))))
     (local.set $dx (call $gdi_line_map_x (local.get $dst) (local.get $dx_logical)))
     (local.set $dy (call $gdi_line_map_y (local.get $dst) (local.get $dy_logical)))
+    ;; Destination dimensions are logical; share mapped extents with presentation.
+    (local.set $w (i32.sub
+      (call $gdi_line_map_x (local.get $dst) (i32.add (local.get $dx_logical) (local.get $w)))
+      (local.get $dx)))
+    (local.set $h (i32.sub
+      (call $gdi_line_map_y (local.get $dst) (i32.add (local.get $dy_logical) (local.get $h)))
+      (local.get $dy)))
     (if (local.get $src_hdc)
       (then
         (if (i32.eqz (call $gdi_surface_descriptor (local.get $src_hdc) (local.get $src)))
@@ -6290,6 +6310,7 @@
     (local $record i32) (local $base i32) (local $count i32) (local $desc i32)
     (local $x i32) (local $y i32) (local $left i32) (local $top i32)
     (local $right i32) (local $bottom i32) (local $device_x i32) (local $device_y i32)
+    (local $cell_left i32) (local $cell_right i32) (local $cell_bottom i32)
     (local $color i32)
     (local.set $record (call $gdi_rgn_record (local.get $hrgn)))
     (if (i32.or (i32.eqz (local.get $record))
@@ -6343,12 +6364,34 @@
           (then
             (local.set $device_x (call $gdi_line_map_x (local.get $desc) (local.get $x)))
             (local.set $device_y (call $gdi_line_map_y (local.get $desc) (local.get $y)))
-            (local.set $color (call $gdi_brush_sample
-              (local.get $hdc) (local.get $brush) (local.get $device_x) (local.get $device_y)))
-            (if (i32.le_u (local.get $color) (i32.const 0xFFFFFF))
-              (then (drop (call $gdi_raster_write (local.get $desc)
-                (local.get $device_x) (local.get $device_y)
-                (call $gdi_raster_swap_rb (local.get $color))))))))
+            (local.set $cell_left (local.get $device_x))
+            (local.set $cell_right (call $gdi_line_map_x (local.get $desc)
+              (i32.add (local.get $x) (i32.const 1))))
+            (local.set $cell_bottom (call $gdi_line_map_y (local.get $desc)
+              (i32.add (local.get $y) (i32.const 1))))
+            ;; Cover the whole positively mapped logical cell. Keep the
+            ;; existing single-pixel behavior for collapsed or reversed cells.
+            (if (i32.eqz (i32.and
+                  (i32.gt_s (local.get $cell_right) (local.get $device_x))
+                  (i32.gt_s (local.get $cell_bottom) (local.get $device_y))))
+              (then
+                (local.set $cell_right (i32.add (local.get $device_x) (i32.const 1)))
+                (local.set $cell_bottom (i32.add (local.get $device_y) (i32.const 1)))))
+            (block $cell_rows_done (loop $cell_rows
+              (br_if $cell_rows_done (i32.ge_s (local.get $device_y) (local.get $cell_bottom)))
+              (local.set $device_x (local.get $cell_left))
+              (block $cell_cols_done (loop $cell_cols
+                (br_if $cell_cols_done (i32.ge_s (local.get $device_x) (local.get $cell_right)))
+                (local.set $color (call $gdi_brush_sample
+                  (local.get $hdc) (local.get $brush) (local.get $device_x) (local.get $device_y)))
+                (if (i32.le_u (local.get $color) (i32.const 0xFFFFFF))
+                  (then (drop (call $gdi_raster_write (local.get $desc)
+                    (local.get $device_x) (local.get $device_y)
+                    (call $gdi_raster_swap_rb (local.get $color))))))
+                (local.set $device_x (i32.add (local.get $device_x) (i32.const 1)))
+                (br $cell_cols)))
+              (local.set $device_y (i32.add (local.get $device_y) (i32.const 1)))
+              (br $cell_rows)))))
         (local.set $x (i32.add (local.get $x) (i32.const 1)))
         (br $cols)))
       (local.set $y (i32.add (local.get $y) (i32.const 1)))
@@ -6880,6 +6923,8 @@
         (if (i32.eqz (local.get $core))
           (then (i32.store offset=32 (local.get $bmi) (local.get $palette_count))))
         (local.set $table (i32.add (local.get $bmi) (local.get $header_size)))
+        ;; Preserve the source color table only for a matching indexed depth.
+        ;; A conversion synthesizes the requested format's table (1 bpp is black/white).
         (if (i32.eqz (local.get $color_use))
           (then
             (local.set $x (i32.const 0))
@@ -6887,7 +6932,7 @@
               (br_if $rgb_done (i32.ge_u (local.get $x) (local.get $palette_count)))
               (local.set $desired
                 (if (result i32) (i32.and
-                      (i32.le_u (i32.load offset=16 (local.get $src)) (i32.const 8))
+                      (i32.eq (i32.load offset=16 (local.get $src)) (local.get $bpp))
                       (i32.lt_u (local.get $x) (i32.load offset=28 (local.get $src))))
                   (then (call $gdi_raster_palette_color (local.get $src) (local.get $x)))
                   (else (call $gdi_raster_default_palette
@@ -6915,7 +6960,7 @@
               (br_if $pal_done (i32.ge_u (local.get $x) (local.get $palette_count)))
               (local.set $desired
                 (if (result i32) (i32.and
-                      (i32.le_u (i32.load offset=16 (local.get $src)) (i32.const 8))
+                      (i32.eq (i32.load offset=16 (local.get $src)) (local.get $bpp))
                       (i32.lt_u (local.get $x) (i32.load offset=28 (local.get $src))))
                   (then (call $gdi_raster_palette_color (local.get $src) (local.get $x)))
                   (else (call $gdi_raster_default_palette
@@ -7197,8 +7242,7 @@
         (return (i32.const 0))))
     (local.set $mdx (call $gdi_line_map_x (local.get $dst) (local.get $dx)))
     (local.set $mdy (call $gdi_line_map_y (local.get $dst) (local.get $dy)))
-    ;; The destination width and height are logical extents. Map both edges
-    ;; through the DC so anisotropic and upward-Y modes scale the DIB too.
+    ;; Destination dimensions are logical units; source dimensions are pixels.
     (local.set $mdw (i32.sub
       (call $gdi_line_map_x (local.get $dst) (i32.add (local.get $dx) (local.get $dw)))
       (local.get $mdx)))

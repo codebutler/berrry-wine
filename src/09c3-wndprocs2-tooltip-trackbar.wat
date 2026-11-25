@@ -299,13 +299,15 @@
   ;;
   ;; Minimal common-control trackbar for Funpack dialogs. State:
   ;; +0 min, +4 max, +8 pos, +12 line, +16 page, +20 thumb length.
+  ;; Page -1 is private default state; explicit nonnegative sizes include zero.
   (func $trackbar_wndproc (param $hwnd i32) (param $msg i32) (param $wParam i32) (param $lParam i32) (result i32)
     (local $state i32) (local $sw i32) (local $min i32) (local $max i32) (local $pos i32)
     (local $old i32) (local $hdc i32) (local $sz i32) (local $w i32) (local $h i32)
-    (local $style i32) (local $vert i32) (local $range i32) (local $track_len i32)
+    (local $style i32) (local $vert i32) (local $range i64) (local $track_len i32)
     (local $thumb_len i32) (local $thumb_pos i32) (local $cx i32) (local $cy i32)
     (local $coord i32) (local $long_dim i32) (local $parent i32) (local $scroll_msg i32)
-    (local $i i32)
+    (local $i i32) (local $code i32) (local $step i32) (local $next_pos i64)
+    (local $rect i32) (local $page i32)
 
     (local.set $state (call $wnd_get_state_ptr (local.get $hwnd)))
     (if (i32.eqz (local.get $state))
@@ -313,8 +315,26 @@
         (local.set $state (call $heap_alloc (i32.const 24)))
         (local.set $sw (call $g2w (local.get $state)))
         (call $trk_state_init (local.get $sw))
+        (call $trk_set_page (local.get $sw) (i32.const -1))
         (call $wnd_set_state_ptr (local.get $hwnd) (local.get $state))))
     (local.set $sw (call $g2w (local.get $state)))
+
+    ;; Microsoft Press, Programming the Windows 95 User Interface, p.46:
+    ;; default page = (maximum - minimum) / 5. Keep it derived across range
+    ;; changes until TBM_SETPAGESIZE supplies an explicit value. Widen each
+    ;; signed endpoint before subtracting: INT_MIN..INT_MAX spans 33 bits.
+    ;; Tiny/equal/inverted ranges and negative explicit pages are outside this
+    ;; documented subset; preserve the existing size-10 fallback for spans <5.
+    (local.set $page (call $trk_page (local.get $sw)))
+    (if (i32.eq (local.get $page) (i32.const -1))
+      (then
+        (local.set $range
+          (i64.sub (i64.extend_i32_s (call $trk_max (local.get $sw)))
+                   (i64.extend_i32_s (call $trk_min (local.get $sw)))))
+        (local.set $page (i32.const 10))
+        (if (i64.ge_s (local.get $range) (i64.const 5))
+          (then (local.set $page
+            (i32.wrap_i64 (i64.div_s (local.get $range) (i64.const 5))))))))
 
     ;; WM_CREATE
     (if (i32.eq (local.get $msg) (i32.const 0x0001))
@@ -324,6 +344,65 @@
       (then
         (call $heap_free (local.get $state))
         (call $wnd_set_state_ptr (local.get $hwnd) (i32.const 0))
+        (return (i32.const 0))))
+
+    ;; Trackbars keep direction keys when IsDialogMessage queries the control.
+    ;; Tab remains dialog navigation (DLGC_WANTARROWS, not WANTALLKEYS).
+    (if (i32.eq (local.get $msg) (i32.const 0x0087))
+      (then (return (i32.const 1))))
+
+    ;; WM_KEYDOWN / WM_KEYUP: VK_PRIOR..VK_DOWN are exactly the eight
+    ;; navigation keys. TBS_VERT changes the notification message, while
+    ;; TBS_REVERSED is a label and does not reverse the keyboard direction.
+    (if (i32.and
+          (i32.or (i32.eq (local.get $msg) (i32.const 0x0100))
+                  (i32.eq (local.get $msg) (i32.const 0x0101)))
+          (i32.and (i32.ge_u (local.get $wParam) (i32.const 0x21))
+                   (i32.le_u (local.get $wParam) (i32.const 0x28))))
+      (then
+        (local.set $code (i32.const 8)) ;; TB_ENDTRACK on relevant key release.
+        (if (i32.eq (local.get $msg) (i32.const 0x0100))
+          (then
+            (local.set $pos (call $trk_pos (local.get $sw)))
+            (if (i32.le_u (local.get $wParam) (i32.const 0x22))
+              (then
+                (local.set $step (local.get $page))
+                (local.set $code (i32.sub (local.get $wParam) (i32.const 0x1f))))
+              (else
+                (if (i32.le_u (local.get $wParam) (i32.const 0x24))
+                  (then
+                    (local.set $pos
+                      (select (call $trk_min (local.get $sw)) (call $trk_max (local.get $sw))
+                        (i32.eq (local.get $wParam) (i32.const 0x24))))
+                    (local.set $code
+                      (select (i32.const 6) (i32.const 7)
+                        (i32.eq (local.get $wParam) (i32.const 0x24)))))
+                  (else
+                    (local.set $step (call $trk_line (local.get $sw)))
+                    (local.set $code
+                      (select (i32.const 0) (i32.const 1)
+                        (i32.le_u (local.get $wParam) (i32.const 0x26))))))))
+            ;; Widen before stepping so an overshoot cannot wrap past the
+            ;; opposite endpoint before the inclusive range clamp.
+            (local.set $next_pos
+              (i64.add (i64.extend_i32_s (local.get $pos))
+                (select
+                  (i64.sub (i64.const 0) (i64.extend_i32_s (local.get $step)))
+                  (i64.extend_i32_s (local.get $step))
+                  (i32.eqz (i32.and (local.get $code) (i32.const 1))))))
+            (if (i64.lt_s (local.get $next_pos) (i64.extend_i32_s (call $trk_min (local.get $sw))))
+              (then (local.set $next_pos (i64.extend_i32_s (call $trk_min (local.get $sw))))))
+            (if (i64.gt_s (local.get $next_pos) (i64.extend_i32_s (call $trk_max (local.get $sw))))
+              (then (local.set $next_pos (i64.extend_i32_s (call $trk_max (local.get $sw))))))
+            (call $trk_set_pos (local.get $sw) (i32.wrap_i64 (local.get $next_pos)))
+            (call $invalidate_hwnd (local.get $hwnd))))
+        (local.set $vert (i32.and (call $wnd_get_style (local.get $hwnd)) (i32.const 0x0002)))
+        ;; Keyboard notifications carry no position in HIWORD. Publish the
+        ;; position first: the parent may synchronously query TBM_GETPOS.
+        (drop (call $wnd_send_message
+          (call $wnd_get_parent (local.get $hwnd))
+          (select (i32.const 0x0115) (i32.const 0x0114) (local.get $vert))
+          (local.get $code) (local.get $hwnd)))
         (return (i32.const 0))))
 
     ;; TBM_GETPOS / TBM_GETRANGEMIN / TBM_GETRANGEMAX
@@ -357,21 +436,25 @@
     (if (i32.eq (local.get $msg) (i32.const 0x0407))
       (then
         (call $trk_set_min (local.get $sw) (local.get $lParam))
+        (if (i32.lt_s (call $trk_pos (local.get $sw)) (local.get $lParam))
+          (then (call $trk_set_pos (local.get $sw) (local.get $lParam))))
         (if (local.get $wParam) (then (call $invalidate_hwnd (local.get $hwnd))))
         (return (i32.const 0))))
     (if (i32.eq (local.get $msg) (i32.const 0x0408))
       (then
         (call $trk_set_max (local.get $sw) (local.get $lParam))
+        (if (i32.gt_s (call $trk_pos (local.get $sw)) (local.get $lParam))
+          (then (call $trk_set_pos (local.get $sw) (local.get $lParam))))
         (if (local.get $wParam) (then (call $invalidate_hwnd (local.get $hwnd))))
         (return (i32.const 0))))
     ;; TBM_SETPAGESIZE / GETPAGESIZE / SETLINESIZE / GETLINESIZE
     (if (i32.eq (local.get $msg) (i32.const 0x0415))
       (then
-        (local.set $old (call $trk_page (local.get $sw)))
+        (local.set $old (local.get $page))
         (call $trk_set_page (local.get $sw) (local.get $lParam))
         (return (local.get $old))))
     (if (i32.eq (local.get $msg) (i32.const 0x0416))
-      (then (return (call $trk_page (local.get $sw)))))
+      (then (return (local.get $page))))
     (if (i32.eq (local.get $msg) (i32.const 0x0417))
       (then
         (local.set $old (call $trk_line (local.get $sw)))
@@ -379,6 +462,55 @@
         (return (local.get $old))))
     (if (i32.eq (local.get $msg) (i32.const 0x0418))
       (then (return (call $trk_line (local.get $sw)))))
+    ;; TBM_GETTHUMBRECT (WM_USER+25) / TBM_GETCHANNELRECT (WM_USER+26).
+    ;; lParam is a caller RECT in trackbar client coordinates; no return value.
+    ;; Match the existing WM_PAINT bounds, including its minimum thumb length
+    ;; and wide signed range calculation, without painting or invalidating.
+    (if (i32.or (i32.eq (local.get $msg) (i32.const 0x0419))
+                (i32.eq (local.get $msg) (i32.const 0x041A)))
+      (then
+        (if (i32.eqz (local.get $lParam)) (then (return (i32.const 0))))
+        (local.set $rect (call $g2w (local.get $lParam)))
+        (local.set $sz (call $ctrl_get_wh_packed (local.get $hwnd)))
+        (local.set $w (i32.and (local.get $sz) (i32.const 0xFFFF)))
+        (local.set $h (i32.shr_u (local.get $sz) (i32.const 16)))
+        (local.set $vert (i32.and (call $wnd_get_style (local.get $hwnd)) (i32.const 0x0002)))
+        (local.set $cx (i32.div_s (local.get $w) (i32.const 2)))
+        (local.set $cy (i32.div_s (local.get $h) (i32.const 2)))
+        (if (i32.eq (local.get $msg) (i32.const 0x041A))
+          (then
+            (i32.store (local.get $rect)
+              (select (i32.sub (local.get $cx) (i32.const 2)) (i32.const 4) (local.get $vert)))
+            (i32.store offset=4 (local.get $rect)
+              (select (i32.const 4) (i32.sub (local.get $cy) (i32.const 2)) (local.get $vert)))
+            (i32.store offset=8 (local.get $rect)
+              (select (i32.add (local.get $cx) (i32.const 2)) (i32.sub (local.get $w) (i32.const 4)) (local.get $vert)))
+            (i32.store offset=12 (local.get $rect)
+              (select (i32.sub (local.get $h) (i32.const 4)) (i32.add (local.get $cy) (i32.const 2)) (local.get $vert)))
+            (return (i32.const 0))))
+        (local.set $thumb_len (call $trk_thumb_len (local.get $sw)))
+        (if (i32.lt_s (local.get $thumb_len) (i32.const 8)) (then (local.set $thumb_len (i32.const 8))))
+        (local.set $track_len
+          (i32.sub (select (local.get $h) (local.get $w) (local.get $vert)) (local.get $thumb_len)))
+        (if (i32.lt_s (local.get $track_len) (i32.const 1)) (then (local.set $track_len (i32.const 1))))
+        (local.set $min (call $trk_min (local.get $sw)))
+        (local.set $range
+          (i64.sub (i64.extend_i32_s (call $trk_max (local.get $sw))) (i64.extend_i32_s (local.get $min))))
+        (if (i64.le_s (local.get $range) (i64.const 0)) (then (local.set $range (i64.const 1))))
+        (local.set $thumb_pos
+          (i32.wrap_i64 (i64.div_s
+            (i64.mul (i64.sub (i64.extend_i32_s (call $trk_pos (local.get $sw))) (i64.extend_i32_s (local.get $min)))
+              (i64.extend_i32_s (local.get $track_len)))
+            (local.get $range))))
+        (i32.store (local.get $rect)
+          (select (i32.sub (local.get $cx) (i32.const 8)) (local.get $thumb_pos) (local.get $vert)))
+        (i32.store offset=4 (local.get $rect)
+          (select (local.get $thumb_pos) (i32.sub (local.get $cy) (i32.const 8)) (local.get $vert)))
+        (i32.store offset=8 (local.get $rect)
+          (select (i32.add (local.get $cx) (i32.const 8)) (i32.add (local.get $thumb_pos) (local.get $thumb_len)) (local.get $vert)))
+        (i32.store offset=12 (local.get $rect)
+          (select (i32.add (local.get $thumb_pos) (local.get $thumb_len)) (i32.add (local.get $cy) (i32.const 8)) (local.get $vert)))
+        (return (i32.const 0))))
     ;; TBM_SETTHUMBLENGTH / GETTHUMBLENGTH
     (if (i32.eq (local.get $msg) (i32.const 0x041B))
       (then
@@ -393,7 +525,7 @@
     (if (i32.or
           (i32.eq (local.get $msg) (i32.const 0x0201))
           (i32.and (i32.eq (local.get $msg) (i32.const 0x0200))
-                   (i32.eq (global.get $capture_hwnd) (local.get $hwnd))))
+                   (i32.eq (call $capture_live) (local.get $hwnd))))
       (then
         (local.set $sz (call $ctrl_get_wh_packed (local.get $hwnd)))
         (local.set $w (i32.and (local.get $sz) (i32.const 0xffff)))
@@ -417,14 +549,16 @@
         (if (i32.gt_s (local.get $coord) (local.get $track_len)) (then (local.set $coord (local.get $track_len))))
         (local.set $min (call $trk_min (local.get $sw)))
         (local.set $max (call $trk_max (local.get $sw)))
-        (local.set $range (i32.sub (local.get $max) (local.get $min)))
-        (if (i32.le_s (local.get $range) (i32.const 0)) (then (local.set $range (i32.const 1))))
+        ;; Full signed32 endpoints need 33 bits even before the pixel product.
+        (local.set $range (i64.sub (i64.extend_i32_s (local.get $max)) (i64.extend_i32_s (local.get $min))))
+        (if (i64.le_s (local.get $range) (i64.const 0)) (then (local.set $range (i64.const 1))))
         (local.set $pos
-          (i32.add (local.get $min)
-            (i32.div_s (i32.mul (local.get $coord) (local.get $range)) (local.get $track_len))))
+          (i32.wrap_i64 (i64.add (i64.extend_i32_s (local.get $min))
+            (i64.div_s (i64.mul (i64.extend_i32_s (local.get $coord)) (local.get $range))
+              (i64.extend_i32_s (local.get $track_len))))))
         (call $trk_set_pos (local.get $sw) (local.get $pos))
         (if (i32.eq (local.get $msg) (i32.const 0x0201))
-          (then (global.set $capture_hwnd (local.get $hwnd))))
+          (then (call $capture_store (local.get $hwnd))))
         (call $invalidate_hwnd (local.get $hwnd))
         (local.set $parent (call $wnd_get_parent (local.get $hwnd)))
         (local.set $scroll_msg (select (i32.const 0x0115) (i32.const 0x0114) (local.get $vert)))
@@ -436,9 +570,9 @@
 
     (if (i32.eq (local.get $msg) (i32.const 0x0202))
       (then
-        (if (i32.eq (global.get $capture_hwnd) (local.get $hwnd))
+        (if (i32.eq (call $capture_live) (local.get $hwnd))
           (then
-            (global.set $capture_hwnd (i32.const 0))
+            (call $capture_store (i32.const 0))
             (local.set $pos (call $trk_pos (local.get $sw)))
             (local.set $vert (i32.and (call $wnd_get_style (local.get $hwnd)) (i32.const 0x0002)))
             (local.set $scroll_msg (select (i32.const 0x0115) (i32.const 0x0114) (local.get $vert)))
@@ -466,8 +600,8 @@
         (local.set $min (call $trk_min (local.get $sw)))
         (local.set $max (call $trk_max (local.get $sw)))
         (local.set $pos (call $trk_pos (local.get $sw)))
-        (local.set $range (i32.sub (local.get $max) (local.get $min)))
-        (if (i32.le_s (local.get $range) (i32.const 0)) (then (local.set $range (i32.const 1))))
+        (local.set $range (i64.sub (i64.extend_i32_s (local.get $max)) (i64.extend_i32_s (local.get $min))))
+        (if (i64.le_s (local.get $range) (i64.const 0)) (then (local.set $range (i64.const 1))))
         (local.set $thumb_len (call $trk_thumb_len (local.get $sw)))
         (if (i32.lt_s (local.get $thumb_len) (i32.const 8)) (then (local.set $thumb_len (i32.const 8))))
         (if (local.get $vert)
@@ -475,9 +609,10 @@
             (local.set $track_len (i32.sub (local.get $h) (local.get $thumb_len)))
             (if (i32.lt_s (local.get $track_len) (i32.const 1)) (then (local.set $track_len (i32.const 1))))
             (local.set $thumb_pos
-              (i32.div_s
-                (i32.mul (i32.sub (local.get $pos) (local.get $min)) (local.get $track_len))
-                (local.get $range)))
+              (i32.wrap_i64 (i64.div_s
+                (i64.mul (i64.sub (i64.extend_i32_s (local.get $pos)) (i64.extend_i32_s (local.get $min)))
+                  (i64.extend_i32_s (local.get $track_len)))
+                (local.get $range))))
             (local.set $cx (i32.div_s (local.get $w) (i32.const 2)))
             (drop (call $gdi_native_draw_edge (local.get $hdc)
                     (i32.sub (local.get $cx) (i32.const 2)) (i32.const 4)
@@ -511,21 +646,25 @@
                         (i32.sub (local.get $w) (i32.const 5)) (i32.sub (local.get $h) (i32.const 5))
                         (i32.sub (local.get $w) (i32.const 2)) (i32.sub (local.get $h) (i32.const 4))
                         (i32.const 0x30014)))))
-            (drop (call $gdi_native_fill_rect (local.get $hdc)
-                    (i32.sub (local.get $cx) (i32.const 8)) (local.get $thumb_pos)
-                    (i32.add (local.get $cx) (i32.const 8)) (i32.add (local.get $thumb_pos) (local.get $thumb_len))
-                    (i32.const 0x30011)))
-            (drop (call $gdi_native_draw_edge (local.get $hdc)
-                    (i32.sub (local.get $cx) (i32.const 8)) (local.get $thumb_pos)
-                    (i32.add (local.get $cx) (i32.const 8)) (i32.add (local.get $thumb_pos) (local.get $thumb_len))
-                    (i32.const 0x05) (i32.const 0x0F))))
+            ;; TBS_NOTHUMB suppresses only the slider, preserving channel/ticks.
+            (if (i32.eqz (i32.and (local.get $style) (i32.const 0x0080)))
+              (then
+                (drop (call $gdi_native_fill_rect (local.get $hdc)
+                        (i32.sub (local.get $cx) (i32.const 8)) (local.get $thumb_pos)
+                        (i32.add (local.get $cx) (i32.const 8)) (i32.add (local.get $thumb_pos) (local.get $thumb_len))
+                        (i32.const 0x30011)))
+                (drop (call $gdi_native_draw_edge (local.get $hdc)
+                        (i32.sub (local.get $cx) (i32.const 8)) (local.get $thumb_pos)
+                        (i32.add (local.get $cx) (i32.const 8)) (i32.add (local.get $thumb_pos) (local.get $thumb_len))
+                        (i32.const 0x05) (i32.const 0x0F))))))
           (else
             (local.set $track_len (i32.sub (local.get $w) (local.get $thumb_len)))
             (if (i32.lt_s (local.get $track_len) (i32.const 1)) (then (local.set $track_len (i32.const 1))))
             (local.set $thumb_pos
-              (i32.div_s
-                (i32.mul (i32.sub (local.get $pos) (local.get $min)) (local.get $track_len))
-                (local.get $range)))
+              (i32.wrap_i64 (i64.div_s
+                (i64.mul (i64.sub (i64.extend_i32_s (local.get $pos)) (i64.extend_i32_s (local.get $min)))
+                  (i64.extend_i32_s (local.get $track_len)))
+                (local.get $range))))
             (local.set $cy (i32.div_s (local.get $h) (i32.const 2)))
             (drop (call $gdi_native_draw_edge (local.get $hdc)
                     (i32.const 4) (i32.sub (local.get $cy) (i32.const 2))
@@ -551,14 +690,16 @@
                     (i32.const 0x30014)))
                   (local.set $i (i32.add (local.get $i) (i32.const 1)))
                   (br $ticks)))))
-            (drop (call $gdi_native_fill_rect (local.get $hdc)
-                    (local.get $thumb_pos) (i32.sub (local.get $cy) (i32.const 8))
-                    (i32.add (local.get $thumb_pos) (local.get $thumb_len)) (i32.add (local.get $cy) (i32.const 8))
-                    (i32.const 0x30011)))
-            (drop (call $gdi_native_draw_edge (local.get $hdc)
-                    (local.get $thumb_pos) (i32.sub (local.get $cy) (i32.const 8))
-                    (i32.add (local.get $thumb_pos) (local.get $thumb_len)) (i32.add (local.get $cy) (i32.const 8))
-                    (i32.const 0x05) (i32.const 0x0F)))))
+            (if (i32.eqz (i32.and (local.get $style) (i32.const 0x0080)))
+              (then
+                (drop (call $gdi_native_fill_rect (local.get $hdc)
+                        (local.get $thumb_pos) (i32.sub (local.get $cy) (i32.const 8))
+                        (i32.add (local.get $thumb_pos) (local.get $thumb_len)) (i32.add (local.get $cy) (i32.const 8))
+                        (i32.const 0x30011)))
+                (drop (call $gdi_native_draw_edge (local.get $hdc)
+                        (local.get $thumb_pos) (i32.sub (local.get $cy) (i32.const 8))
+                        (i32.add (local.get $thumb_pos) (local.get $thumb_len)) (i32.add (local.get $cy) (i32.const 8))
+                        (i32.const 0x05) (i32.const 0x0F)))))))
         (return (i32.const 0))))
     (i32.const 0))
 

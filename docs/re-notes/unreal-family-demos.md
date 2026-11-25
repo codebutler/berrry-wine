@@ -536,6 +536,39 @@ Route (box2; flags as for UT2003 above):
 
 ## UT 348 route (2026-10-06)
 
+### Native main-menu input handoff (2026-11-21)
+
+`scratch/runs/20261121-ut-mainmenu-handoff/` proves one unchanged 599-file
+original through its normal Software Rendering wizard, rendered main menu,
+and **Game → Start Practice Session**. `original/after-12.png` shows the
+Practice setup screen with Tournament DeathMatch, `dm-morpheusdemo`, and its
+Morpheus preview. This checkpoint does not establish a started match.
+
+The retained failure mixed splash thread 2's HWND 98305 with thread 1's
+shared capture HWND 65560. Its native wait repeatedly displaced the actual
+input owner's observation. `guest-rpc.js` now omits scene metadata when native
+capture belongs to another thread; native calls and routing remain unchanged.
+The original subsequently observed the main actor at slot 0 with matching
+focus/capture 65560. A separate authored window-replacement case exposed the
+private requester's inability to retire a successfully completed old scene.
+The production guard's `release(owner, nonce)` relinquishes only completed
+native input with trusted physical UP and the same process/transport
+incarnation. It grants no new authority: a subsequent `bind()` must pass the
+unchanged fresh-scene checks.
+
+Both causes have separate actual-Worker authored old-fail/new-pass controls.
+The original reused the accepted startup transport and focus-navigation
+evidence without rerunning those controls. All six observed CPUWorkers
+matched the retained `d7a39d3fa` module
+`2c37a26bd614bc2b2529d3921185bc111aa11547c1454135b9a01fca2a3a03f2`;
+the exact two production JS changes are retained as `candidate.patch`.
+Ten physical actions received exact native ACKs and prearmed independent
+trusted UP/release ACKs within unchanged bounds. After reopening Game, two
+Down presses visibly selected Start Practice Session; Enter opened it.
+No focus, guest/configuration, pump, or presentation override was used.
+Normal shutdown completed with both native supervisors exiting 0, no leaks,
+and drained wrapper/browser/display/release waits. No box was created.
+
 `--app=ut348_demo` mounts `test/binaries/candidates/unreal-tournament-348-demo/extracted/`
 through a manifest written by `node tools/gen-tree-manifest.js <root>
 --exe=System/UnrealTournament.exe --flatten=System`. The game opens
@@ -594,6 +627,53 @@ buffer is at `core+0x101f65fc`, readable with `--dump` after the exit).
   only the HUD (death/respawn view).
 
 Evidence: `scratch/runs/20261006T001500Z-ut348-demo-claude202b4b39-dm-morpheus`.
+
+### Upload/first-run path, Worker main (issue #30, 2026-11-24)
+
+The ZIP upload route (no registry INI overrides: `FirstRun=0`, SoftDrv,
+mounted at `c:\program files\<zip>\`, exe in `System\`) now reaches the
+UWindow menu in the browser with Threads on, and a DM-MorpheusDEMO match on
+the headless CLI. Two causes, neither in the guest:
+
+- **The splash thread lost its WM_QUIT.** `UnrealTournament.exe` shows its
+  splash from a thread (`0x109018a0`: CreateDialogParam 0x77, SetWindowPos
+  TOPMOST, then a GetMessage loop with no DestroyWindow). ExitSplash
+  (`0x10901be0`) ends it with `PostThreadMessage(tid, WM_QUIT)`, and the
+  thread's exit destroys the splash. With the guest main thread in a Worker,
+  the splash thread's Worker starts *after* that post, and `init_thread` reset
+  the thread's shared USER queue, dropping the quit. The splash (hwnd
+  `0x18001` = app base + 0x8000, i.e. worker thread 1) then sat over the
+  wizard and took every click (`[input] hwnd=0x18001 msg=0x201`), which is the
+  "wizard and splash" screenshot of the 2026-11-18 rerun. The queue is now
+  cleared when CreateThread allocates the id (`ThreadManager.createThread`),
+  not at the asynchronous instance start. `test/test-post-thread-message-before-start.js`.
+  The CLI never showed it: its thread instances (coop or `--threads`) start
+  before the creator runs on.
+- **CLI `--zip-exe` set no guest exe path**, so mounted private-DLL admission
+  had no directory and Core/Engine/Window.dll bound to stubs: the CLI twin of
+  the original issue trap (`?appPackage@@YAPBGXZ`). `--zip-exe` now reports the
+  exe at its place in the mounted archive.
+
+The child process whose `ExitProcess(0)` the 2026-11-18 rerun reported is the
+renderer probe (`testrendev=D3DDrv.D3DRenderDevice log=Detected.log`), which
+exits by design; the parent never ends. In the browser the probe child sets
+"(Exiting)" about 0.4 s after start (after a failed `fetch` of a guest-path
+`ole32.dll`), and in the CLI the parent's 100 x Sleep(100) poll expires long
+before the separate child process finishes, so on both routes the wizard
+offers only Software Rendering. Not fixed; it only decides the renderer.
+
+CLI route (upload layout, wizard Next x3 by mouse, then the match):
+
+    node test/run.js --zip=unreal-tournament.zip \
+      --zip-root="c:\program files\unreal tournament" \
+      --zip-exe='System\UnrealTournament.exe' --args=DM-MorpheusDEMO \
+      --spawn-processes --stuck-after=0 --batch-size=200000 --max-batches=1850 \
+      --input=700:mousedown:223:418,703:mouseup:223:418,900:mousedown:223:418,...
+
+Next x3 completes by batch ~1250, the map renders on SoftDrv by ~1500
+(~20 batches/s once in the level). Evidence `scratch/runs/20261124-issue30-ut99`
+(browser1 = before, browser2-after = after, r5-zip = CLI trap before,
+r7-zip-match = CLI 3D scene; `browser-upload-driver.js` is the upload driver).
 
 ## Deus Ex demo on OpenGlDrv (2026-10-06, OPENGLDRV-GL11-SURFACE)
 
@@ -1946,3 +2026,54 @@ PID/port/profile absence afterward. The board watcher was also stopped.
 Free disk stayed above 2 GB. No Boat/test box was allocated
 (ID/state/expiry N/A), public deployment or successor launch occurred.
 `RECOVERY.md`, `result.json` and `final.txt` retain replay and limitations.
+
+## UT 348 on GlideDrv: RenDev assertion is windowed Glide on a Voodoo Graphics (2026-11-14, UT348-GLIDE-RENDEV)
+
+Symptom: with all three `[Engine.Engine]` devices set to
+`GlideDrv.GlideRenderDevice` and `StartupFullscreen=False`, UT dies with
+`Assertion failed: RenDev [File:E:\unreal220\WinDrv\Src\WinViewport.cpp]
+[Line: 343]` (OpenWindow <- UGameEngine::Init). GlideDrv.dll *does* load and
+Glide initializes; `System\UnrealTournament.log` (get it with
+`--save-vfs=DIR --save-vfs-suffix=.log`) shows, twice (Game- then
+WindowedRenderDevice):
+
+    Init: Found Glide: 2.43 Wine Assembly
+    Init: Glide info: Type=0, fbRam=4 fbiRev=2 nTexelfx=1 Sli=0
+    Init: grSstOpen Res=7 Ref=0 Buffers=2
+    Init: Glide tmu 0: tmuRev=1 tmuRam=4 Space=4194296
+    Log: Flushed Glide TMU 0
+    Log: 3d hardware initialization failed
+
+GlideDrv (image base 0x10700000, unrelocated in this run) copies
+`GrHwConfiguration` to `this+0xbc` (so `this+0xc0` = `SSTs[0].type`). Its
+SetRes (0x10702d00; the tail at 0x10702ff0) does: if Fullscreen ->
+`Viewport->ResizeViewport(BLIT_Fullscreen..)`; else if `type == 1`
+(`GR_SSTTYPE_SST96`, Voodoo Rush) -> windowed `ResizeViewport`; **else
+return 0**. So on a Voodoo Graphics board GlideDrv refuses a window, exactly
+as on real hardware; the stock INI only gets away with it because
+WindowedRenderDevice is SoftDrv. `-window` does **not** force windowed in
+348 -- only `StartupFullscreen` matters. Nothing in our Glide is wrong here.
+
+With the same INI but `StartupFullscreen=True` (with or without `-window`) UT
+plays DM-MorpheusDEMO on Glide on the CLI (Glide asks for 3 colour buffers,
+gets FXFALSE, falls back to 2, as Deus Ex does). The emulator-side
+alternative -- answering `grSstQueryHardware` as a Voodoo Rush -- would make
+windowed GlideDrv work but changes the board identity (and the
+`SST96Config` struct layout) for every Glide 2 app, so it was not done.
+Fix for the registry: when GlideDrv is selected, set
+`WinDrv.WindowsClient StartupFullscreen=True` like `deusExIniSet`.
+
+CLI repro (`--vfs-mount` now applies after the app manifest, so it can
+replace one manifest file for a run):
+
+    node test/run.js --app=ut348_demo --args="DM-MorpheusDEMO -window" \
+      --quiet-api --max-seconds=55 --max-batches=1000000 --batch-size=100000 \
+      --stuck-after=1000000 \
+      --vfs-mount="INI=c:\System\UnrealTournament.ini" \
+      --vfs-mount="INI=c:\UnrealTournament.ini" \
+      --save-vfs=DIR --save-vfs-suffix=.log --png=OUT.png --no-close
+
+Without `--max-batches` the CLI stops at 200 batches inside UT's CPU-speed
+loop (exe+0x10903523), and without `--stuck-after` it reports STUCK there.
+Evidence: `scratch/runs/20261114-ut348-glide` (run3 = failure + log, run5 =
+fullscreen Glide gameplay `fullscreen.png`, run6 = fullscreen INI + `-window`).

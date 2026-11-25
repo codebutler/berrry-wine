@@ -56,7 +56,10 @@
     ;; GetMessage/PeekMessage call instead of using it as a throwaway probe.
     (if (i32.eqz (global.get $pending_input_packed))
       (then
+        (call $native_user_event (i32.const 3) (i32.const 0))
         (local.set $packed (call $host_check_input))
+        (global.set $pending_input_token (call $host_check_input_token))
+        (call $native_user_event (i32.const 4) (local.get $packed))
         (if (i32.ne (local.get $packed) (i32.const 0))
           (then
             (global.set $pending_input_packed (local.get $packed))
@@ -143,7 +146,10 @@
     ;; The host probe removes an event. Keep all its fields for the following
     ;; PeekMessage/GetMessage and do not probe again while that event is cached.
     (if (i32.eqz (global.get $pending_input_packed)) (then
-      (local.set $packed (call $host_check_input))
+      (call $native_user_event (i32.const 3) (i32.const 0))
+        (local.set $packed (call $host_check_input))
+        (global.set $pending_input_token (call $host_check_input_token))
+        (call $native_user_event (i32.const 4) (local.get $packed))
       (if (local.get $packed) (then
         (global.set $pending_input_packed (local.get $packed))
         (global.set $pending_input_hwnd (call $host_check_input_hwnd (global.get $focus_hwnd)))
@@ -159,13 +165,13 @@
   ;; pane from dialog-control placements), so a fixed 640x480 rect produces
   ;; negative child dimensions.
   (func $handle_GetWindowPlacement (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $wa i32) (local $x i32) (local $y i32)
-    (local.set $wa (call $g2w (local.get $arg1)))
+    (local $x i32) (local $y i32) (local $right i32) (local $bottom i32)
+    (local $rect_guest i32) (local $rect i32) (local $saved i32)
     ;; length = 44
-    (i32.store (local.get $wa) (i32.const 44))
+    (call $gs32 (local.get $arg1) (i32.const 44))
     ;; flags: WPF_RESTORETOMAXIMIZED (0x0002) when this icon will come back
     ;; maximized. That is the one thing an app cannot work out from showCmd.
-    (i32.store offset=4 (local.get $wa)
+    (call $gs32 (i32.add (local.get $arg1) (i32.const 4))
       (select (i32.const 2) (i32.const 0)
         (i32.and (call $wnd_min_get (local.get $arg0))
                  (call $wnd_max_get (local.get $arg0)))))
@@ -173,16 +179,16 @@
     ;; It was the constant 1, so an app restoring its own window from its saved
     ;; placement — how Win9x apps persist "start maximized" — always came back
     ;; normal no matter what it had been.
-    (i32.store offset=8 (local.get $wa)
+    (call $gs32 (i32.add (local.get $arg1) (i32.const 8))
       (select (i32.const 2)
         (select (i32.const 3) (i32.const 1) (call $wnd_max_get (local.get $arg0)))
         (call $wnd_min_get (local.get $arg0))))
     ;; ptMinPosition = (0,0)
-    (i32.store offset=12 (local.get $wa) (i32.const 0))
-    (i32.store offset=16 (local.get $wa) (i32.const 0))
+    (call $gs32 (i32.add (local.get $arg1) (i32.const 12)) (i32.const 0))
+    (call $gs32 (i32.add (local.get $arg1) (i32.const 16)) (i32.const 0))
     ;; ptMaxPosition = (-1,-1)
-    (i32.store offset=20 (local.get $wa) (i32.const -1))
-    (i32.store offset=24 (local.get $wa) (i32.const -1))
+    (call $gs32 (i32.add (local.get $arg1) (i32.const 20)) (i32.const -1))
+    (call $gs32 (i32.add (local.get $arg1) (i32.const 24)) (i32.const -1))
     ;; rcNormalPosition = current window rectangle. Child placement uses
     ;; parent-client coordinates; top-level placement uses screen coordinates.
     ;;
@@ -201,22 +207,47 @@
       (then
         (local.set $x (call $ctrl_get_x_s (local.get $arg0)))
         (local.set $y (call $ctrl_get_y_s (local.get $arg0)))
+        (local.set $right (i32.add (local.get $x) (call $wnd_screen_w (local.get $arg0))))
+        (local.set $bottom (i32.add (local.get $y) (call $wnd_screen_h (local.get $arg0))))
         ;; An iconic child's icon position is ptMinPosition.
         (if (call $wnd_min_get (local.get $arg0))
           (then
-            (i32.store offset=12 (local.get $wa) (local.get $x))
-            (i32.store offset=16 (local.get $wa) (local.get $y))))
-        (i32.store offset=28 (local.get $wa) (local.get $x))
-        (i32.store offset=32 (local.get $wa) (local.get $y))
-        (i32.store offset=36 (local.get $wa)
-          (i32.add (local.get $x) (call $wnd_screen_w (local.get $arg0))))
-        (i32.store offset=40 (local.get $wa)
-          (i32.add (local.get $y) (call $wnd_screen_h (local.get $arg0))))
-        (drop (call $wnd_normal_rect_out (local.get $arg0)
-          (i32.add (local.get $wa) (i32.const 28)))))
+            (call $gs32 (i32.add (local.get $arg1) (i32.const 12)) (local.get $x))
+            (call $gs32 (i32.add (local.get $arg1) (i32.const 16)) (local.get $y))))
+        ;; An iconic or maximized MDI child's rcNormalPosition is the
+        ;; rectangle it will come back to, not the one it has now.
+        (local.set $saved (call $wnd_normal_saved (local.get $arg0)))
+        (if (local.get $saved)
+          (then
+            (local.set $x (i32.load offset=4 (local.get $saved)))
+            (local.set $y (i32.load offset=8 (local.get $saved)))
+            (local.set $right (i32.add (local.get $x) (i32.load offset=12 (local.get $saved))))
+            (local.set $bottom (i32.add (local.get $y) (i32.load offset=16 (local.get $saved)))))))
       (else
-        (call $host_get_window_rect (local.get $arg0)
-          (i32.add (local.get $wa) (i32.const 28)))))
+        ;; The host writes a contiguous RECT. Align sixteen bytes within this
+        ;; invocation's live allocation: the slot cannot cross a guest page,
+        ;; even when heap pages have unrelated backing. A nested host/guest
+        ;; callback owns another allocation, never a shared scratch rectangle.
+        (local.set $rect_guest (call $heap_alloc (i32.const 31)))
+        (if (i32.eqz (local.get $rect_guest))
+          (then
+            (global.set $last_error (i32.const 8))
+            (i32.store (global.get $reg_base) (i32.const 0))
+            (i32.store offset=16 (global.get $reg_base)
+              (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
+            (return)))
+        (local.set $rect (call $g2w
+          (i32.and (i32.add (local.get $rect_guest) (i32.const 15)) (i32.const -16))))
+        (call $host_get_window_rect (local.get $arg0) (local.get $rect))
+        (local.set $x (i32.load (local.get $rect)))
+        (local.set $y (i32.load offset=4 (local.get $rect)))
+        (local.set $right (i32.load offset=8 (local.get $rect)))
+        (local.set $bottom (i32.load offset=12 (local.get $rect)))
+        (call $heap_free (local.get $rect_guest))))
+    (call $gs32 (i32.add (local.get $arg1) (i32.const 28)) (local.get $x))
+    (call $gs32 (i32.add (local.get $arg1) (i32.const 32)) (local.get $y))
+    (call $gs32 (i32.add (local.get $arg1) (i32.const 36)) (local.get $right))
+    (call $gs32 (i32.add (local.get $arg1) (i32.const 40)) (local.get $bottom))
     (i32.store offset=0 (global.get $reg_base) (i32.const 1))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))  ;; stdcall, 2 args
   )
@@ -956,8 +987,9 @@
   ;; 618: SetWindowPlacement(hWnd, lpwndpl) — 2 args stdcall
   ;; WINDOWPLACEMENT: length(0), flags(4), showCmd(8), ptMin(12,16), ptMax(20,24), rcNormal(28: left,top,right,bottom)
   (func $handle_SetWindowPlacement (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $wa i32) (local $left i32) (local $top i32) (local $right i32) (local $bottom i32)
+    (local $left i32) (local $top i32) (local $right i32) (local $bottom i32)
     (local $show i32)
+    (local $wa i32)
     (local.set $wa (call $g2w (local.get $arg1)))
     (if (call $mdi_child_set_placement (local.get $arg0) (local.get $wa))
       (then
@@ -967,11 +999,11 @@
     ;; Snapshot every consumed WINDOWPLACEMENT field in this invocation's
     ;; Wasm locals BEFORE the position transaction enters guest code. The
     ;; caller may overwrite/free its structure or nest another placement.
-    (local.set $show (i32.load offset=8 (local.get $wa)))
-    (local.set $left   (i32.load offset=28 (local.get $wa)))
-    (local.set $top    (i32.load offset=32 (local.get $wa)))
-    (local.set $right  (i32.load offset=36 (local.get $wa)))
-    (local.set $bottom (i32.load offset=40 (local.get $wa)))
+    (local.set $show (call $gl32 (i32.add (local.get $arg1) (i32.const 8))))
+    (local.set $left   (call $gl32 (i32.add (local.get $arg1) (i32.const 28))))
+    (local.set $top    (call $gl32 (i32.add (local.get $arg1) (i32.const 32))))
+    (local.set $right  (call $gl32 (i32.add (local.get $arg1) (i32.const 36))))
+    (local.set $bottom (call $gl32 (i32.add (local.get $arg1) (i32.const 40))))
     ;; Use USER's changing -> commit -> changed transaction. It retains the
     ;; CLIENT_RECT/host mirror repair and lets DefWindowProc derive WM_SIZE
     ;; from the committed client, including ordinary already-visible moves.
@@ -1333,7 +1365,7 @@ GetTopWindow(hWnd) — 1 arg stdcall
         (local.set $base (call $scroll_bar_addr (local.get $slot)
           (call $scroll_bar_is_vert (local.get $arg0) (local.get $arg1))))
         (local.set $aux (call $scroll_aux_bar_addr (local.get $slot)
-          (i32.ne (local.get $arg1) (i32.const 0))))
+          (call $scroll_bar_is_vert (local.get $arg0) (local.get $arg1))))
         ;; SIF_RANGE = 0x01
         (if (i32.and (local.get $fMask) (i32.const 1))
           (then
@@ -2393,23 +2425,6 @@ GetTopWindow(hWnd) — 1 arg stdcall
     (i32.store offset=16 (local.get $p) (local.get $h))
     (i32.store (local.get $p) (i32.const 1)))
 
-  ;; GetWindowPlacement's rcNormalPosition for an iconic or maximized MDI
-  ;; child: the rectangle it will come back to, not the one it has now.
-  ;; Writes left/top/right/bottom at $out and returns 1 when one is saved.
-  (func $wnd_normal_rect_out (param $child i32) (param $out i32) (result i32)
-    (local $p i32) (local $x i32) (local $y i32)
-    (local.set $p (call $wnd_normal_saved (local.get $child)))
-    (if (i32.eqz (local.get $p)) (then (return (i32.const 0))))
-    (local.set $x (i32.load offset=4 (local.get $p)))
-    (local.set $y (i32.load offset=8 (local.get $p)))
-    (i32.store (local.get $out) (local.get $x))
-    (i32.store offset=4 (local.get $out) (local.get $y))
-    (i32.store offset=8 (local.get $out)
-      (i32.add (local.get $x) (i32.load offset=12 (local.get $p))))
-    (i32.store offset=12 (local.get $out)
-      (i32.add (local.get $y) (i32.load offset=16 (local.get $p))))
-    (i32.const 1))
-
   (func $mdi_icon_height (param $child i32) (result i32)
     ;; Caption (18) plus the frame above and below it.
     (i32.add (i32.const 18)
@@ -3017,6 +3032,8 @@ GetTopWindow(hWnd) — 1 arg stdcall
   ;; 663: MapDialogRect(hDlg, lpRect) — convert dialog units to pixels.
   (func $handle_MapDialogRect (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $p i32) (local $base_x i32) (local $base_y i32)
+    (local $index i32) (local $offset i32)
+    (local $product i64) (local $divisor i64) (local $rounded i64)
     (if (i32.eqz (local.get $arg1))
       (then
         (i32.store offset=0 (global.get $reg_base) (i32.const 0))
@@ -3028,16 +3045,35 @@ GetTopWindow(hWnd) — 1 arg stdcall
       (i32.and (call $dialog_base_units (local.get $arg0)) (i32.const 0xFFFF)))
     (local.set $base_y
       (i32.shr_u (call $dialog_base_units (local.get $arg0)) (i32.const 16)))
-    ;; x pixels = MulDiv(dialogX, baseX, 4)
-    (store.field.memarg Rect left (local.get $p)
-      (i32.div_s (i32.mul (load.field.memarg Rect left (local.get $p)) (local.get $base_x)) (i32.const 4)))
-    (store.field.memarg Rect right (local.get $p)
-      (i32.div_s (i32.mul (load.field.memarg Rect right (local.get $p)) (local.get $base_x)) (i32.const 4)))
-    ;; y pixels = MulDiv(dialogY, baseY, 8)
-    (store.field.memarg Rect top (local.get $p)
-      (i32.div_s (i32.mul (load.field.memarg Rect top (local.get $p)) (local.get $base_y)) (i32.const 8)))
-    (store.field.memarg Rect bottom (local.get $p)
-      (i32.div_s (i32.mul (load.field.memarg Rect bottom (local.get $p)) (local.get $base_y)) (i32.const 8)))
+    ;; MapDialogRect specifies MulDiv: signed 64-bit product, nearest integer,
+    ;; ties away from zero, and -1 if the rounded result is outside signed i32.
+    ;; Base units are unsigned 16-bit, so product plus half-divisor fits i64.
+    ;; Visit left/right/top/bottom, retaining the existing load/store order.
+    (loop $coordinates
+      (local.set $offset
+        (i32.or (i32.shl (i32.and (local.get $index) (i32.const 1)) (i32.const 3))
+          (i32.shl (i32.and (local.get $index) (i32.const 2)) (i32.const 1))))
+      (local.set $divisor
+        (select (i64.const 4) (i64.const 8) (i32.lt_u (local.get $index) (i32.const 2))))
+      (local.set $product
+        (i64.mul (i64.extend_i32_s (load.field.memarg Rect left (i32.add (local.get $p) (local.get $offset))))
+          (i64.extend_i32_u
+            (select (local.get $base_x) (local.get $base_y)
+              (i32.lt_u (local.get $index) (i32.const 2))))))
+      (local.set $rounded
+        (i64.div_s
+          (i64.add (local.get $product)
+            (select
+              (i64.sub (i64.const 0) (i64.div_u (local.get $divisor) (i64.const 2)))
+              (i64.div_u (local.get $divisor) (i64.const 2))
+              (i64.lt_s (local.get $product) (i64.const 0))))
+          (local.get $divisor)))
+      (store.field.memarg Rect left (i32.add (local.get $p) (local.get $offset))
+        (select (i32.const -1) (i32.wrap_i64 (local.get $rounded))
+          (i32.or (i64.lt_s (local.get $rounded) (i64.const -2147483648))
+            (i64.gt_s (local.get $rounded) (i64.const 2147483647)))))
+      (local.set $index (i32.add (local.get $index) (i32.const 1)))
+      (br_if $coordinates (i32.lt_u (local.get $index) (i32.const 4))))
     (i32.store offset=0 (global.get $reg_base) (i32.const 1))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
   )
@@ -3080,7 +3116,7 @@ GetTopWindow(hWnd) — 1 arg stdcall
   ;; Reads the child Edit control's WAT-side text buffer directly (via
   ;; state_ptr offsets that match $handle_edit_wndproc WM_GETTEXT) and
   ;; parses a decimal integer. bSigned lets a leading '-' flip the sign.
-  ;; *lpTranslated receives TRUE iff at least one digit was consumed.
+  ;; *lpTranslated receives TRUE iff digits were consumed without positive overflow.
   (func $handle_GetDlgItemInt (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $child i32) (local $state i32) (local $state_w ptr<ControlTextState>)
     (local $buf_wa i32) (local $text_len i32)
@@ -3124,6 +3160,22 @@ GetTopWindow(hWnd) — 1 arg stdcall
                   (local.set $c (i32.load8_u (i32.add (local.get $buf_wa) (local.get $i))))
                   (br_if $parse_done (i32.lt_u (local.get $c) (i32.const 0x30)))
                   (br_if $parse_done (i32.gt_u (local.get $c) (i32.const 0x39)))
+                  ;; Check the next positive digit before multiply/add can wrap.
+                  ;; Preserve the existing negative-input arithmetic unchanged.
+                  (if (i32.eqz (local.get $neg))
+                    (then
+                      (if (i32.or
+                            (i32.gt_u (local.get $val)
+                              (select (i32.const 214748364) (i32.const 429496729) (local.get $arg3)))
+                            (i32.and
+                              (i32.eq (local.get $val)
+                                (select (i32.const 214748364) (i32.const 429496729) (local.get $arg3)))
+                              (i32.gt_u (local.get $c)
+                                (select (i32.const 0x37) (i32.const 0x35) (local.get $arg3)))))
+                        (then
+                          (local.set $val (i32.const 0))
+                          (local.set $ok (i32.const 0))
+                          (br $parse_done)))))
                   (local.set $val (i32.add
                     (i32.mul (local.get $val) (i32.const 10))
                     (i32.sub (local.get $c) (i32.const 0x30))))
@@ -3723,22 +3775,42 @@ Layout(hdc) -> DWORD — return 0 (LTR layout)
   ;; JS clamps subsequent mouse input to this rect so apps that watch for the
   ;; cursor reaching a clipped edge (Bricks/Klotski) see Win32-like coords.
   (func $handle_ClipCursor (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $rc i32)
+    (local $pos i32) (local $x i32) (local $y i32)
     (if (i32.eqz (local.get $arg0))
       (then
         (global.set $clip_cursor_active (i32.const 0))
         (i32.store offset=0 (global.get $reg_base) (i32.const 1))
         (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
         (return)))
-    (local.set $rc (call $g2w (local.get $arg0)))
-    (global.set $clip_cursor_l (load.field Rect left (local.get $rc)))
-    (global.set $clip_cursor_t (load.field.memarg Rect top (local.get $rc)))
-    (global.set $clip_cursor_r (load.field.memarg Rect right (local.get $rc)))
-    (global.set $clip_cursor_b (load.field.memarg Rect bottom (local.get $rc)))
+    ;; RECT fields can straddle separately backed guest pages.
+    (global.set $clip_cursor_l (call $gl32 (i32.add (local.get $arg0) (offset-of Rect left))))
+    (global.set $clip_cursor_t (call $gl32 (i32.add (local.get $arg0) (offset-of Rect top))))
+    (global.set $clip_cursor_r (call $gl32 (i32.add (local.get $arg0) (offset-of Rect right))))
+    (global.set $clip_cursor_b (call $gl32 (i32.add (local.get $arg0) (offset-of Rect bottom))))
     (global.set $clip_cursor_active
       (i32.and
         (i32.lt_s (global.get $clip_cursor_l) (global.get $clip_cursor_r))
         (i32.lt_s (global.get $clip_cursor_t) (global.get $clip_cursor_b))))
+    ;; Establish confinement immediately, before any later mouse input.
+    ;; Use the existing packed signed-coordinate read and cursor-warp import;
+    ;; Worker RPC flushes that warp before the following GetCursorPos read.
+    (if (global.get $clip_cursor_active)
+      (then
+        (local.set $pos (call $host_get_mouse_position))
+        (local.set $x (i32.shr_s (i32.shl (local.get $pos) (i32.const 16)) (i32.const 16)))
+        (local.set $y (i32.shr_s (local.get $pos) (i32.const 16)))
+        (if (i32.lt_s (local.get $x) (global.get $clip_cursor_l))
+          (then (local.set $x (global.get $clip_cursor_l))))
+        (if (i32.ge_s (local.get $x) (global.get $clip_cursor_r))
+          (then (local.set $x (i32.sub (global.get $clip_cursor_r) (i32.const 1)))))
+        (if (i32.lt_s (local.get $y) (global.get $clip_cursor_t))
+          (then (local.set $y (global.get $clip_cursor_t))))
+        (if (i32.ge_s (local.get $y) (global.get $clip_cursor_b))
+          (then (local.set $y (i32.sub (global.get $clip_cursor_b) (i32.const 1)))))
+        (if (i32.or
+              (i32.ne (local.get $x) (i32.shr_s (i32.shl (local.get $pos) (i32.const 16)) (i32.const 16)))
+              (i32.ne (local.get $y) (i32.shr_s (local.get $pos) (i32.const 16))))
+          (then (call $host_set_mouse_position (local.get $x) (local.get $y))))))
     (i32.store offset=0 (global.get $reg_base) (i32.const 1))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
   )
@@ -3748,23 +3820,21 @@ Layout(hdc) -> DWORD — return 0 (LTR layout)
   ;; screen rather than failing; fullscreen games use that successful query
   ;; while switching from a menu cursor to their playfield cursor.
   (func $handle_GetClipCursor (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $rc i32)
     (if (i32.eqz (local.get $arg0))
       (then
         (i32.store offset=0 (global.get $reg_base) (i32.const 0))
         (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
         (return)))
-    (local.set $rc (call $g2w (local.get $arg0)))
-    (store.field Rect left (local.get $rc)
+    (call $gs32 (i32.add (local.get $arg0) (offset-of Rect left))
       (select (global.get $clip_cursor_l) (i32.const 0)
         (global.get $clip_cursor_active)))
-    (store.field Rect top (local.get $rc)
+    (call $gs32 (i32.add (local.get $arg0) (offset-of Rect top))
       (select (global.get $clip_cursor_t) (i32.const 0)
         (global.get $clip_cursor_active)))
-    (store.field Rect right (local.get $rc)
+    (call $gs32 (i32.add (local.get $arg0) (offset-of Rect right))
       (select (global.get $clip_cursor_r) (call $screen_metric_w)
         (global.get $clip_cursor_active)))
-    (store.field Rect bottom (local.get $rc)
+    (call $gs32 (i32.add (local.get $arg0) (offset-of Rect bottom))
       (select (global.get $clip_cursor_b) (call $screen_metric_h)
         (global.get $clip_cursor_active)))
     (i32.store offset=0 (global.get $reg_base) (i32.const 1))

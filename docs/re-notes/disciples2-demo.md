@@ -369,3 +369,269 @@ Static native modules now receive distinct, process-shared readable PE identity 
 With this change, the same original DLL closure reports TRUE from all five DllMain calls and starts executing the EXE. This is a startup regression check, not a new gameplay or Safari verification: only the EXE/DLL closure was available locally; the headless run had no renderer. Evidence runs: `20261019-disciples2-dll-control`, `20261019-disciples2-dll-native-images` under root scratch/runs.
 
 Validation: full candidate build gates pass; native image direct/sparse fixtures, cross-instance identity/reference release, allocation-failure retry, DLL rollback/completion and DirectX version chain (11/11) pass. The wide API suite retains four failures reproduced on baseline (older KERNEL32 identity expectations and manually inserted lifecycle-less DLL rows); the changed module identity and DSOUND ordinal cases pass. No deployment or full game rerun.
+
+## November 12 current map and page-read limit
+
+Run `20261112-disciples2-post-battle-healing-save-0510` used published runtime
+`af0e208e9` / actual Worker `1165f15c…`, with all721 source/helper/media pins
+verified. The original Canvas2D route reached day1 Huun’reh, and ordinary
+plotted/confirmed eastward movement reduced Move20/20→16/20. The passive
+capture after the northeast approach exceeded its20s controller budget;
+there was no completed encounter frame or battle input.
+
+A changed fresh attempt doubled the work budget to40s and sought a map save
+first. The reviewed image after the disk-icon click still showed the map,
+not a Save panel. Before the next Escape input, page-session `Runtime.evaluate`
+for the exact `bound-input.cjs` PAGE_READ owner expression received no reply
+for35s. Escape was never dispatched. This identifies the observed barrier
+as a page-owner read, not proven Save serialization or Escape consumption.
+No debugger stack was captured; the page, diagnostic getter, guest and protocol
+causes remain unresolved. A larger timeout alone did not resolve it.
+
+No new day, healing, recruitment, battle reward or native Save/load checkpoint
+was established. The prior November7 victory remains its separate evidence.
+MW3-specific guest mouse fields in the inherited helper were invalid for this
+app and excluded; only generic viewport/renderer fields mapped clicks.
+The request client's `oomKilled` flag is retained without a memory-cause claim.
+
+The coordinator verified641 recovered references /559 unique raw hashes and
+the full eastward-movement and unchanged-map images. Both actual runtime
+parents exited1 with separate output EOF; both Chrome parents exited0/EOF.
+The box stopped normally before expiry, with watchdog/manager/client wait0/EOF.
+No production code or build was changed. `RESULT.txt` and
+`retrieval-manifest.json` retain exact source, outputs and failed-request timing.
+A fresh task prearms independent page/debugger observations before reproducing
+the read, then resumes native menu/Save/day progression only if responsive.
+
+## November 12 reproduced kernel OOM before the stalled read
+
+Run `20261112-disciples2-page-read-stall-native-save-0534` establishes a cause
+for its two fresh reproductions, not retrospectively for the inaccessible0510
+box. Kernel logs show `CONSTRAINT_MEMCG` kills of owning-runtime Chrome
+PIDs7813 and12523 at05:38:55Z and05:46:23Z, before the unanswered page reads.
+Their anonymous RSS was approximately6.7 and6.6GB. `/user.slice` reached its
+7,789,871,104-byte limit with swap disabled. The exact Chrome subprocess role
+and allocation site were not captured; a page-renderer attribution is inference.
+
+During the second stall, independent browser version/target requests continued
+to answer. Trivial page evaluation, isolate lookup and debugger pause did not;
+no paused stack arrived. The earlier normal rendering stack preceded the kill
+and does not explain it. Increasing PAGE_READ timeout cannot recover the killed
+process. The next task records process roles and allocation growth before OOM,
+then repairs the demonstrated source or helper cause without weakening ownership
+checks. A larger allocation alone would not prove a repair.
+
+Native Escape did open the reviewed Options screen after five separately
+reviewed story panels. Save, day change, healing and Load/movement remain
+unproved. Source stayedaf0e208e9 / actual Worker1165f15c;724pins matched.
+The coordinator verified550 recovered references /489 unique raw hashes,
+the kernel kill records and the full Options image. Both runtime parents
+exited1/EOF; Chrome parents exited0, and the box stopped normally before expiry
+with owner/client/watchdog wait0/EOF. No production change or build was made.
+Exact logs and failed CDP request IDs remain in the run's `RESULT.txt` and
+`retrieval-manifest.json`.
+
+## November 12 Chrome allocation repair and native day two
+
+Run `20261112-disciples2-chrome-growth-native-save-0602` locates the growing
+allocation and repairs it in published main commit `703015ea5`. The original
+DirectSound long-ring snapshot fallback repeatedly decoded PCM and created
+replacement Web Audio sources while AudioContext was suspended at time zero.
+Stopping the old source at `currentTime + 0.005` could not retire its acquired
+buffer while that clock remained frozen. Native allocation samples attributed
+3,064 MiB of 3,408 MiB to `blink::AudioBuffer::AudioBuffer`, reached through
+`BaseAudioContext::createBuffer`; the host path is `_decodePcm` / `playRing`.
+Independent per-PID sampling identifies the growing subprocess as renderer8564:
+885→4,340 MiB anonymous RSS over162 seconds. This connects the previous
+reproduced memory-limit failure to a concrete producer; it does not establish
+the inaccessible0510 box's cause.
+
+The fix coalesces suspended refreshes only for the nonqueued looping snapshot
+fallback. Resume rebuilds once from latest PCM at the current guest cursor;
+Stop cancels pending work. The bounded small-ring queue retains its existing
+behavior. A 2,000-refresh regression fails against exact `af0e208e9` and passes
+with the repair; resume, scaled guest cursor, duplicate state event and Stop
+cancellation are covered. Six focused audio suites and the locked full build
+pass. Neither guest code, module admission nor repeated source/owner checks
+were weakened.
+
+The controlled repaired menu arm remained approximately400 MiB renderer anonymous
+RSS over183 seconds; its native AudioBuffer sample was0.3125 MiB. The final
+source then ran the original quest for almost20 minutes, with sampled renderer peak
+781 MiB during actual gameplay. Its forwarding-only allocation observer counted
+exactly two initial AudioBuffers through day two, and Wasm memory stayed512 MiB.
+AudioContext remained suspended, so audible playback is not claimed.
+
+The same surviving Canvas2D page completed Timmoria / Undead Hordes / default
+Warrior Lord, the five individually reviewed story panels, Escape→Options,
+native Save Game named `s`, and the **Game saved successfully** confirmation.
+The complete native `c:\savegame\s.sg` is208,644 bytes, SHA-256
+`ebfe38e5852b16c1c6bdefcb1d007abcda38877c4332944415ad6b5f527e12e8`.
+Two independent passive reads match; its whole-save manifest is
+`native-save-whole.json`. No partial save restoration or guest state writes
+were used. Space opened the native End Turn confirmation, Enter accepted it,
+the original game wrote AutoSave, and the Empire turn/message completed.
+The separately reviewed `day-two-income.png` shows **Beginning day2**;
+`income-two-accept.png` shows the returned map, day2 and Huunreh Move20/20.
+Day1 also showed20/20; this run does not prove replenishment from spent movement.
+The earlier candidate mouse controls did not advance the day; Enter on the map
+opened chat and was closed normally. Only Space/confirmation earns the day claim.
+
+Runtime was exact `af0e208e9` plus the audio repair, canonical Worker
+`1165f15cb29fa4ff4b67621f3ce66f8df68fb50baea929d0b76e9b2f66118135`,
+registered original EXE `adba242a0a3563651baffa6ec7d9a6c0978b7ae844a1cccedb2a1f4e8eb7b1f8`,
+with parent724 pins through GitPinBytes; concurrent host-window/thread changes
+were excluded. Final754 pins match after completion. All three browser parents
+and their actual runtime parents exited0 with separate output EOFs; profiles,
+ports and process lifetimes closed. Independent recovery verified837 references.
+Box `bx_zfbgtfjv` stopped normally at06:36:12Z before its06:54:18Z lease;
+independent GET confirms archived, expiry null, stop
+`stop_39dce5560033bb34` completed / forced=false. The manager and independent
+watchdogs have actual wait0/EOF receipts; the outer submitting tool exited143,
+so no additional outer-client wait receipt is claimed. Next: native Load of the
+preserved whole save and fresh movement; day-two saving, healing and combat
+remain outside this run's claims.
+
+## November 12 native reload, replenishment and day-two save
+
+Run `20261112-disciples2-native-load-day2-progress-0648` restored the authentic
+whole day-one `s.sg` through public FS with independent byte/hash readback,
+then used normal Load and fresh map movement: Move20→10 with changed position.
+Native End Turn advanced to day2 and replenished the spent movement10→20.
+This adds the replenishment proof absent from the earlier0602 run; it is not
+healing or a new battle result.
+
+Native Save produced complete `c:\savegame\d.sg`,208157 bytes, SHA256
+`1c133e45c1066f838dba546ea395ba31971019fe48737347101992d83c81d912`.
+Use `day-two-native-whole.json` entry2 and `day-two-native-whole-2.bin`.
+Three whole exports match. After an unsaved move, normal Load discarded that
+move and restored the saved day2 position/20 movement. File-read coverage was
+exactly[0,208157), with zero failures. Fresh movement then changed position and
+spent20→10 again; it was **not resaved**. Future continuation must restore the
+whole authentic d.sg, verify readback, and use native Load.
+
+The coordinator checked660 references /610 unique raw hashes, whole save
+exports and full loaded/moved images. The successful parent runtime is exact
+af0e208e9 plus703015ea5 audio changes, canonical1165 Wasm and779 pinned files;
+do not substitute a later host closure wholesale. Sampled peak749.172MiB over
+994.916s, two AudioBuffers and no OOM were observed. Audio remained suspended;
+this is Canvas2D, with no GL/FPS/audio/parity claim. Runtime, Chrome, lifecycle
+owner/client and watchdog actual waits all reached0/EOF; the box stopped
+normally before expiry. No production change/build/commit was needed.
+
+The next bounded objective is native recruitment or new quest progress from
+the saved day2 state, preserving a living successor save and reload/movement.
+The earlier human-trio victory alone is already covered and is not new progress.
+
+## November 12 recruited party and reloadable army save
+
+Run `20261112-disciples2-day2-party-quest-progress-0723` restored only the
+whole authentic d.sg and used native capital management to hire Death Knight
+Hagog for500 gold and a Fighter for50. Trusted native mouse drags moved the
+new Fighter and existing garrison Initiate into Hagog's party. The completed
+and reloaded roster shows Hagog150/150, Fighter120/120, Initiate45/45,
+leadership2/3. Gold fell600→100→50. Original Huun'reh remains a separate
+party10/20 near the capital; Hagog exited with20/20. No building was bought.
+Helper labels mentioning Ghoul were wrong; completed unit frames show Fighter.
+
+Native Save wrote separate `c:\savegame\a.sg`,209429 bytes, SHA256
+`10b106e180c9d8fe76da441a103edac1acdaf398593f505f19de471ac6213811`.
+Use `party-successor-whole.json` entry1 / `party-successor-whole-1.bin`.
+Independent public readback and post-reload whole export match. Normal Load
+discarded unsaved movement and restored the saved position, full roster and
+20/20. Native read coverage spans every209429 byte, zero failures. Fresh map
+plot/confirm then changed position and spent20→10; it was not resaved.
+The preferred a therefore retains Hagog20/20 at the capital entrance.
+Parent d and all779 inherited pins remain unchanged. The next task uses this
+expanded party for a new quest encounter; no new combat occurred here.
+
+The coordinator checked1135 references /1050 unique raw hashes, both complete
+successor exports, full reloaded roster and fresh-movement images. Runtime
+remains exactaf0e208e9 plus703015ea5 audio, canonical1165/compat048fd50c;
+Git source compiled in memory reproduced both pinned modules after current
+build bytes changed. This is Canvas2D, with no new GL/FPS/audio/parity/healing
+or day advancement claim. No production change or task commit was needed.
+Actual runtime/Chrome parents and durable lifecycle/watchdogs reached0/EOF;
+outer transport143 and absent separate client/owner waits remain qualified.
+The box stopped normally before expiry. `RECOVERY.md` binds exact restoration.
+
+## November 12 three-unit victory and unqualified postbattle save
+
+Run `20261112-disciples2-recruited-party-quest-encounter-0758` used the recruited
+Hagog/Fighter/Initiate party to defeat two40-HP Peasants and a65-HP Thug.
+All survived and earned7 XP each. Victory health was131/150,92/120,45/45;
+native End Turn reached day3 with150/150,116/120,45/45 and Move20/20.
+No settlement or quest-clear result follows.
+
+Native Save acknowledged complete `c:\savegame\f.sg`,207944 bytes, SHA256
+`4f2b4ceadb0fd23a32128ce3798d02880b89843201f009615ce5eafb56b53184`;
+`postbattle-save-whole.json` entry2 binds the full file. Independent public
+readback and later exports match. **This successor is unqualified for Load.**
+Ordinary Load and a changed fresh-process Load both read all207944 bytes with
+zero failures, then remained Please Wait for over3 minutes. Captures stayed
+responsive and the canonical Worker lived. A passive PC/stack probe sampled
+rectangle/clipping arithmetic, but does not establish the cause. Do not call
+this corruption or a specific rendering defect without stronger evidence.
+
+Keep the known-good recruited-party a.sg as the recovery point, with d unchanged.
+The fresh task compares exact f and a loading and targets a demonstrated cause;
+it does not repeat the battle or promote f. Runtime remainsaf0+703/canonical1165,
+all779 parent pins plus32 helpers verified. No production change/build/commit.
+The coordinator checked1118 final references /1018 unique raw hashes, the whole
+f file, full victory/XP and fresh Please Wait images. Both game/Chrome parent
+pairs exited0 with separate EOFs; normal box stop passed. Outer transport143
+remains separate. Canvas2D supplies no GL/FPS/audio/parity claim.
+
+## November 12 postbattle Load: native AI stream version mismatch
+
+Run `20261112-disciples2-postbattle-native-load-cause-0836` compared ordinary
+native Load in two fresh processes on the exact af0+703 closure. Whole publicFS
+restore/readback matched authentic f and parent a. Parent a reached the day2
+quest/map; f again read all207944 bytes (31765 reads,223566 bytes including
+rereads,0 failures) and stalled. No battle was repeated and f remains unqualified
+for restored party or fresh movement. The prior qualified a fallback is unchanged.
+
+Passive samples of **loading thread4 / Worker slot3**, using mapped guest stack
+reads, identify `CAiStrategic` deserialization, not the main thread's wait-screen
+rendering. Native `0x445b86` reads a list count, then `0x445c00..0x445c39`
+constructs/inserts that many nodes. The captured count is `0x80630000`
+(2153971712). The `CStreamBits` source at guest184621808 has length292 and
+position292; its complete292 bytes equal original f offsets[2743,3035).
+The first player's obsolete tactic-tail count13 and special count2 were also
+read back from live native objects. The second player's strategic list grew
+through millions of entries while EOF reads failed; native entry helpers ignore
+those failures. A final full capture at08:57:17Z shows a SmartHeap out-of-memory
+Abort/Retry/Ignore dialog after that growth (11848767 nodes sampled). This is a
+later consequence of the identified count loop, not an assumed initial OOM cause.
+No input was sent to the loading guest or the heap dialog.
+
+Original EXE disassembly supplies the version mismatch without changing guest
+state: `0x5c160c` hardcodes header version2, whereas AI saving at `0x4206a3`
+passes `0x7fffffff` to the same serializer. Loading reads header offset16 through
+`0x5c17f6`, forwards it via `0x425d4b/0x425859` to server setter `0x41f4be`,
+and `0x41d3dc` passes it to AI reading. Live server version is2. Version2 skips
+states gated at32 and enables an obsolete tactic tail gated below34. The
+latest writer takes the other layout. Thus the original native reader consumes
+a packed object-ID value as a list count; complete host file reads cannot fix it.
+
+The read-only `audit-native-schema.py` checks original opcode bytes, both whole
+save hashes and this exact version2 walk. For f: strategic0, tactic0, obsolete
+tail13 at blob+8, special2 at+220, then second strategic count`0x80630000` at+256
+(file2999). For a: tail5, special13 at+92 requests through+304 beyond its272-byte
+blob. The original bounded stream reader leaves destinations unchanged on EOF;
+a freshly empty subsequent strategic list therefore retains count0. This explains
+why a can escape the pathological loop; that final a parsing explanation is an
+inference from the original reader/initializer, not a new full AI-state fidelity
+claim. The a control's full map was reviewed; no new a movement or roster proof
+is claimed in this diagnosis.
+
+The remaining dependency is a native save/read AI-schema compatibility decision
+for this original demo EXE. No emulator instruction/API defect was demonstrated,
+and no emulator patch, save edit, forced guest call or skipped code was applied.
+A guard that drops the huge list would conceal deserialization failure and cannot
+qualify f. Repair needs a demonstrated legitimate compatibility path or separately
+authorized native compatibility work, then original whole f ordinary Load and
+fresh movement. Do not enlarge the timeout or replay the battle. Evidence includes
+mapped thread stacks, original disassemblies, byte audit, full canonical Canvas2D
+frames and separate runtime/Chrome actual-parent EOFs. No GL/FPS/audio/parity
+claim follows; the run's RESULT/RECOVERY files bind lifecycle and recovery.

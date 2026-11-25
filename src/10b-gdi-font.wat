@@ -1981,9 +1981,9 @@
           (local.set $b (call $gdi_bitmap_font_scaled_ink_value (local.get $hdc) (local.get $strike)
             (call $tt_entry_width (local.get $entry)) (local.get $height)))))
       (local.set $dest (i32.add (local.get $out) (i32.mul (local.get $i) (i32.const 12))))
-      (i32.store (local.get $dest) (local.get $a))
-      (i32.store offset=4 (local.get $dest) (local.get $b))
-      (i32.store offset=8 (local.get $dest) (i32.sub (i32.sub (local.get $advance) (local.get $a)) (local.get $b)))
+      (call $gs32 (local.get $dest) (local.get $a))
+      (call $gs32 (i32.add (local.get $dest) (i32.const 4)) (local.get $b))
+      (call $gs32 (i32.add (local.get $dest) (i32.const 8)) (i32.sub (i32.sub (local.get $advance) (local.get $a)) (local.get $b)))
       (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $characters)))
     (i32.const 1))
 
@@ -2002,7 +2002,7 @@
       (i32.add (i32.sub (local.get $last) (local.get $first)) (i32.const 1)))
     (block $done (loop $characters
       (br_if $done (i32.ge_u (local.get $i) (local.get $count)))
-      (i32.store (i32.add (local.get $output) (i32.shl (local.get $i) (i32.const 2)))
+      (call $gs32 (i32.add (local.get $output) (i32.shl (local.get $i) (i32.const 2)))
         (call $gdi_font_character_width (local.get $hdc)
           (i32.add (local.get $first) (local.get $i)) (local.get $wide)))
       (local.set $i (i32.add (local.get $i) (i32.const 1)))
@@ -2039,12 +2039,8 @@
     (local.set $caret (i32.load offset=16 (local.get $results)))
     (local.set $class (i32.load offset=20 (local.get $results)))
     (local.set $glyphs (i32.load offset=24 (local.get $results)))
-    (if (local.get $out_string) (then (local.set $out_string (call $g2w (local.get $out_string)))))
-    (if (local.get $order) (then (local.set $order (call $g2w (local.get $order)))))
-    (if (local.get $dx) (then (local.set $dx (call $g2w (local.get $dx)))))
-    (if (local.get $caret) (then (local.set $caret (call $g2w (local.get $caret)))))
-    (if (local.get $class) (then (local.set $class (call $g2w (local.get $class)))))
-    (if (local.get $glyphs) (then (local.set $glyphs (call $g2w (local.get $glyphs)))))
+    ;; Text/results retain the physical helper ABI. Nested pointers are guest
+    ;; addresses: translate each access, including split WORDs and DWORDs.
     (block $done (loop $characters
       (br_if $done (i32.ge_u (local.get $i) (local.get $limit)))
       (local.set $character
@@ -2071,19 +2067,19 @@
               (local.get $max_extent)))
         (then (br $done)))
       (if (local.get $out_string)
-        (then (i32.store16
+        (then (call $gs16
           (i32.add (local.get $out_string) (i32.shl (local.get $included) (i32.const 1)))
           (local.get $character))))
       (if (local.get $order)
-        (then (i32.store
+        (then (call $gs32
           (i32.add (local.get $order) (i32.shl (local.get $included) (i32.const 2)))
           (local.get $i))))
       (if (local.get $dx)
-        (then (i32.store
+        (then (call $gs32
           (i32.add (local.get $dx) (i32.shl (local.get $included) (i32.const 2)))
           (local.get $width))))
       (if (local.get $caret)
-        (then (i32.store
+        (then (call $gs32
           (i32.add (local.get $caret) (i32.shl (local.get $included) (i32.const 2)))
           (local.get $extent))))
       ;; GCP_CLASSIN preserves nonzero caller classifications. Otherwise Latin
@@ -2092,11 +2088,11 @@
         (then
           (if (i32.or
                 (i32.eqz (i32.and (local.get $flags) (i32.const 0x00080000)))
-                (i32.eqz (i32.load8_u (i32.add (local.get $class) (local.get $included)))))
-            (then (i32.store8
+                (i32.eqz (call $gl8 (i32.add (local.get $class) (local.get $included)))))
+            (then (call $gs8
               (i32.add (local.get $class) (local.get $included)) (i32.const 1))))))
       (if (local.get $glyphs)
-        (then (i32.store16
+        (then (call $gs16
           (i32.add (local.get $glyphs) (i32.shl (local.get $included) (i32.const 1)))
           (local.get $character))))
       (local.set $extent (i32.add (local.get $extent) (local.get $width)))
@@ -2119,9 +2115,9 @@
         (local.set $i (i32.const 0))
         (block $justify_done (loop $justify
           (br_if $justify_done (i32.ge_u (local.get $i) (local.get $included)))
-          (i32.store (i32.add (local.get $dx) (i32.shl (local.get $i) (i32.const 2)))
+          (call $gs32 (i32.add (local.get $dx) (i32.shl (local.get $i) (i32.const 2)))
             (i32.add
-              (i32.load (i32.add (local.get $dx) (i32.shl (local.get $i) (i32.const 2))))
+              (call $gl32 (i32.add (local.get $dx) (i32.shl (local.get $i) (i32.const 2))))
               (i32.add (local.get $share)
                 (i32.lt_u (local.get $i) (local.get $remainder)))))
           (local.set $i (i32.add (local.get $i) (i32.const 1)))
@@ -2286,6 +2282,10 @@
     (if (i32.eqz (call $gdi_raster_clip_visible_row
           (local.get $hdc) (local.get $desc) (local.get $x) (local.get $y)))
       (then (return (i32.const 0))))
+    ;; A deferred DirectDraw DC (09abg $d3dim_gps_getdc_defer) learns the
+    ;; pixel before it is written.
+    (if (global.get $d3g_gdi_text_t)
+      (then (call $d3dim_gps_gdi_pixel (local.get $x) (local.get $y))))
     (if (i32.and
           (i32.le_u (i32.load offset=16 (local.get $desc)) (i32.const 8))
           (i32.eq (i32.and (local.get $color) (i32.const 0xFFFF0000))
@@ -2981,8 +2981,16 @@
               (i32.eqz (local.get $text)))))
       (then (return (i32.const 0))))
     (local.set $desc (global.get $GDI_BITMAP_FONT_DESC))
+    ;; Text reads no destination pixels: a DirectDraw DC whose GPU target was
+    ;; opened deferred stays deferred, and each pixel written below is
+    ;; reported to $d3dim_gps_gdi_pixel instead.
+    (global.set $d3g_gdi_text_t (i32.const 0))
+    (global.set $gdi_dx_bounded (i32.const 1))
     (if (i32.eqz (call $gdi_surface_descriptor (local.get $hdc) (local.get $desc)))
-      (then (return (i32.const 0))))
+      (then
+        (global.set $gdi_dx_bounded (i32.const 0))
+        (return (i32.const 0))))
+    (global.set $gdi_dx_bounded (i32.const 0))
     ;; Native Win98 accepts ETO_OPAQUE/ETO_CLIPPED with no rectangle: there is
     ;; no extra rectangle operation, but text and TA_UPDATECP execute. D3DX fonts
     ;; depend on that advance when deciding whether a glyph is empty.
@@ -3403,7 +3411,12 @@
     (if (i32.and (i32.ne (i32.and (local.get $align) (i32.const 1)) (i32.const 0))
           (i32.eqz (local.get $dx_array)))
       (then (local.set $update_x (i32.add (local.get $update_x)
-        (call $gdi_bitmap_text_device_x_delta (local.get $desc) (local.get $width))))))
+        ;; Character extra belongs to every character, including the last.
+        ;; Layout width excludes that trailing space; the next run must not.
+        (call $gdi_bitmap_text_device_x_delta (local.get $desc)
+          (i32.add (local.get $width)
+            (select (local.get $char_extra) (i32.const 0)
+              (i32.gt_s (local.get $count) (i32.const 0)))))))))
     (if (i32.ne (i32.and (local.get $align) (i32.const 1)) (i32.const 0))
       (then
         (drop (call $gdi_dc_set_field (local.get $hdc) (i32.const 12)
@@ -3710,6 +3723,14 @@
       (br $draw_lines)))
     (drop (call $gdi_dc_set_field (local.get $hdc) (i32.const 32)
       (local.get $saved_align) (i32.const 0)))
+    ;; Vertically aligned single-line text reports the distance from the
+    ;; rectangle top to the rendered cell bottom, including its top margin.
+    ;; device_y now follows the last cell; convert the complete span back to
+    ;; logical units once, so DC origins and scaling do not alter the offset.
+    (if (i32.and (local.get $single_line)
+          (i32.ne (i32.and (local.get $format) (i32.const 12)) (i32.const 0)))
+      (then (return (call $gdi_bitmap_text_device_y_delta
+        (local.get $desc) (i32.sub (local.get $device_y) (local.get $top_device))))))
     (local.get $total_height))
 
   (func (export "test_gdi_bitmap_font_count") (result i32)

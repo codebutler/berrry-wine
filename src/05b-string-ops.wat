@@ -19,6 +19,10 @@
   ;; backing, so validate the complete spans before using memory.copy/fill.
   ;; The byte fallback also preserves memmove overlap semantics.
   (func $guest_memmove (param $dst i32) (param $src i32) (param $size i32)
+    (call $guest_memmove_body (local.get $dst) (local.get $src) (local.get $size))
+    (if (global.get $selective_watch_on)
+      (then (call $selective_watch_check (i32.const 0) (i32.const 0) (i32.const 3)))))
+  (func $guest_memmove_body (param $dst i32) (param $src i32) (param $size i32)
     (local $i i32) (local $chunk i32) (local $remaining i32)
     ;; This bulk API has no architectural REP continuation. Refuse it before
     ;; any notification/store in the opt-in REP debugger mode.
@@ -92,6 +96,10 @@
           (br $forward))))))
 
   (func $guest_memset (param $dst i32) (param $value i32) (param $size i32)
+    (call $guest_memset_body (local.get $dst) (local.get $value) (local.get $size))
+    (if (global.get $selective_watch_on)
+      (then (call $selective_watch_check (i32.const 0) (i32.const 0) (i32.const 3)))))
+  (func $guest_memset_body (param $dst i32) (param $value i32) (param $size i32)
     (local $i i32) (local $chunk i32)
     (if (global.get $rep_store_step) (then (unreachable)))
     (if (i32.eqz (local.get $size)) (then (return)))
@@ -182,6 +190,10 @@
   ;; element count and must be nonzero; n*w wraps exactly as the old
   ;; per-width bodies' `n << 2` did.
   (func $rep_movs_mem (param $edi i32) (param $esi i32) (param $n i32) (param $w i32)
+    (call $rep_movs_mem_body (local.get $edi) (local.get $esi) (local.get $n) (local.get $w))
+    (if (global.get $selective_watch_on)
+      (then (call $selective_watch_check (i32.const 0) (i32.const 0) (i32.const 3)))))
+  (func $rep_movs_mem_body (param $edi i32) (param $esi i32) (param $n i32) (param $w i32)
     (local $bytes i32) (local $dst i32) (local $src i32) (local $step i32)
     (local $i i32) (local $d i32) (local $s i32)
     ;; Direct optimized-tier callers have no per-element continuation here.
@@ -197,6 +209,9 @@
         (local.set $dst (i32.sub (local.get $edi) (i32.sub (local.get $bytes) (local.get $w))))
         (local.set $src (i32.sub (local.get $esi) (i32.sub (local.get $bytes) (local.get $w))))
         (local.set $step (i32.sub (i32.const 0) (local.get $w)))))
+    ;; A copy over a whole lazily-locked GPU surface needs no readback.
+    (if (i32.atomic.load (region.addr $GPS_LAZY 4))
+      (then (call $gps_lazy_overwrite (local.get $dst) (local.get $bytes) (local.get $src) (local.get $bytes))))
     ;; One call over the whole destination extent, not two endpoint calls.
     ;; Endpoints were enough while invalidation was per-page and a copy of
     ;; this size spanned at most two pages; per-offset retirement
@@ -253,6 +268,10 @@
   ;; one repeated byte, else one element and then doubling copies of what is
   ;; already written. Non-linear spans keep the element loop.
   (func $rep_stos_mem (param $edi i32) (param $n i32) (param $w i32) (param $v i64)
+    (call $rep_stos_mem_body (local.get $edi) (local.get $n) (local.get $w) (local.get $v))
+    (if (global.get $selective_watch_on)
+      (then (call $selective_watch_check (i32.const 0) (i32.const 0) (i32.const 3)))))
+  (func $rep_stos_mem_body (param $edi i32) (param $n i32) (param $w i32) (param $v i64)
     (local $bytes i32) (local $dst i32) (local $step i32) (local $i i32) (local $d i32)
     (local $b i32) (local $wa i32) (local $k i32) (local $c i32) (local $mask i64)
     (if (global.get $rep_store_step) (then (unreachable)))
@@ -270,6 +289,8 @@
               (i32.eq (local.get $w) (i32.const 8))))
     (local.set $v (i64.and (local.get $v) (local.get $mask)))
     (local.set $b (i32.and (i32.wrap_i64 (local.get $v)) (i32.const 0xFF)))
+    (if (i32.atomic.load (region.addr $GPS_LAZY 4))
+      (then (call $gps_lazy_overwrite (local.get $dst) (local.get $bytes) (i32.const 0) (i32.const 0))))
     (call $invalidate_code_write (local.get $dst) (local.get $bytes))
     ;; Match MOVS: only armed runs pay for per-element $gs completion notes.
     (if (i32.and (i32.eqz (global.get $native_store_on))
@@ -559,6 +580,7 @@
      (local $nx_fn i32) (local $nx_op i32) (local $a i32) (local $b i32)
     (local.set $a (call $gl8 (i32.load offset=24 (global.get $reg_base)))) (local.set $b (call $gl8 (i32.load offset=28 (global.get $reg_base))))
     (call $set_flags_sub (local.get $a) (local.get $b) (i32.sub (local.get $a) (local.get $b)))
+    (global.set $flag_sign_shift (i32.const 7))
     (if (global.get $df)
       (then (i32.store offset=24 (global.get $reg_base) (i32.sub (i32.load offset=24 (global.get $reg_base)) (i32.const 1)))
             (i32.store offset=28 (global.get $reg_base) (i32.sub (i32.load offset=28 (global.get $reg_base)) (i32.const 1))))
@@ -570,6 +592,7 @@
     (local.set $a (i32.and (i32.load offset=0 (global.get $reg_base)) (i32.const 0xFF)))
     (local.set $b (call $gl8 (i32.load offset=28 (global.get $reg_base))))
     (call $set_flags_sub (local.get $a) (local.get $b) (i32.sub (local.get $a) (local.get $b)))
+    (global.set $flag_sign_shift (i32.const 7))
     (if (global.get $df)
       (then (i32.store offset=28 (global.get $reg_base) (i32.sub (i32.load offset=28 (global.get $reg_base)) (i32.const 1))))
       (else (i32.store offset=28 (global.get $reg_base) (i32.add (i32.load offset=28 (global.get $reg_base)) (i32.const 1)))))
@@ -581,6 +604,7 @@
       (br_if $d (i32.eqz (i32.load offset=4 (global.get $reg_base))))
       (local.set $a (call $gl8 (i32.load offset=24 (global.get $reg_base)))) (local.set $b (call $gl8 (i32.load offset=28 (global.get $reg_base))))
       (call $set_flags_sub (local.get $a) (local.get $b) (i32.sub (local.get $a) (local.get $b)))
+      (global.set $flag_sign_shift (i32.const 7))
       (if (global.get $df)
         (then (i32.store offset=24 (global.get $reg_base) (i32.sub (i32.load offset=24 (global.get $reg_base)) (i32.const 1)))
               (i32.store offset=28 (global.get $reg_base) (i32.sub (i32.load offset=28 (global.get $reg_base)) (i32.const 1))))
@@ -598,6 +622,7 @@
       (br_if $d (i32.eqz (i32.load offset=4 (global.get $reg_base))))
       (local.set $b (call $gl8 (i32.load offset=28 (global.get $reg_base))))
       (call $set_flags_sub (local.get $a) (local.get $b) (i32.sub (local.get $a) (local.get $b)))
+      (global.set $flag_sign_shift (i32.const 7))
       (if (global.get $df)
         (then (i32.store offset=28 (global.get $reg_base) (i32.sub (i32.load offset=28 (global.get $reg_base)) (i32.const 1))))
         (else (i32.store offset=28 (global.get $reg_base) (i32.add (i32.load offset=28 (global.get $reg_base)) (i32.const 1)))))

@@ -10,6 +10,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const crypto = require('node:crypto');
 const { createMainSchedulerObserver } = require('./main-scheduler-observer');
+const { createGuestMainOwner } = require('../lib/guest-main-owner');
 const baseline = require('./fixtures/main-scheduler-original.json');
 const runSource = fs.readFileSync(path.join(__dirname, 'run.js'), 'utf8');
 const tmSource = fs.readFileSync(path.join(__dirname, '../lib/thread-manager.js'), 'utf8');
@@ -22,8 +23,8 @@ function extract(run, tm) {
     window: cut(run, 'const TRACE_FROM =', '// --decode-stats[=FROM_BATCH]:'),
     flag: run.match(/^const hasFlag = .*;$/m)[0],
     init: cut(run, '  const mainSchedulerObserver =', '  const inputConsumptionTrace ='),
-    gate: cut(run, '  const mainExecutionSuspended =', '\n\n  // A main thread parked'),
-    ordinary: cut(run, '      if (!mainExecutionSuspended(', '\n    } catch (e) {'),
+    gate: cut(run, '  const mainExecutionSuspended =', '\n\n  let lastSchedSig = null;'),
+    ordinary: cut(run, '      if (syncMain ? !mainExecutionSuspendedSync() : !await mainExecutionSuspended(', '\n    } catch (e) {'),
     worker: cut(run, '      let ran = 0;', '\n      if (TRACE_BATCH_TIMING)'),
     cooperative: cut(run, '      for (let s = 0; s < slices; s++) {', '\n      if (TRACE_BATCH_TIMING)'),
     input: cut(run, '  let lastInputEvent = null;', '\n  // Default hwnd routing:'),
@@ -36,13 +37,24 @@ function extract(run, tm) {
 const production = extract(runSource, tmSource);
 const records = logs => logs.filter(x => x.startsWith('[main-scheduler] {')).map(x => JSON.parse(x.slice('[main-scheduler] '.length)));
 
+function stripComPolls(calls, throws, local) {
+  if (!local) { assert(!calls.includes('com-yield'), 'Worker-owned main must not poll the local COM yield'); return calls; }
+  let runOpen = false;
+  for (const x of calls) {
+    if (Array.isArray(x) && x[0] === 'run') { assert(!runOpen || throws, 'COM poll missing after a completed main run'); runOpen = !throws; }
+    else if (x === 'com-yield') { assert(runOpen, 'COM poll without a completed main run'); runOpen = false; }
+  }
+  assert(!runOpen, 'COM poll missing after the last completed main run');
+  return calls.filter(x => x !== 'com-yield');
+}
+
 function harness(parts, { enabled = false, extra = '', mode = 'ordinary', now = 25015,
   deadline = 25021, live = true, real = false, named = false, yieldReason = 0,
   suspended = false, timer = false, renderSend = false, render = false,
   callback = null, pending = null, cross = [], buttons = [], installing = false,
   renderEvent = null, sleepFlag = 0, sleepTimeout = 0, stopped = false,
   serial = false, workerRan = 1, active = true, throws = false, baselineMode = false,
-  clockReads = null } = {}) {
+  clockReads = null, wrapOwner = null } = {}) {
   const calls = [], logs = [], dequeues = [], h = {}, wh = {};
   let clock = now, flag = sleepFlag;
   const ex = {
@@ -87,8 +99,16 @@ function harness(parts, { enabled = false, extra = '', mode = 'ordinary', now = 
     console: { error() {}, log() {} },
     require(name) { assert.equal(name, './main-scheduler-observer'); factoryCalls++; return { createMainSchedulerObserver }; },
     nativeFault: { capture: () => false, wait: async () => {}, isHeld: () => false },
-    h, wh, tid: 7, instance: { exports: ex }, threadManager: tm, tickState, logs,
-    ctx: { waitD3DRender() { calls.push('wait-render'); }, d3d9Bridge: { requests: new Map() } },
+    // Production's --d3dim-render-owner executor; null unless that flag is set.
+    // Also selects the batch loop's synchronous fast path (syncMain) with the
+    // local owner below whenever --trace-main-scheduler is off.
+    d3dimExecutionOwner: null,
+    h, wh, tid: 7, instance: { exports: ex }, mainOwner: (wrapOwner || (o => o))(createGuestMainOwner({localExports:ex})), threadManager: tm, tickState, logs,
+    // Production sets ctx.exports = instance.exports; after an ordinary local
+    // slice it reads the yield for the COM interface service (23, since
+    // 295182375). Tagged separately so the baseline normalization can name it.
+    ctx: { exports: { get_yield_reason() { calls.push('com-yield'); return yieldReason; } },
+      comInterfaces: { service() { calls.push('com-service'); } }, waitD3DRender() { calls.push('wait-render'); }, d3d9Bridge: { requests: new Map() } },
     mainRenderWait: render ? { token: 123, done: false, polls: 0, since: 0 } : null,
     renderWaitAttribution: null, renderParkStats: { skippedBatches: 0 },
     inputEvent: pending, crossThreadMsgs: [...cross], inputQueue: [...buttons], installingFiles: installing,
@@ -101,14 +121,25 @@ function harness(parts, { enabled = false, extra = '', mode = 'ordinary', now = 
   const init = baselineMode ? 'const mainSchedulerObserver = null;' : parts.args + '\n' + parts.flag + '\n' + parts.getArg + '\n' + parts.window + '\n' + parts.init;
   vm.runInContext(init + '\n' + parts.input + '\n' + parts.workerInput + '\n' + parts.gate, context);
   return {
-    calls, logs, dequeues, context, tm, h, wh, ex, factoryCalls: () => factoryCalls,
+    // Production polls the COM service yield once after every completed
+    // local main run (295182375); the pinned baseline predates it. Check that
+    // placement here, then compare the remaining calls against the baseline.
+    // A Worker-owned main services COM on its own endpoint: no local poll.
+    get calls() { return baselineMode ? calls : stripComPolls(calls, throws, context.mainOwner.kind === 'local'); }, rawCalls: calls,
+    logs, dequeues, context, tm, h, wh, ex, factoryCalls: () => factoryCalls,
     async dispatch(which = mode) {
       const key = which === 'worker' ? 'worker' : which === 'cooperative' ? 'cooperative' : 'ordinary';
       // The saved baseline predates the native-fault stop guard. Normalize
       // that existing guard so this test compares observer behavior.
+      // Ordinary: the baseline's suspended-path yield-16 render park went
+      // with the old JS D3D9 path (a6ee42aed); drop it from the baseline.
       const snippet = baselineMode && key === 'cooperative'
         ? parts[key].replace('const sliceStats = threadManager.runSlice(BATCH_SIZE);',
-          'const sliceStats = threadManager.runSlice(BATCH_SIZE); if (stopped) break;') : parts[key];
+          'const sliceStats = threadManager.runSlice(BATCH_SIZE); if (stopped) break;')
+        : baselineMode && key === 'ordinary'
+          ? parts[key].replace('\n      else if (instance.exports.get_yield_reason() === 16) renderParkStats.skippedBatches++;', '')
+          : parts[key];
+      if (baselineMode && key === 'ordinary') assert(!snippet.includes('=== 16'), 'baseline yield-16 normalization anchor');
       return vm.runInContext('(async () => { for (let fixtureTurn = 0; fixtureTurn < 1; fixtureTurn++) {\n' + snippet + '\n} })()', context);
     },
     gate() { return vm.runInContext('mainExecutionSuspended()', context); },
@@ -144,7 +175,9 @@ async function acceptance(parts) {
     { deadline: 0, sleepFlag: 1, sleepTimeout: 6 },
     { live: false }, { live: false, real: true }, { real: true },
     { named: true }, { renderSend: true }, { yieldReason: 10 },
-    { yieldReason: 16, render: true }, { now: 25025, suspended: true },
+    // No yield-16 case: the D3D9 render wait went with the old JS D3D9 path
+    // (d3d9-retire S4); the WAT no longer yields 16.
+    { now: 25025, suspended: true },
     { now: 25025, suspended: true, timer: true }, { now: 25025, throws: true },
     { now: 25025, stopped: true }, { now: 25025, active: false },
     { now: 25025, serial: true }, { now: 25025, workerRan: 0 },
@@ -156,15 +189,41 @@ async function acceptance(parts) {
       const disabled = harness(parts, config);
       const enabled = harness(parts, { ...config, enabled: true });
       const results = await Promise.allSettled([original.dispatch(), disabled.dispatch(), enabled.dispatch()]);
-      assert.deepEqual(results.map(r => r.status), [results[0].status, results[0].status, results[0].status]);
-      assert.deepEqual(disabled.calls, original.calls, `default semantics ${mode} ${JSON.stringify(options)}`);
-      assert.deepEqual(enabled.calls, original.calls, `enabled semantics ${mode} ${JSON.stringify(options)}`);
+      const faultRetired = mode !== 'ordinary' && options.throws;
+      if (faultRetired) {
+        // The pinned baseline swallowed an interleaved main-run exception and
+        // kept running. Since 0c2bc2da5 an uncaptured native fault rethrows:
+        // never continue a guest whose handler unwound. Assert that directly.
+        assert.deepEqual(results.map(r => r.status), ['fulfilled', 'rejected', 'rejected']);
+        for (const r of results.slice(1)) assert.match(r.reason.message, /stub guest exception/);
+      } else assert.deepEqual(results.map(r => r.status), [results[0].status, results[0].status, results[0].status],
+        `dispatch status ${mode} ${JSON.stringify(options)}: ${results.map(r => r.reason?.stack || r.status).join(' | ')}`);
+      if (faultRetired) {
+        const firstRun = original.calls.findIndex(x => Array.isArray(x) && x[0] === 'run');
+        // The faulting run still polled host input once before it threw.
+        assert.deepEqual(disabled.calls, [...original.calls.slice(0, firstRun + 1), 'renderer-input'],
+          'fault retires at the faulting main run');
+        assert.deepEqual(enabled.calls, disabled.calls, 'observer preserves fault retirement');
+      } else if (mode === 'cooperative' && options.stopped) {
+        // The pinned pre-fault-lifecycle baseline ran all three sibling
+        // slices after stop. Current production retires after the first;
+        // assert that behavior explicitly rather than restoring old work.
+        assert.deepEqual(disabled.calls, [['slice',100]], 'stop retires before another cooperative slice');
+        assert.deepEqual(enabled.calls, disabled.calls, 'observer preserves stop retirement');
+      } else if (mode === 'ordinary' && options.stopped) {
+        assert.deepEqual(disabled.calls,original.calls.filter(x=>
+          !(Array.isArray(x)&&x[0]==='run') && x!=='renderer-input'));
+        assert.deepEqual(enabled.calls,disabled.calls,'stop after admission prevents guest entry');
+      } else {
+        assert.deepEqual(disabled.calls, original.calls, `default semantics ${mode} ${JSON.stringify(options)}`);
+        assert.deepEqual(enabled.calls, original.calls, `enabled semantics ${mode} ${JSON.stringify(options)}`);
+      }
       assert.deepEqual(records(disabled.logs), []);
       const events = records(enabled.logs);
       const decisions = events.filter(r => r.event === 'decision');
       const runs = events.filter(r => r.event === 'main-run');
       const inputs = events.filter(r => r.event === 'host-check-input');
-      assert.equal(runs.length, original.calls.filter(x => Array.isArray(x) && x[0] === 'run').length);
+      assert.equal(runs.length, disabled.calls.filter(x => Array.isArray(x) && x[0] === 'run').length);
       assert.equal(inputs.length, runs.length);
       for (const run of runs) {
         const decision = decisions.find(d => d.id === run.decisionId);
@@ -179,6 +238,49 @@ async function acceptance(parts) {
         assert.equal(runs.length, 0);
       }
     }
+  }
+  for (const mode of ['ordinary','worker','cooperative']) {
+    // An admission RPC that can settle late is a Worker owner's: a local
+    // owner's calls are synchronous and take the batch loop's syncMain path.
+    // Wrap before the gate is evaluated, so syncMain sees this owner.
+    let context=null;
+    const h=harness(parts,{mode,now:25025,wrapOwner:owner=>({...owner,kind:'worker',call:async(name,...args)=>{
+      const value=await owner.call(name,...args);
+      context.stopped=true; // Shutdown arrives during owner admission RPC.
+      return value;
+    }})});
+    context=h.context;
+    await h.dispatch();
+    assert.equal(h.calls.some(x=>Array.isArray(x)&&x[0]==='run'),false,
+      mode+': no guest slice after stop during admission');
+  }
+  {
+    const h=harness(parts,{now:1000,deadline:77});
+    let release,reads=0;
+    const endpoint={optionalCall:async name=>{
+      if(name==='get_sleep_yielded'){reads++;return 1;}
+      return new Promise(resolve=>{release=resolve;});
+    }};
+    const pending=h.tm.noteMainSleepOwned(endpoint);
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(h.tm._mainSleepUntil,77,'no deadline change before timeout arrives');
+    release(25);await pending;
+    assert.equal(h.tm._mainSleepUntil,1025);assert.equal(reads,1);
+    await assert.rejects(h.tm.noteMainSleepOwned({optionalCall:async()=>{throw Error('retired');}}),/retired/);
+    assert.equal(h.tm._mainSleepUntil,1025);
+    await h.tm.noteMainSleepOwned({optionalCall:()=>{throw Error('must not re-read Worker flag');}},
+      {sleepYielded:true,sleepMs:0});
+    assert.equal(h.tm._mainSleepUntil,0,'Sleep(0) removes previous deadline');
+    await assert.rejects(h.tm.noteMainSleepOwned(endpoint,{}),/invalid main Worker sleep/);
+  }
+  for (const mode of ['ordinary','worker','cooperative']) {
+    const h=harness(parts,{mode,now:25025,wrapOwner:owner=>({...owner,kind:'worker',run:async size=>{
+      await owner.run(size);return {sleepYielded:true,sleepMs:77};
+    }})});
+    await h.dispatch();
+    assert.equal(h.tm._mainSleepUntil,25102,mode+': slice-returned sleep recorded');
+    assert.equal(h.calls.filter(x=>Array.isArray(x)&&x[0]==='run').length,1,
+      mode+': consumed Worker sleep prevents another main slice');
   }
   // No deadline means the existing short circuit spends no wait clock read.
   const noDeadline = harness(parts, { enabled: true, deadline: 0 }); await noDeadline.dispatch();
@@ -270,8 +372,8 @@ async function acceptance(parts) {
   // than a helper-only assertion that merely checks the implementation shape.
   const controls = [
     ['default-on', { ...production, init: production.init.replace("hasFlag('trace-main-scheduler')", 'true') }],
-    ['lost-run-wiring', { ...production, ordinary: production.ordinary.replace("mainSchedulerObserver.run('ordinary', () => instance.exports.run(BATCH_SIZE))", 'instance.exports.run(BATCH_SIZE)') }],
-    ['extra-consuming-sleep-getter', { ...production, gate: production.gate.replace('threadManager.noteMainSleep();', 'instance.exports.get_sleep_yielded(); threadManager.noteMainSleep();') }],
+    ['lost-run-wiring', { ...production, ordinary: production.ordinary.replace("mainSchedulerObserver.run('ordinary', () => mainOwner.run(BATCH_SIZE))", 'mainOwner.run(BATCH_SIZE)') }],
+    ['extra-consuming-sleep-getter', { ...production, gate: production.gate.replace('await threadManager.noteMainSleepOwned(mainOwner);', 'instance.exports.get_sleep_yielded(); await threadManager.noteMainSleepOwned(mainOwner);') }],
     ['extra-decision-clock', { ...production, sleep: production.sleep.replace('observe({ now, deadline, sleeping });', 'this._waitNow(); observe({ now, deadline, sleeping });') }],
     ['forced-main-wake', { ...production, gate: production.gate.replace("if (threadManager.isMainSleeping(observation?.sleep)) return finish(true, 'sleep');", "if (false) return finish(true, 'sleep');") }],
     ['lost-worker-provenance', { ...production, workerInput: baseline.parts.workerInput }],

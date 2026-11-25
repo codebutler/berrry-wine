@@ -13,17 +13,19 @@
   ;;   2=CBS_DROPDOWN     listbox toggled by click/F4/Alt+Down; field is editable
   ;;   3=CBS_DROPDOWNLIST listbox toggled, field shows selection (read-only)
   ;;
-  ;; ComboBoxState (40 bytes, allocated in WM_CREATE)
+  ;; ComboBoxState (48 bytes, allocated in WM_CREATE)
   ;;   +0   text_buf_ptr   guest ptr to selected/typed item text
   ;;   +4   text_len
   ;;   +8   style          full window style
   ;;   +12  cur_sel        mirror of listbox cur_sel; -1 = none
   ;;   +16  lb_hwnd        inner listbox hwnd
   ;;   +20  popup_hwnd     reserved for future WS_POPUP escape (0 today)
-  ;;   +24  edit_hwnd      CBS_DROPDOWN inner edit child; 0 for SIMPLE/DROPDOWNLIST
+  ;;   +24  edit_hwnd      SIMPLE/DROPDOWN inner edit child; 0 for DROPDOWNLIST
   ;;   +28  is_dropped     0/1 — CB_GETDROPPEDSTATE
   ;;   +32  variant        1=SIMPLE 2=DROPDOWN 3=DROPDOWNLIST
   ;;   +36  suppress_edit_notify — combo-originated edit WM_SETTEXT nesting
+  ;;   +40  dropped_width — requested minimum popup width (default zero)
+  ;;   +44  font — caller WM_SETFONT handle (default zero)
   ;; The control id is NOT in the record: $ctrl_table_get_id($hwnd).
   ;;
   ;; FIELD_H = 21 px; arrow box = 16 px wide on right edge.
@@ -161,6 +163,7 @@
     (local.set $state (call $wnd_get_state_ptr (local.get $hwnd)))
     (if (i32.eqz (local.get $state)) (then (return)))
     (local.set $sw (call $g2w (local.get $state)))
+    (if (i32.eq (call $cb_variant (local.get $sw)) (i32.const 1)) (then (return)))
     (if (call $cb_is_dropped (local.get $sw)) (then (return)))  ;; already dropped
     ;; Another combo already dropped on the same dialog? Close it (cancel) before
     ;; opening this one — Win32 only allows one expanded combo dropdown at a time.
@@ -180,12 +183,22 @@
         (local.set $lb_wh (call $ctrl_get_wh_packed (local.get $lb)))
         (local.set $lb_w (i32.and (local.get $lb_wh) (i32.const 0xFFFF)))
         (local.set $lb_h (i32.shr_u (local.get $lb_wh) (i32.const 16)))
+        ;; Recompute from the field and the retained minimum, not the last
+        ;; list width. This permits shrinking and honors a resized combo on
+        ;; the next drop without changing its field or horizontal extent.
+        (local.set $lb_w (i32.and (call $ctrl_get_wh_packed (local.get $hwnd)) (i32.const 0xFFFF)))
+        (if (i32.gt_u (call $cb_dropped_width (local.get $sw)) (local.get $lb_w))
+          (then (local.set $lb_w (call $cb_dropped_width (local.get $sw)))))
         ;; Reparent listbox under popup (WAT side + renderer side).
         (call $wnd_set_parent (local.get $lb) (local.get $popup))
         (call $host_set_parent (local.get $lb) (local.get $popup))
         ;; Listbox is now top-left of popup interior.
         (call $ctrl_geom_set (call $wnd_table_find (local.get $lb))
           (i32.const 0) (i32.const 0) (local.get $lb_w) (local.get $lb_h))
+        ;; Let the existing list resize path refresh viewport/ranges while
+        ;; retaining its independent content extent and clamping scroll.
+        (drop (call $wnd_send_message (local.get $lb) (i32.const 0x0005) (i32.const 0)
+          (i32.or (local.get $lb_w) (i32.shl (local.get $lb_h) (i32.const 16)))))
         ;; Position popup directly below combo's field area in screen coords.
         (local.set $rect (call $paint_scratch_take))
         (call $host_get_window_rect (local.get $hwnd) (local.get $rect))
@@ -209,8 +222,8 @@
     ;; misses the listbox entirely. Falls back to combo for variants without
     ;; a popup shell (CBS_SIMPLE).
     (if (local.get $popup)
-      (then  (global.set $capture_hwnd (local.get $popup)))
-      (else  (global.set $capture_hwnd (local.get $hwnd))))
+      (then  (call $capture_store (local.get $popup)))
+      (else  (call $capture_store (local.get $hwnd))))
     ;; CBN_DROPDOWN(7) → parent
     (local.set $parent (call $wnd_get_parent (local.get $hwnd)))
     (if (local.get $parent)
@@ -230,6 +243,7 @@
     (local.set $state (call $wnd_get_state_ptr (local.get $hwnd)))
     (if (i32.eqz (local.get $state)) (then (return)))
     (local.set $sw (call $g2w (local.get $state)))
+    (if (i32.eq (call $cb_variant (local.get $sw)) (i32.const 1)) (then (return)))
     (if (i32.eqz (call $cb_is_dropped (local.get $sw))) (then (return)))  ;; not dropped
     (local.set $lb (call $cb_lb_hwnd (local.get $sw)))
     (local.set $popup (call $cb_popup_hwnd (local.get $sw)))
@@ -264,10 +278,10 @@
     (call $cb_set_is_dropped (local.get $sw) (i32.const 0))
     (if (i32.eq (global.get $combo_open_hwnd) (local.get $hwnd))
       (then (global.set $combo_open_hwnd (i32.const 0))))
-    (if (i32.or (i32.eq (global.get $capture_hwnd) (local.get $hwnd))
+    (if (i32.or (i32.eq (call $capture_live) (local.get $hwnd))
                 (i32.and (i32.ne (local.get $popup) (i32.const 0))
-                         (i32.eq (global.get $capture_hwnd) (local.get $popup))))
-      (then (global.set $capture_hwnd (i32.const 0))))
+                         (i32.eq (call $capture_live) (local.get $popup))))
+      (then (call $capture_store (i32.const 0))))
     (local.set $parent (call $wnd_get_parent (local.get $hwnd)))
     (local.set $ctrl_id (i32.and (call $ctrl_table_get_id (local.get $hwnd)) (i32.const 0xFFFF)))
     (if (local.get $parent)
@@ -338,7 +352,7 @@
     (if (i32.lt_s (local.get $sel) (i32.const 0))
       (then
         (if (i32.and
-              (i32.eq (call $cb_variant (local.get $sw)) (i32.const 2))
+              (i32.ne (call $cb_variant (local.get $sw)) (i32.const 3))
               (i32.ne (call $cb_edit_hwnd (local.get $sw)) (i32.const 0)))
           (then
             (call $cb_set_suppress_edit_notify (local.get $sw) (i32.const 1))
@@ -355,7 +369,7 @@
     (call $cb_set_text_ptr (local.get $sw) (local.get $buf_g))
     (call $cb_set_text_len (local.get $sw) (local.get $slen))
     (if (i32.and
-          (i32.eq (call $cb_variant (local.get $sw)) (i32.const 2))
+          (i32.ne (call $cb_variant (local.get $sw)) (i32.const 3))
           (i32.ne (call $cb_edit_hwnd (local.get $sw)) (i32.const 0)))
       (then
         (call $cb_set_suppress_edit_notify (local.get $sw) (i32.const 1))
@@ -378,6 +392,12 @@
     (local $paint_state_w ptr<ControlTextState>) (local $edit_text_w ptr<ControlTextState>)
     (local $paint_state_g i32)
     (local $prev_lb i32) (local $prev_edit i32) (local $prev_popup i32)
+    (local $prev_font i32)
+
+    ;; Dialog navigation must leave selection arrows to WM_KEYDOWN below.
+    ;; Keep Tab with the dialog manager; character input belongs to the combo.
+    (if (i32.eq (local.get $msg) (i32.const 0x0087)) ;; WM_GETDLGCODE
+      (then (return (i32.const 0x0081)))) ;; DLGC_WANTARROWS | DLGC_WANTCHARS
 
     (local.set $field_h (i32.const 21))
     (local.set $state (call $wnd_get_state_ptr (local.get $hwnd)))
@@ -432,14 +452,16 @@
         ;; had room for.
         (if (local.get $state)
           (then
+            (local.set $prev_font (call $cb_font (call $g2w (local.get $state))))
             (local.set $prev_lb
               (call $cb_lb_hwnd (call $g2w (local.get $state))))
             (local.set $prev_popup
               (call $cb_popup_hwnd (call $g2w (local.get $state))))
             (local.set $prev_edit
               (call $cb_edit_hwnd (call $g2w (local.get $state))))))
-        (local.set $state (call $heap_alloc (i32.const 40)))
+        (local.set $state (call $heap_alloc (i32.const 48)))
         (local.set $state_w (call $g2w (local.get $state)))
+        (call $cb_set_font (local.get $state_w) (local.get $prev_font))
         (call $cb_set_text_ptr (local.get $state_w) (i32.const 0))
         (call $cb_set_text_len (local.get $state_w) (i32.const 0))
         (call $cb_set_style (local.get $state_w) (local.get $style))
@@ -451,6 +473,7 @@
         (call $cb_set_popup_hwnd (local.get $state_w) (local.get $prev_popup))
         (call $cb_set_edit_hwnd (local.get $state_w) (local.get $prev_edit))
         (call $cb_set_is_dropped (local.get $state_w) (i32.const 0))
+        (call $cb_set_dropped_width (local.get $state_w) (i32.const 0))
         (call $cb_set_variant (local.get $state_w) (local.get $variant))
         (call $cb_set_suppress_edit_notify (local.get $state_w) (i32.const 0))
         (if (local.get $name_ptr)
@@ -466,11 +489,22 @@
         (local.set $w (i32.load offset=20 (local.get $cs_w)))
         (local.set $cy (i32.load offset=16 (local.get $cs_w)))
         (local.set $h (i32.sub (local.get $cy) (local.get $field_h)))
-        (if (i32.lt_s (local.get $h) (i32.const 32))
+        (if (i32.and (i32.eq (local.get $variant) (i32.const 1))
+                     (i32.lt_s (local.get $h) (i32.const 0)))
+          (then (local.set $h (i32.const 0))))
+        (if (i32.and (i32.ne (local.get $variant) (i32.const 1))
+                     (i32.lt_s (local.get $h) (i32.const 32)))
           (then (local.set $h (i32.const 64)))) ;; minimum sensible dropdown
         ;; Listbox style: WS_CHILD(0x40000000) | WS_VSCROLL(0x00200000) | WS_BORDER(0x00800000)
         ;; + WS_VISIBLE(0x10000000) only for CBS_SIMPLE.
-        (local.set $style (i32.const 0x40A00000))
+        (local.set $style (i32.or (i32.const 0x40A00000)
+          (i32.and (call $cb_style (local.get $state_w)) (i32.const 0x00100000))))
+        ;; CBS_SORT uses the backing list's sorted-add path (LBS_SORT).
+        (if (i32.and (call $cb_style (local.get $state_w)) (i32.const 0x0100))
+          (then (local.set $style (i32.or (local.get $style) (i32.const 0x0002)))))
+        ;; CBS_DISABLENOSCROLL maps to the inner list's LBS equivalent.
+        (if (i32.and (call $cb_style (local.get $state_w)) (i32.const 0x0800))
+          (then (local.set $style (i32.or (local.get $style) (i32.const 0x1000)))))
         (if (i32.eq (local.get $variant) (i32.const 1))
           (then (local.set $style (i32.or (local.get $style) (i32.const 0x10000000)))))
         (if (local.get $prev_lb)
@@ -479,26 +513,29 @@
         (local.set $lb (call $ctrl_create_child (local.get $hwnd) (i32.const 4)
                           (i32.const 1000) ;; synthetic ctrl_id for inner listbox
                           (i32.const 0)
-                          (select (i32.const 0) (local.get $field_h) (i32.eq (local.get $variant) (i32.const 1)))
+                          (local.get $field_h)
                           (local.get $w)
-                          (select (local.get $cy) (local.get $h) (i32.eq (local.get $variant) (i32.const 1)))
+                          (local.get $h)
                           (local.get $style) (i32.const 0)))))
         (call $cb_set_lb_hwnd (local.get $state_w) (local.get $lb))
         ;; CBS_SIMPLE: always-dropped state.
         (if (i32.eq (local.get $variant) (i32.const 1))
           (then (call $cb_set_is_dropped (local.get $state_w) (i32.const 1))))
-        ;; CBS_DROPDOWN (variant=2): create EDIT child filling the field
-        ;; area minus the arrow box (18px wide on right). Style: WS_CHILD |
-        ;; WS_VISIBLE | ES_AUTOHSCROLL(0x80). Field width = w - 18 to leave
-        ;; room for the arrow.
-        (if (i32.and (i32.eq (local.get $variant) (i32.const 2))
+        ;; Both editable variants own a real EDIT. SIMPLE uses the full
+        ;; inset field width; DROPDOWN reserves its existing arrow area.
+        (if (i32.and (i32.ne (local.get $variant) (i32.const 3))
                      (i32.eqz (local.get $prev_edit)))
           (then
+            (local.set $idx (i32.sub (local.get $w)
+              (select (i32.const 4) (i32.const 20) (i32.eq (local.get $variant) (i32.const 1)))))
+            (if (i32.and (i32.eq (local.get $variant) (i32.const 1))
+                         (i32.lt_s (local.get $idx) (i32.const 0)))
+              (then (local.set $idx (i32.const 0))))
             (call $cb_set_edit_hwnd (local.get $state_w)
               (call $ctrl_create_child (local.get $hwnd) (i32.const 2)
                 (i32.const 1001) ;; synthetic ctrl_id for inner edit
                 (i32.const 2) (i32.const 2)
-                (i32.sub (local.get $w) (i32.const 20))
+                (local.get $idx)
                 (i32.sub (local.get $field_h) (i32.const 4))
                 (i32.const 0x50000080)  ;; WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL
                 (i32.load offset=36 (local.get $cs_w)))))) ;; pass initial title
@@ -597,17 +634,81 @@
     (local.set $variant (call $cb_variant (local.get $state_w)))
     (local.set $lb      (call $cb_lb_hwnd (local.get $state_w)))
 
+    ;; Microsoft 1992 Vol3 pp128/190-191 and WIN32.HLP 1992-94 topic82:
+    ;; COMBOBOX retains the caller's font and uses it for field and list text.
+    ;; Keep child text/selection ownership intact. Geometry remains caller set;
+    ;; no automatic font-to-field/row-height formula is established here.
+    (if (i32.eq (local.get $msg) (i32.const 0x0030)) ;; WM_SETFONT
+      (then
+        (call $cb_set_font (local.get $state_w) (local.get $wParam))
+        (if (local.get $lb)
+          (then (drop (call $wnd_send_message (local.get $lb)
+            (local.get $msg) (local.get $wParam) (local.get $lParam)))))
+        (if (call $cb_edit_hwnd (local.get $state_w))
+          (then (drop (call $wnd_send_message (call $cb_edit_hwnd (local.get $state_w))
+            (local.get $msg) (local.get $wParam) (local.get $lParam)))))
+        (if (i32.and (local.get $lParam) (i32.const 0xFFFF))
+          (then (call $invalidate_hwnd (local.get $hwnd))))
+        (return (i32.const 0))))
+    (if (i32.eq (local.get $msg) (i32.const 0x0031)) ;; WM_GETFONT
+      (then (return (call $cb_font (local.get $state_w)))))
+
+    ;; WIN32.HLP (Microsoft 1992-1994), WM_CUT/COPY/PASTE/CLEAR:
+    ;; Messages addressed to an editable combo are handled by its EDIT.
+    ;; Keep the child as the sole text, selection and clipboard owner.
+    (if (i32.and
+          (i32.or (i32.eq (local.get $variant) (i32.const 1))
+                  (i32.eq (local.get $variant) (i32.const 2)))
+          (i32.le_u (i32.sub (local.get $msg) (i32.const 0x0300)) (i32.const 3)))
+      (then (return (call $wnd_send_message
+        (call $cb_edit_hwnd (local.get $state_w))
+        (local.get $msg) (local.get $wParam) (local.get $lParam)))))
+
+    ;; SIMPLE occupies the application's full rectangle. Its children share
+    ;; the fixed selection field and the remaining visible list area, even
+    ;; after MoveWindow. Keep USER geometry, host geometry and viewports equal.
+    (if (i32.and (i32.eq (local.get $variant) (i32.const 1))
+                 (i32.eq (local.get $msg) (i32.const 0x0005))) ;; WM_SIZE
+      (then
+        (local.set $sz (call $ctrl_get_wh_packed (local.get $hwnd)))
+        (local.set $w (i32.and (local.get $sz) (i32.const 0xFFFF)))
+        (local.set $h (i32.sub (i32.shr_u (local.get $sz) (i32.const 16)) (local.get $field_h)))
+        (if (i32.lt_s (local.get $h) (i32.const 0)) (then (local.set $h (i32.const 0))))
+        (if (local.get $lb)
+          (then
+            (call $host_move_window (local.get $lb) (i32.const 0) (local.get $field_h)
+              (local.get $w) (local.get $h) (i32.const 0))
+            (call $ctrl_geom_sync (local.get $lb) (i32.const 0) (local.get $field_h)
+              (local.get $w) (local.get $h) (i32.const 0))
+            (drop (call $wnd_send_message (local.get $lb) (i32.const 0x0005) (i32.const 0)
+              (i32.or (local.get $w) (i32.shl (local.get $h) (i32.const 16)))))))
+        (local.set $idx (call $cb_edit_hwnd (local.get $state_w)))
+        (if (local.get $idx)
+          (then
+            (local.set $w (i32.sub (local.get $w) (i32.const 4)))
+            (if (i32.lt_s (local.get $w) (i32.const 0)) (then (local.set $w (i32.const 0))))
+            (call $host_move_window (local.get $idx) (i32.const 2) (i32.const 2)
+              (local.get $w) (i32.const 17) (i32.const 0))
+            (call $ctrl_geom_sync (local.get $idx) (i32.const 2) (i32.const 2)
+              (local.get $w) (i32.const 17) (i32.const 0))
+            (drop (call $wnd_send_message (local.get $idx) (i32.const 0x0005) (i32.const 0)
+              (i32.or (local.get $w) (i32.const 0x00110000))))
+            (call $invalidate_hwnd (local.get $idx))))
+        (call $invalidate_hwnd (local.get $hwnd))
+        (return (i32.const 0))))
+
     ;; ---------- WM_SETTEXT ----------
-    ;; CBS_DROPDOWN (variant=2): forward to inner edit; the edit owns the text.
+    ;; SIMPLE/DROPDOWN forward to the EDIT that owns the visible text.
     (if (i32.eq (local.get $msg) (i32.const 0x000C))
       (then
-        (if (i32.eq (local.get $variant) (i32.const 2))
+        (if (i32.ne (local.get $variant) (i32.const 3))
           (then
             ;; WordPad converts RichEdit 2.0's empty-document 32767-twip
             ;; sentinel to literal point-size text "1638.5". Normalize that
             ;; exact value only in its toolbar size combo (control id 166).
             (if (i32.and
-                  (i32.eq (i32.and (call $ctrl_table_get_id (local.get $hwnd)) (i32.const 0xFFFF)) (i32.const 166))
+                  (i32.and (i32.eq (local.get $variant) (i32.const 2))
+                    (i32.eq (i32.and (call $ctrl_table_get_id (local.get $hwnd)) (i32.const 0xFFFF)) (i32.const 166)))
                   (i32.and
                     (i32.eq (call $strlen (call $g2w (local.get $lParam))) (i32.const 6))
                     (i32.and
@@ -652,7 +753,7 @@
     ;; ---------- WM_GETTEXT ----------
     (if (i32.eq (local.get $msg) (i32.const 0x000D))
       (then
-        (if (i32.eq (local.get $variant) (i32.const 2))
+        (if (i32.ne (local.get $variant) (i32.const 3))
           (then (return (call $wnd_send_message
                           (call $cb_edit_hwnd (local.get $state_w))
                           (i32.const 0x000D) (local.get $wParam) (local.get $lParam)))))
@@ -671,7 +772,7 @@
     ;; ---------- WM_GETTEXTLENGTH ----------
     (if (i32.eq (local.get $msg) (i32.const 0x000E))
       (then
-        (if (i32.eq (local.get $variant) (i32.const 2))
+        (if (i32.ne (local.get $variant) (i32.const 3))
           (then (return (call $wnd_send_message
                           (call $cb_edit_hwnd (local.get $state_w))
                           (i32.const 0x000E) (i32.const 0) (i32.const 0)))))
@@ -692,6 +793,11 @@
     ;; ---------- WM_KILLFOCUS (0x0008) — close dropdown + fire CBN_KILLFOCUS(4) ----------
     (if (i32.eq (local.get $msg) (i32.const 0x0008))
       (then
+        ;; Moving into SIMPLE's own EDIT/list is an internal focus transfer.
+        (if (i32.and (i32.eq (local.get $variant) (i32.const 1))
+              (i32.or (i32.eq (local.get $wParam) (call $cb_edit_hwnd (local.get $state_w)))
+                      (i32.eq (local.get $wParam) (local.get $lb))))
+          (then (return (i32.const 0))))
         (if (call $cb_is_dropped (local.get $state_w))
           (then (call $combobox_close_dropdown (local.get $hwnd) (i32.const 0))))
         (if (i32.eq (global.get $focus_hwnd) (local.get $hwnd))
@@ -713,12 +819,15 @@
         (call $heap_free (call $cb_text_ptr (local.get $state_w)))
         (call $cb_set_text_ptr (local.get $state_w) (i32.const 0))
         (call $cb_set_text_len (local.get $state_w) (i32.const 0))
+        (if (i32.eq (local.get $variant) (i32.const 1))
+          (then (call $cb_set_suppress_edit_notify (local.get $state_w) (i32.const 1))))
         (if (i32.and
-              (i32.eq (local.get $variant) (i32.const 2))
+              (i32.ne (local.get $variant) (i32.const 3))
               (i32.ne (call $cb_edit_hwnd (local.get $state_w)) (i32.const 0)))
           (then (drop (call $wnd_send_message
             (call $cb_edit_hwnd (local.get $state_w))
             (i32.const 0x000C) (i32.const 0) (i32.const 0)))))
+        (call $cb_set_suppress_edit_notify (local.get $state_w) (i32.const 0))
         (call $invalidate_hwnd (local.get $hwnd))
         (return (i32.const 0))))
 
@@ -726,23 +835,53 @@
     (if (i32.eq (local.get $msg) (i32.const 0x0146))
       (then (return (call $wnd_send_message (local.get $lb) (i32.const 0x018B) (i32.const 0) (i32.const 0)))))
 
+    ;; ---------- CB_GETTOPINDEX / CB_SETTOPINDEX — use the backing list's scroll path ----------
+    (if (i32.eq (local.get $msg) (i32.const 0x015B))
+      (then (return (call $wnd_send_message (local.get $lb) (i32.const 0x018E) (i32.const 0) (i32.const 0)))))
+    (if (i32.eq (local.get $msg) (i32.const 0x015C))
+      (then (return (call $wnd_send_message (local.get $lb) (i32.const 0x0197) (local.get $wParam) (i32.const 0)))))
+
     ;; ---------- CB_GETCURSEL (0x0147) ----------
     (if (i32.eq (local.get $msg) (i32.const 0x0147))
       (then (return (call $cb_cur_sel (local.get $state_w)))))
 
-    ;; ---------- CB_ADDSTRING (0x0143) → LB_ADDSTRING (0x0180) ----------
-    (if (i32.eq (local.get $msg) (i32.const 0x0143))
-      (then (return (call $wnd_send_message (local.get $lb) (i32.const 0x0180) (i32.const 0) (local.get $lParam)))))
-
-    ;; ---------- CB_INSERTSTRING (0x014A) → LB_INSERTSTRING (0x0181) ----------
-    (if (i32.eq (local.get $msg) (i32.const 0x014A))
-      (then (return (call $wnd_send_message (local.get $lb) (i32.const 0x0181) (local.get $wParam) (local.get $lParam)))))
+    ;; Insertion moves a surviving selection's index, including sorted ADD.
+    ;; Its text and EDIT selection already name that same item: retain them
+    ;; rather than rewriting the field (especially arbitrary unselected text).
+    ;; The returned insertion index, not wParam, determines which rows moved.
+    (if (i32.or (i32.eq (local.get $msg) (i32.const 0x0143))
+                (i32.eq (local.get $msg) (i32.const 0x014A)))
+      (then
+        (local.set $idx (call $wnd_send_message (local.get $lb)
+          (select (i32.const 0x0180) (i32.const 0x0181)
+                  (i32.eq (local.get $msg) (i32.const 0x0143)))
+          (local.get $wParam) (local.get $lParam)))
+        (if (i32.and (i32.ge_s (local.get $idx) (i32.const 0))
+                    (i32.ge_s (call $cb_cur_sel (local.get $state_w)) (local.get $idx)))
+          (then (call $cb_set_cur_sel (local.get $state_w)
+            (i32.add (call $cb_cur_sel (local.get $state_w)) (i32.const 1)))))
+        (return (local.get $idx))))
 
     ;; ---------- CB_DELETESTRING (0x0144) → LB_DELETESTRING (0x0182) ----------
     (if (i32.eq (local.get $msg) (i32.const 0x0144))
-      (then (return (call $wnd_send_message (local.get $lb) (i32.const 0x0182) (local.get $wParam) (i32.const 0)))))
+      (then
+        (local.set $idx (call $wnd_send_message (local.get $lb)
+          (i32.const 0x0182) (local.get $wParam) (i32.const 0)))
+        ;; Only preceding deletions move the surviving selected item. Leave
+        ;; selected-item deletion's existing field behavior unchanged here.
+        (if (i32.and (i32.ge_s (local.get $idx) (i32.const 0))
+                    (i32.gt_s (call $cb_cur_sel (local.get $state_w)) (local.get $wParam)))
+          (then (call $cb_set_cur_sel (local.get $state_w)
+            (i32.sub (call $cb_cur_sel (local.get $state_w)) (i32.const 1)))))
+        (return (local.get $idx))))
 
     ;; ---------- CB_FINDSTRING (0x014C) / CB_FINDSTRINGEXACT (0x0158) ----------
+    ;; Extent belongs to the list, not the combo field or its current text.
+    (if (i32.eq (local.get $msg) (i32.const 0x015D))
+      (then (return (call $wnd_send_message (local.get $lb) (i32.const 0x0193) (i32.const 0) (i32.const 0)))))
+    (if (i32.eq (local.get $msg) (i32.const 0x015E))
+      (then (return (call $wnd_send_message (local.get $lb) (i32.const 0x0194) (local.get $wParam) (i32.const 0)))))
+
     (if (i32.eq (local.get $msg) (i32.const 0x014C))
       (then (return (call $wnd_send_message (local.get $lb) (i32.const 0x018F) (local.get $wParam) (local.get $lParam)))))
     (if (i32.eq (local.get $msg) (i32.const 0x0158))
@@ -768,10 +907,34 @@
     ;; ---------- CB_SETCURSEL (0x014E) → LB_SETCURSEL + sync text ----------
     (if (i32.eq (local.get $msg) (i32.const 0x014E))
       (then
-        (drop (call $wnd_send_message (local.get $lb) (i32.const 0x0186) (local.get $wParam) (i32.const 0)))
+        (local.set $idx (call $wnd_send_message (local.get $lb) (i32.const 0x0186) (local.get $wParam) (i32.const 0)))
         (call $combobox_sync_text (local.get $state_w))
         (call $invalidate_hwnd (local.get $hwnd))
-        (return (local.get $wParam))))
+        ;; The list returns CB_ERR for a rejected index or the -1 clear.
+        ;; Keep text synchronized with its resulting selection in both cases.
+        (return (local.get $idx))))
+
+    ;; ---------- CB_GETDROPPEDWIDTH / CB_SETDROPPEDWIDTH ----------
+    ;; Microsoft: minimum defaults to zero; the list uses the larger of that
+    ;; minimum and the combo width. Keep the request even when below the field
+    ;; width, so a later resize does not replace application state. SET only
+    ;; changes this minimum; geometry is applied on the next drop. lParam is
+    ;; unused, and neither message selects, edits, scrolls or notifies.
+    (if (i32.or (i32.eq (local.get $msg) (i32.const 0x015F))
+                (i32.eq (local.get $msg) (i32.const 0x0160)))
+      (then
+        (if (i32.eq (local.get $variant) (i32.const 1))
+          (then (return (i32.const -1)))) ;; CBS_SIMPLE has no dropdown
+        (if (i32.eq (local.get $msg) (i32.const 0x0160))
+          (then
+            ;; Control geometry is represented by unsigned 16-bit dimensions.
+            ;; Reject unrepresentable requests rather than wrapping on open.
+            (if (i32.gt_u (local.get $wParam) (i32.const 65535))
+              (then (return (i32.const -1))))
+            (call $cb_set_dropped_width (local.get $state_w) (local.get $wParam))))
+        (local.set $w (i32.and (call $ctrl_get_wh_packed (local.get $hwnd)) (i32.const 0xFFFF)))
+        (local.set $idx (call $cb_dropped_width (local.get $state_w)))
+        (return (select (local.get $idx) (local.get $w) (i32.gt_u (local.get $idx) (local.get $w))))))
 
     ;; ---------- CB_GETDROPPEDSTATE (0x0157) ----------
     (if (i32.eq (local.get $msg) (i32.const 0x0157))
@@ -786,39 +949,38 @@
         (return (i32.const 1))))
 
     ;; ---------- CB_GETDROPPEDCONTROLRECT (0x0152) ----------
-    ;; lParam = guest RECT*, filled in SCREEN coordinates with the combo as it
-    ;; looks dropped: the field's top-left, its width, and the bottom of the
-    ;; list below it. mIRC's Options pages copy each combobox onto the dialog
-    ;; from this rect. The old window-local (0, FIELD_H, w, h) answer put the
-    ;; copy at the dialog's corner with no height, and since mIRC centres a
-    ;; page on the bounding box of its controls, the whole Sounds page moved.
+    ;; Microsoft: screen coordinates of the combo in its expanded state, not
+    ;; just the popup. Include the selection field even while the list is hidden.
+    ;; The retained list height survives the field's collapse to 21px; its width
+    ;; is max(combo width, requested dropped minimum), as on the next open.
+    ;; SIMPLE already occupies its full expanded window rectangle.
     (if (i32.eq (local.get $msg) (i32.const 0x0152))
       (then
         (if (i32.eqz (local.get $lParam)) (then (return (i32.const 0))))
-        (local.set $sz (call $ctrl_get_wh_packed (local.get $hwnd)))
-        (local.set $w (i32.and (local.get $sz) (i32.const 0xFFFF)))
-        (local.set $h (i32.shr_u (local.get $sz) (i32.const 16)))
-        ;; The dropped height is the field plus the inner list, whichever is
-        ;; taller than the window itself (a CBS_SIMPLE window already is).
-        (if (call $cb_lb_hwnd (local.get $state_w))
+        (local.set $cs_w (call $paint_scratch_take))
+        (call $host_get_window_rect (local.get $hwnd) (local.get $cs_w))
+        (local.set $px (load.field PaintRect left (local.get $cs_w)))
+        (local.set $py (load.field.memarg PaintRect top (local.get $cs_w)))
+        (local.set $w (i32.sub (load.field.memarg PaintRect right (local.get $cs_w)) (local.get $px)))
+        (local.set $h (i32.sub (load.field.memarg PaintRect bottom (local.get $cs_w)) (local.get $py)))
+        (if (i32.ne (local.get $variant) (i32.const 1))
           (then
-            (local.set $cy (i32.add (local.get $field_h)
-              (i32.shr_u (call $ctrl_get_wh_packed (call $cb_lb_hwnd (local.get $state_w)))
-                (i32.const 16))))
-            (if (i32.gt_s (local.get $cy) (local.get $h))
-              (then (local.set $h (local.get $cy))))))
-        (call $host_get_window_rect (local.get $hwnd) (call $g2w (local.get $lParam)))
-        (i32.store offset=8 (call $g2w (local.get $lParam))
-          (i32.add (i32.load (call $g2w (local.get $lParam))) (local.get $w)))
-        (i32.store offset=12 (call $g2w (local.get $lParam))
-          (i32.add (i32.load offset=4 (call $g2w (local.get $lParam))) (local.get $h)))
+            (if (i32.gt_u (call $cb_dropped_width (local.get $state_w)) (local.get $w))
+              (then (local.set $w (call $cb_dropped_width (local.get $state_w)))))
+            (if (local.get $lb)
+              (then (local.set $h (i32.add (local.get $h)
+                (i32.shr_u (call $ctrl_get_wh_packed (local.get $lb)) (i32.const 16))))))))
+        (i32.store          (call $g2w (local.get $lParam)) (local.get $px))
+        (i32.store offset=4 (call $g2w (local.get $lParam)) (local.get $py))
+        (i32.store offset=8 (call $g2w (local.get $lParam)) (i32.add (local.get $px) (local.get $w)))
+        (i32.store offset=12 (call $g2w (local.get $lParam)) (i32.add (local.get $py) (local.get $h)))
         (return (i32.const 1))))
 
     ;; ---------- CB_LIMITTEXT (0x0141) → EM_SETLIMITTEXT (0x00C5) ----------
-    ;; Only meaningful for CBS_DROPDOWN; CBS_DROPDOWNLIST/SIMPLE return TRUE no-op.
+    ;; Both editable variants delegate the user-input limit to their EDIT.
     (if (i32.eq (local.get $msg) (i32.const 0x0141))
       (then
-        (if (i32.eq (local.get $variant) (i32.const 2))
+        (if (i32.ne (local.get $variant) (i32.const 3))
           (then (drop (call $wnd_send_message
                         (call $cb_edit_hwnd (local.get $state_w))
                         (i32.const 0x00C5) (local.get $wParam) (i32.const 0)))))
@@ -827,7 +989,7 @@
     ;; ---------- CB_GETEDITSEL (0x0140) → EM_GETSEL (0x00B0) ----------
     (if (i32.eq (local.get $msg) (i32.const 0x0140))
       (then
-        (if (i32.eq (local.get $variant) (i32.const 2))
+        (if (i32.ne (local.get $variant) (i32.const 3))
           (then (return (call $wnd_send_message
                           (call $cb_edit_hwnd (local.get $state_w))
                           (i32.const 0x00B0) (local.get $wParam) (local.get $lParam)))))
@@ -837,18 +999,40 @@
     ;; Win32: lParam packs (start | end<<16); EM_SETSEL takes wParam=start, lParam=end.
     (if (i32.eq (local.get $msg) (i32.const 0x0142))
       (then
-        (if (i32.eq (local.get $variant) (i32.const 2))
-          (then (return (call $wnd_send_message
+        (if (i32.eq (local.get $variant) (i32.const 1))
+          (then
+            (drop (call $wnd_send_message (call $cb_edit_hwnd (local.get $state_w))
+              (i32.const 0x00B1)
+              (i32.shr_s (i32.shl (local.get $lParam) (i32.const 16)) (i32.const 16))
+              (i32.shr_s (local.get $lParam) (i32.const 16))))
+            (return (i32.const 1))))
+        (if (i32.ne (local.get $variant) (i32.const 3))
+          (then
+            ;; Microsoft VC++ 4 (Sep 1995), CComboBox::SetEditSel p184:
+            ;; -1 removes selection / selects through the end; success is
+            ;; nonzero. EM_SETSEL has no success result to forward.
+            ;; Translate only the documented sentinel, preserving other
+            ;; unsigned packed positions in the existing DROPDOWN path.
+            (local.set $px (i32.and (local.get $lParam) (i32.const 0xFFFF)))
+            (local.set $py (i32.shr_u (local.get $lParam) (i32.const 16)))
+            (drop (call $wnd_send_message
                           (call $cb_edit_hwnd (local.get $state_w))
                           (i32.const 0x00B1)
-                          (i32.and (local.get $lParam) (i32.const 0xFFFF))
-                          (i32.shr_u (local.get $lParam) (i32.const 16))))))
+                          (select (i32.const -1) (local.get $px)
+                            (i32.eq (local.get $px) (i32.const 0xFFFF)))
+                          (select (i32.const -1) (local.get $py)
+                            (i32.eq (local.get $py) (i32.const 0xFFFF)))))
+            (return (i32.const 1))))
         (return (i32.const 0))))
 
     ;; ---------- CB_SETEXTENDEDUI / CB_GETEXTENDEDUI ----------
     ;; Stash in a high bit of the stored style word — see $cb_set_extended_ui.
     (if (i32.eq (local.get $msg) (i32.const 0x0155))
       (then
+        ;; Microsoft desktop supports only DROPDOWN/DROPDOWNLIST here.
+        ;; SIMPLE keeps its always-visible list and default keyboard behavior.
+        (if (i32.eq (local.get $variant) (i32.const 1))
+          (then (return (i32.const -1)))) ;; CB_ERR
         (call $cb_set_extended_ui (local.get $state_w) (local.get $wParam))
         (return (i32.const 0))))
     (if (i32.eq (local.get $msg) (i32.const 0x0156))
@@ -862,23 +1046,64 @@
       (then (return (call $wnd_send_message (local.get $lb) (i32.const 0x019A) (local.get $wParam) (local.get $lParam)))))
 
     ;; ---------- CB_SETITEMHEIGHT / CB_GETITEMHEIGHT ----------
-    ;; WordPad's MFC toolbar combo setup adjusts the editable field/item
-    ;; height once the CComboBox wrapper is attached. We keep a fixed Win98-ish
-    ;; field height for now, but report success/height so setup can continue.
+    ;; Microsoft desktop: wParam=0 sets/gets the common fixed list-row height.
+    ;; Reuse the inner list's height so paint, hit tests, reveal, scrolling and
+    ;; public queries share one value. Keep the previous selection-field and
+    ;; variable-owner-draw paths; per-item variable heights are not supported.
+    ;; https://learn.microsoft.com/en-us/windows/win32/controls/cb-setitemheight
+    ;; https://learn.microsoft.com/en-us/windows/win32/controls/cb-getitemheight
     (if (i32.eq (local.get $msg) (i32.const 0x0153))
-      (then (return (i32.const 0))))
+      (then
+        (if (i32.and (i32.eqz (local.get $wParam))
+              (i32.eqz (i32.and (call $cb_style (local.get $state_w)) (i32.const 0x0020))))
+          (then (return (call $wnd_send_message (local.get $lb)
+            (i32.const 0x01A0) (i32.const 0) (local.get $lParam)))))
+        (return (i32.const 0))))
     (if (i32.eq (local.get $msg) (i32.const 0x0154))
       (then
+        (if (i32.and (i32.eqz (local.get $wParam))
+              (i32.eqz (i32.and (call $cb_style (local.get $state_w)) (i32.const 0x0020))))
+          (then (return (call $wnd_send_message (local.get $lb)
+            (i32.const 0x01A1) (i32.const 0) (i32.const 0)))))
         (return
           (select
             (local.get $field_h)
             (i32.const 16)
             (i32.eq (local.get $wParam) (i32.const -1))))))
 
-    ;; ---------- CB_DIR / ownerdraw paths ----------
-    ;; Fail-fast (memory: feedback_fail_fast_stubs).
+    ;; ---------- CB_DIR: ordinary ANSI, unsorted CBS_SIMPLE strings ----------
+    ;; Microsoft Visual C++ 4 (September 1995), Vol3 p172; WIN32.HLP
+    ;; topics 3503/3607: matching file names append; return the last index.
+    ;; Reuse LB_DIR for flags=0. Keep unqualified styles/attributes fail-fast.
     (if (i32.eq (local.get $msg) (i32.const 0x0145))   ;; CB_DIR
-      (then (call $crash_unimplemented (i32.const 0x100))))
+      (then
+        (if (i32.and
+              (i32.and (i32.eq (local.get $variant) (i32.const 1))
+                (i32.eqz (call $wnd_unicode_get (local.get $hwnd))))
+              (i32.and (i32.eqz (local.get $wParam))
+                (i32.eqz (i32.and (call $cb_style (local.get $state_w))
+                  (i32.const 0x6130))))) ;; owner-draw, sort, upper/lowercase
+          (then (return (call $wnd_send_message (local.get $lb)
+            (i32.const 0x018D) (local.get $wParam) (local.get $lParam)))))
+        (call $crash_unimplemented (i32.const 0x100))))
+
+    ;; The container router deliberately stops at COMBOBOX. SIMPLE therefore
+    ;; forwards field clicks to its EDIT, using the child's inset coordinates.
+    ;; EDIT owns focus, capture, selection dragging and keyboard input.
+    (if (i32.and (i32.eq (local.get $variant) (i32.const 1))
+          (i32.or (i32.eq (local.get $msg) (i32.const 0x0201))
+            (i32.or (i32.eq (local.get $msg) (i32.const 0x0202))
+                    (i32.eq (local.get $msg) (i32.const 0x0203)))))
+      (then
+        (local.set $py (i32.shr_s (local.get $lParam) (i32.const 16)))
+        (if (i32.lt_s (local.get $py) (local.get $field_h))
+          (then
+            (local.set $px (i32.shr_s (i32.shl (local.get $lParam) (i32.const 16)) (i32.const 16)))
+            (drop (call $wnd_send_message (call $cb_edit_hwnd (local.get $state_w))
+              (local.get $msg) (local.get $wParam)
+              (i32.or (i32.and (i32.sub (local.get $px) (i32.const 2)) (i32.const 0xFFFF))
+                      (i32.shl (i32.sub (local.get $py) (i32.const 2)) (i32.const 16)))))
+            (return (i32.const 0))))))
 
     ;; ---------- WM_LBUTTONDOWN (0x0201) — toggle dropdown ----------
     ;; While dropped with capture, lParam is in our window-local coords. We
@@ -944,9 +1169,39 @@
                                 (i32.shl (i32.sub (local.get $py) (local.get $field_h)) (i32.const 16)))))))))
         (return (i32.const 0))))
 
+    ;; SetFocus(combo) retains the existing combo keyboard navigation route.
+    ;; Field clicks focus the EDIT directly; character input addressed to the
+    ;; combo itself must reach that same text owner as well.
+    (if (i32.and (i32.eq (local.get $variant) (i32.const 1))
+                 (i32.eq (local.get $msg) (i32.const 0x0102))) ;; WM_CHAR
+      (then (return (call $wnd_send_message (call $cb_edit_hwnd (local.get $state_w))
+        (local.get $msg) (local.get $wParam) (local.get $lParam)))))
+
+    ;; DROPDOWNLIST has no EDIT: initial-character navigation belongs to the
+    ;; backing LISTBOX (Microsoft Visual C++ 4, Sep 1995, vol3 p163).
+    ;; Treat its selection notification like arrow navigation so an open
+    ;; popup remains available for the next character.
+    (if (i32.and (i32.eq (local.get $variant) (i32.const 3))
+                 (i32.eq (local.get $msg) (i32.const 0x0102))) ;; WM_CHAR
+      (then
+        (global.set $combo_kbd_nav_active (i32.const 1))
+        (drop (call $wnd_send_message (local.get $lb) (local.get $msg)
+          (local.get $wParam) (local.get $lParam)))
+        ;; The internal list has no LBS_NOTIFY. Relay a changed selection
+        ;; through the same text-sync and parent-notification path as arrows.
+        (if (i32.ne (call $cb_cur_sel (local.get $state_w))
+              (call $wnd_send_message (local.get $lb) (i32.const 0x0188)
+                (i32.const 0) (i32.const 0)))
+          (then (drop (call $combobox_wndproc (local.get $hwnd) (i32.const 0x0111)
+            (i32.or (call $ctrl_table_get_id (local.get $lb)) (i32.const 0x00010000))
+            (local.get $lb)))))
+        (global.set $combo_kbd_nav_active (i32.const 0))
+        (return (i32.const 0))))
+
     ;; ---------- WM_KEYDOWN (0x0100) ----------
-    ;; F4 (0x73) or Alt+Down (we approximate by VK_F4 since we don't have
-    ;; modifier key state cleanly here): toggle dropdown.
+    ;; Default F4 toggles the dropdown. Extended UI disables F4 and makes
+    ;; Down open a closed dropdown without changing selection. Once open,
+    ;; navigation and the existing accept/cancel notifications are unchanged.
     ;; Esc (0x1B): cancel-close. Enter (0x0D): accept-close (if dropped).
     ;; Arrow/PgUp/PgDn/Home/End: forward to listbox (which fires LBN_SELCHANGE
     ;; back to us via WM_COMMAND, where we'll sync_text + relay CBN_SELCHANGE).
@@ -954,9 +1209,18 @@
       (then
         (if (i32.eq (local.get $wParam) (i32.const 0x73))  ;; VK_F4
           (then
+            (if (call $cb_extended_ui (local.get $state_w))
+              (then (return (i32.const 0))))
             (if (call $cb_is_dropped (local.get $state_w))
               (then (call $combobox_close_dropdown (local.get $hwnd) (i32.const 1)))
               (else (call $combobox_open_dropdown  (local.get $hwnd))))
+            (return (i32.const 0))))
+        (if (i32.and
+              (i32.eq (local.get $wParam) (i32.const 0x28)) ;; VK_DOWN
+              (i32.and (call $cb_extended_ui (local.get $state_w))
+                       (i32.eqz (call $cb_is_dropped (local.get $state_w)))))
+          (then
+            (call $combobox_open_dropdown (local.get $hwnd))
             (return (i32.const 0))))
         (if (i32.eq (local.get $wParam) (i32.const 0x1B))  ;; VK_ESCAPE
           (then
@@ -993,11 +1257,14 @@
                     (local.get $wParam) (local.get $lParam)))
             (global.set $combo_kbd_nav_active (i32.const 0))
             (return (i32.const 0))))
+        (if (i32.eq (local.get $variant) (i32.const 1))
+          (then (return (call $wnd_send_message (call $cb_edit_hwnd (local.get $state_w))
+            (local.get $msg) (local.get $wParam) (local.get $lParam)))))
         (return (i32.const 0))))
 
     ;; ---------- WM_COMMAND (0x0111) from inner listbox or edit ----------
     ;; Listbox: LBN_SELCHANGE/LBN_DBLCLK → sync_text + relay CBN_SELCHANGE.
-    ;; Edit (variant=2 only): EN_CHANGE(0x0300) → CBN_EDITCHANGE(5);
+    ;; Edit (SIMPLE/DROPDOWN): EN_CHANGE(0x0300) → CBN_EDITCHANGE(5);
     ;;                        EN_UPDATE(0x0400) → CBN_EDITUPDATE(6);
     ;;                        EN_SETFOCUS(0x0100) → CBN_SETFOCUS(3);
     ;;                        EN_KILLFOCUS(0x0200) → CBN_KILLFOCUS(4).
@@ -1013,7 +1280,7 @@
     (if (i32.eq (local.get $msg) (i32.const 0x0111))
       (then
         ;; Edit notification path
-        (if (i32.and (i32.eq (local.get $variant) (i32.const 2))
+        (if (i32.and (i32.ne (local.get $variant) (i32.const 3))
                      (i32.eq (local.get $lParam)
                              (call $cb_edit_hwnd (local.get $state_w))))
           (then
@@ -1129,7 +1396,20 @@
         (local.set $sz (call $ctrl_get_wh_packed (local.get $hwnd)))
         (local.set $w (i32.and (local.get $sz) (i32.const 0xFFFF)))
         (local.set $h (local.get $field_h))
-        ;; Skip field paint for CBS_SIMPLE — entire window is the listbox.
+        ;; SIMPLE has an inset full-width EDIT and no arrow. Use EDIT's own
+        ;; painter so text, selection and horizontal scrolling agree with the
+        ;; child that receives native input. The list paints below FIELD_H.
+        (if (i32.eq (local.get $variant) (i32.const 1))
+          (then
+            (drop (call $gdi_native_fill_rect (local.get $hdc)
+              (i32.const 0) (i32.const 0) (local.get $w) (local.get $h) (i32.const 0x30010)))
+            (drop (call $gdi_native_draw_edge (local.get $hdc)
+              (i32.const 0) (i32.const 0) (local.get $w) (local.get $h)
+              (i32.const 0x0A) (i32.const 0x0F)))
+            (drop (call $wnd_send_message (call $cb_edit_hwnd (local.get $state_w))
+              (i32.const 0x000F) (i32.const 0) (i32.const 0)))
+            (return (i32.const 0))))
+        ;; Preserve the existing dropdown field and arrow painter.
         (if (i32.ne (local.get $variant) (i32.const 1))
           (then
             ;; Toolbar-hosted CBS_DROPDOWN inner EDIT children are not
@@ -1173,12 +1453,14 @@
                     (i32.add (local.get $arrow_x) (i32.const 7)) (i32.const 12)
                     (i32.add (local.get $arrow_x) (i32.const 8)) (i32.const 13)
                     (i32.const 0x30014)))
-            (drop (call $gdi_native_select_object (local.get $hdc) (i32.const 0x30021)))
+            (drop (call $gdi_native_select_object (local.get $hdc)
+              (select (call $cb_font (local.get $state_w)) (i32.const 0x30021)
+                (i32.ne (call $cb_font (local.get $state_w)) (i32.const 0)))))
             (drop (call $gdi_native_set_bk_mode (local.get $hdc) (i32.const 1)))
             ;; CBS_DROPDOWN delegates text ownership to its inner EDIT. Paint
             ;; from that same state so WM_PAINT agrees with WM_GETTEXT.
             (local.set $paint_state_w (cast ptr<ControlTextState> (local.get $state_w)))
-            (if (i32.eq (local.get $variant) (i32.const 2))
+            (if (i32.ne (local.get $variant) (i32.const 3))
               (then
                 (local.set $paint_state_g
                   (call $wnd_get_state_ptr (call $cb_edit_hwnd (local.get $state_w))))

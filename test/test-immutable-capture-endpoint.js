@@ -18,7 +18,7 @@ function fixture(mode = 'integer') {
   return r;
 }
 function host(r) {
-  const context = { URLSearchParams, console, setTimeout, clearTimeout,
+  const context = { URLSearchParams, console, setTimeout, clearTimeout, require: n => require('../' + n),
     performance: { now: () => 0 }, requestAnimationFrame() {} };
   vm.runInNewContext(fs.readFileSync(require.resolve('../host.js'), 'utf8') +
     '\n;globalThis.Host = WineAssembly;', context);
@@ -252,5 +252,278 @@ test('owner is checked at selection and after display; holds and failed display 
     else r.repaint();
     assert.equal(t.status, 'failed', kind); assert.equal(t.read(), null);
     assert.match(t.error, kind === 'false' ? /returned false/ : kind === 'throw' ? /scoped display threw/ : /owner/);
+  }
+});
+
+test('current display is a request-local read of an unchanged ordinary publication, not a new frame', () => {
+  const { r, h } = ownedFixture(); r.repaint();
+  const pub = r._immutablePublicationSequence, displayedAt = r._currentDisplayRecord.displayedAt;
+  const next = h.requestImmutableCapture({ hwnd: 123 });
+  assert.equal(next.status, 'pending'); next.cancel();
+  const a = h.requestCurrentDisplayCapture({ hwnd: 123 }), first = a.read();
+  assert.equal(a.status, 'complete');
+  assert.equal(first.metadata.publication, pub);
+  assert.equal(first.metadata.displayedAt, displayedAt);
+  assert.equal(first.metadata.observation, 'current-display');
+  assert.equal(first.metadata.content, 'already-displayed');
+  assert.equal(first.metadata.engineRender, null);
+  assert(first.metadata.requestedAt <= first.metadata.readbackStartedAt);
+  assert(first.metadata.readbackStartedAt <= first.metadata.readbackCompletedAt);
+  assert.deepEqual(Array.from(first.outputRGBA), pixels(r.presentationCanvas));
+  first.outputRGBA.fill(99);
+  const b = h.requestCurrentDisplayCapture({ hwnd: 123 });
+  assert.deepEqual(b.read().outputRGBA, a.read().outputRGBA);
+  assert.equal(r._immutablePublicationSequence, pub);
+  assert.equal(r._repaintScheduled, false);
+});
+
+test('current display preserves pending damage and cancellation without scheduling or forcing publication', () => {
+  const { r, h, win } = ownedFixture(); r.repaint();
+  const old = h.requestCurrentDisplayCapture({ hwnd: 123 }).read();
+  win._backCanvas.getContext('2d').fillStyle = '#0000ff';
+  win._backCanvas.getContext('2d').fillRect(0, 0, 8, 8);
+  r.scheduleRepaint();
+  const cancelled = h.requestCurrentDisplayCapture({ hwnd: 123 });
+  assert.equal(cancelled.status, 'pending'); assert.equal(cancelled.read(), null);
+  assert(cancelled.cancel());
+  const t = h.requestCurrentDisplayCapture({ hwnd: 123 });
+  assert.equal(t.status, 'pending'); assert.equal(r._repaintScheduled, true);
+  r.flushRepaint();
+  const now = t.read(); assert.equal(t.status, 'complete');
+  assert.equal(now.metadata.content, 'ordinary-publication-after-request');
+  assert.equal(now.metadata.publication, old.metadata.publication + 1);
+  assert.notDeepEqual(now.outputRGBA, old.outputRGBA);
+  assert.deepEqual(Array.from(now.outputRGBA), pixels(r.presentationCanvas));
+  assert.equal(cancelled.status, 'cancelled'); assert.equal(cancelled.read(), null);
+});
+
+test('current display refuses replacement, hidden/clipped owner and unreceipted display', () => {
+  for (const [name, change] of Object.entries({
+    replacement: ({ r, win }) => { r.windows[123] = { ...win }; },
+    hidden: ({ win }) => { win.visible = false; },
+    clipped: ({ win }) => { win.x = -1; },
+    changedProcess: ({ win }) => { win.processId++; },
+    changedInstance: ({ win }) => { win.wasm = {}; },
+    output: ({ r }) => { r.presentationCanvas = createCanvas(16, 16); },
+    resizedOutput: ({ r }) => { r.presentationCanvas.width++; },
+    transparent: ({ r }) => { r.transparentDesktop = true; },
+    displayOnly: ({ r }) => r._presentDisplayCanvas(),
+    failedDisplay: ({ r }) => { r.presentationFilter.ctx = null; assert.throws(() => r.repaint()); },
+  })) {
+    const f = ownedFixture(); f.r.repaint(); change(f);
+    let t;
+    try { t = f.h.requestCurrentDisplayCapture({ hwnd: 123 }); }
+    catch (e) { assert.match(e.message, /owner/, name); continue; }
+    assert.equal(t.status, 'failed', name); assert.equal(t.read(), null, name);
+    assert.equal(f.r._immutableCaptureRequest, null, name);
+  }
+});
+
+test('renderer-only writer queues without host flags, reads or scheduling until natural complete publication', () => {
+  for (const kind of ['slice', 'render-writer', 'paint', 'nested']) {
+    const { r, h, win } = ownedFixture(); r.repaint();
+    const old = h.requestCurrentDisplayCapture({ hwnd: 123 }).read();
+    const words = new Int32Array(new SharedArrayBuffer(16));
+    if (kind === 'slice') r.beginWorkerGuestSlice();
+    if (kind === 'render-writer') {
+      Atomics.store(words, 0, 1);
+      r._d3dimPublicationJoins = [{ live: true, epoch: { words }, startComposition() {}, publication() {}, transfer() {} }];
+    }
+    if (kind === 'paint') r.beginWorkerGdiPaint(123);
+    if (kind === 'nested') r._repainting = true;
+    const scheduled = r._repaintScheduled;
+    const t = h.requestCurrentDisplayCapture({ hwnd: 123 });
+    assert.equal(t.status, 'pending', kind); assert.equal(t.read(), null);
+    assert.equal(r._repaintScheduled, scheduled, 'request must not schedule');
+    assert.equal(r._immutablePublicationSequence, old.metadata.publication);
+    win._backCanvas.getContext('2d').fillStyle = '#0000ff';
+    win._backCanvas.getContext('2d').fillRect(0, 0, 8, 8);
+    // Model the real surface onDirty hook: backing bytes changed after the
+    // retained display, so publication work is pending even after release.
+    r.scheduleRepaint();
+    if (kind === 'slice' || kind === 'render-writer') {
+      r.repaint(); assert.equal(t.status, 'pending');
+    }
+    if (kind === 'slice') r.endWorkerGuestSlice();
+    if (kind === 'render-writer') Atomics.store(words, 0, 0);
+    if (kind === 'paint') r.endWorkerGdiPaint(123);
+    if (kind === 'nested') r._repainting = false;
+    assert.equal(t.status, 'pending', 'hold release alone cannot complete');
+    r.repaint(); assert.equal(t.status, 'complete', t.error);
+    const now = t.read();
+    assert.equal(now.metadata.content, 'ordinary-publication-after-request');
+    assert(Object.values(now.metadata.rendererWorkAtRequest).some(Boolean));
+    assert(Object.values(now.metadata.pendingHostPublicationAtRequest).every(v => !v));
+    assert.deepEqual(Array.from(now.outputRGBA), pixels(r.presentationCanvas));
+    assert.notDeepEqual(now.outputRGBA, old.outputRGBA);
+    const retained = now.outputRGBA.slice(); now.outputRGBA.fill(99); r.repaint();
+    assert.deepEqual(t.read().outputRGBA, retained);
+  }
+});
+
+test('renderer-only pending capture preserves cancellation, owner identity, display/read failure and partial paint refusal', () => {
+  for (const fault of ['cancel', 'owner', 'process', 'instance', 'display', 'readback', 'paint']) {
+    const { r, h, win } = ownedFixture(); r.repaint(); r.beginWorkerGuestSlice();
+    const t = h.requestCurrentDisplayCapture({ hwnd: 123 });
+    assert.equal(t.status, 'pending');
+    if (fault === 'cancel') t.cancel();
+    if (fault === 'owner') r.windows[123] = { ...win };
+    if (fault === 'process') win.processId++;
+    if (fault === 'instance') win.wasm = {};
+    if (fault === 'display') r._presentDisplayCanvas = () => { throw Error('lost display'); };
+    if (fault === 'readback') r.presentationCanvas.getContext('2d').getImageData = () => { throw Error('failed readback'); };
+    if (fault === 'paint') r.beginWorkerGdiPaint(123);
+    r.endWorkerGuestSlice();
+    if (fault === 'display') assert.throws(() => r.repaint(), /lost display/);
+    else r.repaint();
+    assert.equal(t.status, fault === 'cancel' ? 'cancelled' : 'failed', fault);
+    assert.equal(t.read(), null); assert.equal(r._immutableCaptureRequest, null);
+  }
+});
+
+test('clean slice completion reports readback state without changing request history or publication', () => {
+  const { verifyReadback } = require('../tools/revolt-display-admission.cjs');
+  for (const kind of ['slice', 'render-writer', 'paint']) {
+    const { r, h } = ownedFixture(); r.repaint();
+    const publication = r._immutablePublicationSequence, displayedAt = r._currentDisplayRecord.displayedAt;
+    const words = new Int32Array(new SharedArrayBuffer(16));
+    if (kind === 'slice') r.beginWorkerGuestSlice();
+    if (kind === 'render-writer') {
+      Atomics.store(words, 0, 1);
+      r._d3dimPublicationJoins = [{ live: true, epoch: { words } }];
+    }
+    if (kind === 'paint') r.beginWorkerGdiPaint(123);
+    const t = h.requestCurrentDisplayCapture({ hwnd: 123 });
+    r.serviceCurrentDisplayCapture(); assert.equal(t.status, 'pending');
+    if (kind === 'slice') r.endWorkerGuestSlice();
+    if (kind === 'render-writer') Atomics.store(words, 0, 0);
+    if (kind === 'paint') r.endWorkerGdiPaint(123);
+    r.serviceCurrentDisplayCapture(); assert.equal(t.status, 'complete', t.error);
+    const v = t.read(), m = v.metadata;
+    assert(Object.values(m.rendererWorkAtRequest).some(Boolean));
+    assert.equal(m.retainedPublicationPixels, false);
+    assert.equal(m.content, 'already-displayed');
+    assert.equal(m.publication, publication); assert.equal(m.displayedAt, displayedAt);
+    for (const state of Object.values(m.rendererWorkAtReadback)) {
+      assert(Object.isFrozen(state)); assert(Object.values(state).every(v => v === false));
+    }
+    verifyReadback(m, { windowHwnd: 123, processId: m.captureOwner.processId });
+    const bytes = v.outputRGBA.slice(); v.outputRGBA.fill(99);
+    assert.deepEqual(t.read().outputRGBA, bytes);
+    assert.equal(r._repaintScheduled, false);
+  }
+});
+
+test('clean-service completion never admits held mutable pixels or identity/readback faults', () => {
+  for (const fault of ['held', 'paint', 'owner', 'output', 'readback', 'held-during-read', 'replacement-during-read']) {
+    const { r, h, win } = ownedFixture(); r.repaint(); r.beginWorkerGuestSlice();
+    const t = h.requestCurrentDisplayCapture({ hwnd: 123 }); r.endWorkerGuestSlice();
+    if (fault === 'held') r.beginWorkerGuestSlice();
+    if (fault === 'paint') r.beginWorkerGdiPaint(123);
+    if (fault === 'owner') r.windows[123] = { ...win };
+    if (fault === 'output') r.presentationCanvas = createCanvas(16, 16);
+    const ctx = r.presentationCanvas.getContext('2d'), read = ctx.getImageData;
+    ctx.getImageData = function (...args) {
+      if (fault === 'readback') throw Error('readback failed');
+      const data = read.apply(this, args);
+      if (fault === 'held-during-read') r.beginWorkerGuestSlice();
+      if (fault === 'replacement-during-read') r._currentDisplayRecord = { ...r._currentDisplayRecord };
+      return data;
+    };
+    r.serviceCurrentDisplayCapture();
+    assert.equal(t.status, ['held','paint'].includes(fault) ? 'pending' : 'failed', fault);
+    assert.equal(t.read(), null); t.cancel();
+  }
+});
+
+test('pending current display cannot cross owner replacement', () => {
+  const { r, h, win } = ownedFixture(); r.repaint(); r.scheduleRepaint();
+  const t = h.requestCurrentDisplayCapture({ hwnd: 123 });
+  r.windows[123] = { ...win }; r.flushRepaint();
+  assert.equal(t.status, 'failed'); assert.equal(t.read(), null);
+});
+
+test('queued host capture waits for actual unheld publication without uploading, scheduling or completing a writer', () => {
+  for (const field of ['_dxDirty', '_dxLockDeferred', '_presentFrameDue']) {
+    const { r, h, win } = ownedFixture(); r.repaint();
+    const old = h.requestCurrentDisplayCapture({ hwnd: 123 });
+    const seq = r._immutablePublicationSequence;
+    win._backCanvas.getContext('2d').fillStyle = '#0000ff';
+    win._backCanvas.getContext('2d').fillRect(0, 0, 8, 8);
+    h[field] = true;
+    r.beginWorkerGuestSlice();
+    const t = h.requestCurrentDisplayCapture({ hwnd: 123 });
+    assert.equal(t.status, 'pending'); assert.equal(t.read(), null);
+    assert.equal(r._repaintScheduled, false);
+    assert.equal(r._immutablePublicationSequence, seq);
+    assert.equal(h[field], true);
+    r.repaint(); assert.equal(t.status, 'pending', 'active writer cannot publish');
+    r.endWorkerGuestSlice();
+    h[field] = false;
+    r.repaint();
+    assert.equal(t.status, 'complete', t.error);
+    const now = t.read();
+    assert.equal(now.metadata.publication, seq + 1);
+    assert.equal(now.metadata.content, 'ordinary-publication-after-request');
+    const key = {_dxDirty:'dirty',_dxLockDeferred:'lockDeferred',_presentFrameDue:'presentDue'}[field];
+    assert.equal(now.metadata.pendingHostPublicationAtRequest[key], true);
+    assert.notDeepEqual(now.outputRGBA, old.read().outputRGBA);
+    assert.deepEqual(Array.from(now.outputRGBA), pixels(r.presentationCanvas));
+    assert.equal(old.read().metadata.publication, seq);
+    const retained = now.outputRGBA.slice(); now.outputRGBA.fill(99); r.repaint();
+    assert.deepEqual(t.read().outputRGBA, retained, 'completed ticket remains detached');
+  }
+});
+
+test('queued host request retains cancellation, owner replacement and failed readback refusal', () => {
+  for (const fault of ['cancel', 'owner', 'readback']) {
+    const { r, h, win } = ownedFixture(); r.repaint(); h._dxDirty = true;
+    const t = h.requestCurrentDisplayCapture({ hwnd: 123 });
+    assert.equal(t.status, 'pending');
+    if (fault === 'cancel') assert(t.cancel());
+    if (fault === 'owner') r.windows[123] = { ...win };
+    if (fault === 'readback') r.presentationCanvas.getContext('2d').getImageData = () => { throw Error('failed readback'); };
+    h._dxDirty = false; r.repaint();
+    assert.equal(t.status, fault === 'cancel' ? 'cancelled' : 'failed');
+    assert.equal(t.read(), null);
+  }
+});
+
+test('current readback fails closed on identity change during read and never substitutes prior bytes', () => {
+  for (const kind of ['owner', 'output', 'tainted', 'alpha']) {
+    const { r, h, win } = ownedFixture(); r.repaint();
+    const old = h.requestCurrentDisplayCapture({ hwnd: 123 }).read();
+    const ctx = r.presentationCanvas.getContext('2d'), read = ctx.getImageData;
+    ctx.getImageData = function (...args) {
+      const data = read.apply(this, args);
+      if (kind === 'owner') r.windows[123] = { ...win };
+      if (kind === 'output') r.presentationCanvas = createCanvas(16, 16);
+      if (kind === 'tainted') throw Error('readback tainted');
+      if (kind === 'alpha') data.data[3] = 0;
+      return data;
+    };
+    const t = h.requestCurrentDisplayCapture({ hwnd: 123 });
+    assert.equal(t.status, 'failed', kind); assert.equal(t.read(), null);
+    assert.equal(r._immutableCaptureRequest, null);
+    assert.equal(old.metadata.publication, 1);
+  }
+});
+
+test('current exclusive display proves complete one-owner source crop and contained output from the production viewport', () => {
+  const { r, h, win } = ownedFixture();
+  win.wasm.exports.get_dx_exclusive_hwnd = () => win.hwnd;
+  r.repaint();
+  const t = h.requestCurrentDisplayCapture({ hwnd: 123 });
+  assert.equal(t.status, 'complete', t.error);
+  assert.equal(t.read().metadata.composition.exclusive, true);
+  assert.deepEqual(Array.from(t.read().outputRGBA), pixels(r.presentationCanvas));
+  assert.equal(t.read().metadata.content, 'already-displayed');
+  for (const change of [v => { v.cropX++; }, v => { v.cropW--; },
+    v => { v.dstX = -1; }, v => { v.dstH = v.outputH + 1; },
+    v => { v.cropBase.w--; }]) {
+    const f = ownedFixture(); f.win.wasm.exports.get_dx_exclusive_hwnd = () => 123;
+    f.r.repaint(); change(f.r._exclusivePresentationViewport);
+    const refused = f.h.requestCurrentDisplayCapture({ hwnd: 123 });
+    assert.equal(refused.status, 'failed'); assert.equal(refused.read(), null);
   }
 });

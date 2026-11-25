@@ -54,3 +54,178 @@ between batches 245 and 600, equal to host surface uploads, ~7.8 `BitBlt`
 rectangles each. Tile World redraws on change (clock 200 -> 137 over the window
 = ~63 once-per-second redraws + moves/pickups). Evidence:
 `scratch/runs/20261010T0700Z-tworld-cli-frames`.
+
+### 2026-11-20: startup path-buffer allocations, CRT route matters
+
+Run `20261120-tileworld-fileio-allocation-causal-repair-gameplay` traces the
+registered 1.3.1 PE's retained `fileio.c:348` dialog to `0x410df0`:
+`malloc(260)` via `0x41df10` / IAT `0x4383e0`, return `0x410dfe`;
+the zero-result branch sets the file/line and calls the fatal wrapper.
+The earlier native dialog arguments and whole frame are retained in that run.
+This identifies the allocation site, not the underlying failure cause.
+
+The same retained a600 module with Git f696 CLI dependencies and explicit
+SDL.dll (built-in CRT, matching the browser's DLL choice) repeatedly makes
+successful 260-byte allocations at that return address. The CLI comparison
+with automatic DLL discovery loads a real msvcrt.dll and reaches SDL window
+creation instead. These are different CRT contracts; the real-CRT run is not
+an old-fail/new-pass repair. No new failing malloc return, errno or heap OOM
+reason was captured. Upstream BR903/tworld master identifies itself as 1.3.2;
+its getpathbuffer/memerrexit shape agrees, but its line numbers are not the
+1.3.1 binary's source mapping.
+
+The repeated trace exceeded the disk floor; both supervised runs had already
+ended and their tracked processes were joined when the breach was observed.
+The 105,499,260-byte trace was gzip-compressed, restored through a streaming
+SHA-256 check, and only then unlinked. No further runtime query or replay,
+source fix, chip/level progress or Quit is claimed.
+
+Next causal test: retain a bounded first/last allocation and API ring, counts,
+the first heap_oom_trace(size, reason), and the actual native call stack at
+`0x410dfe` and its caller. Include the two intervening imports (their names
+are absent from this filtered trace), their arguments/returns, cdecl ESP and
+nonvolatile-register preservation, and any file/directory failure/error.
+Determine why startup re-enters getpathbuffer before choosing a handler to
+change. Do not increase heap capacity, add media, force wakes or bypass the
+fatal branch on the evidence currently retained.
+
+### 2026-11-20: bounded built-in CRT history identifies argument-handler loop
+
+Run `20261120-tileworld-bounded-crt-fileio-causal-repair` retains the a600
+module and f696 CLI dependencies with explicit SDL.dll and built-in CRT.
+A read-only import observer keeps first32/last64 API records, bounded stack
+words and file-call history in TMPFS, counts all API entries, and stops at
+50,000 completed calls. Offline controls cover finite bound, NULL allocation,
+first OOM reason and nonvolatile-register violation detection. The original
+reaches the bound in four batches; its normal CLI error handler labels the
+authored diagnostic stop `CRASH`. This is not an observed guest fault or OOM.
+
+The missing intervening imports are **sprintf** (thunk `0x41df60`, IAT
+`0x438418`, return `0x4047a4`) and **strtol** (thunk `0x41df58`, IAT
+`0x43843c`, return `0x404567`). Retained late sprintf calls have format
+`%.*s`, precision259, return1; late strtol calls use base10, return0 and
+eventually NULL input. Both and malloc retain ESP delta4 and EBX/ESI/EDI/EBP
+in the retained samples. Counts: malloc16646, sprintf16641, strtol16642;
+no NULL allocation or heap_oom_trace occurred before the finite bound.
+The observer did not retain a separate first32 path-allocation ring, parser
+argc/argv outputs, strtol end-pointer output, or a live errno cell.
+
+Native stack words plus exact PE disassembly tie getpathbuffer re-entry to
+the argument callback: `0x404770 -> 0x410df0`, sprintf at `0x40479f`, return
+through `0x410504` into parser `0x410490`. It is not a proven file-enumeration
+loop: _findfirst/_findnext/_fullpath/_stat/_mkdir were never observed. The
+only file calls are missing DDRAW.DLL attributes (-1; exact last-error not
+retained) and successful stdout/stderr file creation. Do not infer more-media
+need from the optional DLL probe.
+
+Next source/test remedy: first retain GetCommandLineA's returned string,
+__getmainargs argc/argv outputs, SDL's resulting argc/argv and the parser's
+four arguments at `0x410490`, then its loop index/argc comparison and callback
+return at `0x410504`. Keep separate first/last path-allocation records and
+strtol end-pointer/sprintf output bytes. Audit `src/10-helpers.wat`
+store_fake_argv_a, `src/09a-handlers2-runtime.wat` __getmainargs and the exact
+native parser compare/branch before choosing a patch. The shared formatter
+in `src/12-wsprintf.wat` lacks dynamic `.*` precision, but that independently
+visible defect is not proven to cause this argument loop; changing it alone
+would not establish a startup repair. A focused native reproducer must first
+show the actual bad argc/index transition or ABI/output corruption, then
+old-fail/new-pass and negative API controls. No product patch, browser replay,
+chip, level completion or Quit is claimed. All supervised processes joined;
+no remote box was created.
+
+### 2026-11-20: native argument-loop cause repaired; browser owner still hidden
+
+Run `20261120-tileworld-native-argv-loop-causal-repair` first compared the
+actual f696 CRT handlers with the shared tree (the argument, strtol and
+sprintf handlers are identical), then retained bounded first/last API and
+native block rings. GetCommandLineA is terminated `C:\tworld.exe`;
+__getmainargs returns argc1 and argv[1]=NULL. SDL's splitter also produces
+one argument. The PE parser nevertheless receives argc **0x41922a**, with a
+correctly increasing index. Its callback returns zero and the next signed
+comparison continues past argv's terminator. strtol returns zero with its
+end-pointer output captured; sprintf `%.*s` returns the independently wrong
+literal `s`. Neither is the cause of the invalid argc.
+
+The loader binds MSVCRT's **_iob data array** to thunk 0x7500110. Original
+startup code at 0x418d65 copies eight FILE dwords into imported stdout at
+_iob+32, overwriting the adjacent **atexit** descriptor at 0x7500138 from
+`{0x387b8,2477}` to `{0x589188,6}`. The observer's historical field names
+`onexitIat`/`onexitThunk` refer to this atexit import, not _onexit. Two native
+calls via 0x401000 now dispatch the wrong handler and pop20 bytes each.
+ESP rises32 bytes; the return at 0x41922a overwrites argc saved at EBP-0x1c.
+This proves a FILE-data/import-binding corruption, not heap exhaustion or a
+file-enumeration problem.
+
+The narrow source fix extends the existing CRTDLL/MSVCR70 `_iob` data
+resolver to exactly MSVCRT.DLL, case insensitive. Unrelated modules and
+symbol/module suffixes remain rejected; authentic DLL exports retain
+precedence. The frozen control recompiles byte-identically to a600. Replacing
+only this function produces module
+`9fad60add0e7bc86dbcb957709450df5833024e0ba735c7f5bd5db22d856e022`.
+With the same original PE, SDL and media, atexit preserves its descriptor,
+returns with cdecl ESP delta4 and preserved nonvolatile registers, parser
+argc is1 and the native branch takes 0x410738 (completion). No strtol,
+formatter, heap-size, media, callback-wake or input-guard changes were made.
+The focused data-import/native-cdecl regression and stdio regression pass;
+the literal locked build passed. Evidence retains old-fail/new-pass API and
+native observations, exact source/module recovery and foreign diffs.
+
+One fresh coherent browser original actually reads back the repaired module
+in the page and CPU Worker (305 imports each), accepted f696 JS, accepted
+bridge and16 registered media files. Normal browser focus was admitted.
+At the first native observation, Tile World's live HWND65537 is **hidden**,
+with client rect23,43,-6,-27, focus0 and a healthy but not-ready software
+scene. The existing startup observer throws `sampled native owner
+missing/hidden` while the launch overlay remains visible; the scope closes
+without binding, input or later endpoint requests. No picker/board capture,
+chip, level or ordinary Quit was earned. The reviewed screenshot is only the
+prelaunch desktop; the WebGL toolbar selector earns no renderer credit.
+
+The next remedy is a bounded native window-creation/show/size history that
+distinguishes SDL's initial hidden window from a failed later ShowWindow or
+size publication, with native HWND/generation/thread ownership recorded at
+each boundary. The retained hidden observation alone does not justify
+changing the input guard, forcing visibility or replaying this closed scope.
+All local supervised processes and the independent watchdog joined; private
+profile/display/socket/auth were removed, and no remote box was created.
+
+### 2026-11-20: actual filename star-precision defect repaired
+
+Run `20261120-tileworld-native-filename-formatter-repair-gameplay` retains
+the first real filename formatting call with the accepted `_iob` repair.
+At PE `0x404c60`, native code pushes filename `cc-ms.dac`, precision255,
+format `0x422cdc` (`%.*s`) and destination, then calls sprintf; return is
+`0x404c65`. The builtin formatter returned the literal `s`, length1.
+ESP advances4 and EBX/ESI/EDI/EBP survive. This directly demonstrates the
+filename-buffer corruption; the earlier browser's five literal labels remain
+a separate retained visual observation.
+
+`src/12-wsprintf.wat` now consumes CRT dynamic width and precision arguments
+before each value. Negative precision is omitted; negative width means left
+alignment. CRT string/character fields and integer zero precision follow that
+contract. The dialect gate preserves User32's existing behavior. There is no
+host text replacement, rendering overlay, input change or `_iob` change.
+Recompiling the exact accepted f696 closure with the unchanged `_iob` resolver
+and this formatter produces module
+`6d1c386be119ad9b05b3597aa5c3bb7755ba6d4f981859ed454bbff3dc8cd9c5`.
+The same native entry registers and stack arguments now produce `cc-ms.dac`,
+length9, with unchanged ESP/nonvolatile behavior. Focused real x86 API-thunk
+tests cover sprintf/vsprintf/_vsnprintf, zero/bounded/negative precision,
+width/combined stars and following arguments, truncation, null handling,
+output guards/counts and cdecl/nonvolatile preservation. These and the User32
+A/W front-door regression pass, as does the literal locked build. The first
+front-door attempt rejected concurrently changing compilation inputs; the
+stable rerun passed.
+
+The sole fresh browser attempt served and HTTP-readback-verified the matching
+source closure and all16 media hashes, but stopped before native startup
+admission: the run harness omitted the reused `startup.cjs` required by
+`expression.cjs`. This is an author harness error, not a guest failure. Its
+closed scope was not replayed and received no later endpoint requests.
+The personally reviewed whole frame shows only the launching desktop, with
+no game window. Actual page module readback is retained; CPU Worker/module
+provenance, readable picker, manual selection, chip/level progress and Quit
+were not reached. All supervised processes and finite watchdog joined;
+private profile/display/socket/auth were removed. No remote box was created.
+The next authorized attempt must restore the exact accepted startup helper
+and preflight the complete helper dependency closure before launching.

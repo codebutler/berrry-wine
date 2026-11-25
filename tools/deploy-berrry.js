@@ -57,8 +57,12 @@ const ASSET_PART_SIZE = 10 * 1024 * 1024;
 
 // Skip individual large files (>500KB) that aren't essential
 const MAX_BINARY_SIZE = 500 * 1024;
+// Link-preview cards are generated full-bleed game art (500-800KB for a
+// detailed 3D or isometric game); they are always needed, so they get their
+// own cap instead of being skipped.
+const OG_CARD_DIR = 'screenshots/og/', MAX_OG_CARD_SIZE = 2 * 1024 * 1024;
 // But always include these even if large
-const LARGE_OK = new Set(['cards.dll', 'comctl32.dll']);
+const LARGE_OK = new Set(['cards.dll']);
 const LARGE_OK_PATHS = new Set([
   'build/wine-assembly.wasm',
   'build/wine-assembly.compat.wasm',
@@ -195,7 +199,7 @@ function collectTextFiles() {
   }
   // docs/: only the rendered .html pages, never the raw Markdown, JSON
   // status ledgers or the DOS corpus report tree.
-  for (const subdir of ['apps', 'articles', 'design', 'docs', 'docs/re-notes']) {
+  for (const subdir of ['apps', 'compat', 'articles', 'design', 'docs', 'docs/re-notes']) {
     const dir = path.join(ROOT, subdir);
     if (!fs.existsSync(dir)) continue;
     for (const entry of fs.readdirSync(dir)) {
@@ -294,17 +298,35 @@ const PUBLISHABLE_OUTSIDE_BINARIES = [
   // way; publishing it as a promotional demo is the owner's decision
   // (2026-09-24, test/binaries/SOURCES.md). Only its manifest's files ship.
   'test/binaries/candidates/simcity-2000-demo/',
+  // GTA2 Wild Demo: the payload its own InstallShield wizard copied. The demo
+  // licence permits playing it but grants no redistribution right, and
+  // Rockstar's free full-game release forbade mirroring; publishing it anyway
+  // is the owner's decision (2026-11-24). Only the registry's file list ships.
+  'test/binaries/candidates/gta2-demo/installed/Program_Executable_Files/',
   // Moorhuhn (Die Original Moorhuhn Jagd): Phenomedia/Art Department's 1999
   // Johnnie Walker promotion, given away free and passed around by its own
   // design. Only Moorhuhn.exe + MOORHUHN.DAT (its manifest) ship; publishing
   // it is the owner's decision (2026-09-28, test/binaries/SOURCES.md). The
   // sequels and Winter/3/Tennis siblings stay local-only.
   'test/binaries/candidates/moorhuhn/',
+  // Hexen II demo 1.11: its bundled Activision sublicence says no copies or
+  // distribution; publishing it as a promotional demo anyway is the owner's
+  // decision (2026-11-13, test/binaries/SOURCES.md). Only its manifest's 14
+  // installed files ship, the sublicence among them; installer and sources
+  // stay local.
+  'test/binaries/candidates/hexen-2-demo/',
   // Need for Speed II (original), II Special Edition and III: Hot Pursuit
   // demos: EA's own promotional demos, given away on magazine discs and
   // download sites. Their packaging grants no redistribution right either
   // way; publishing them as promotional demos is the owner's decision
   // (2026-09-30, test/binaries/SOURCES.md). Only each manifest's files ship.
+  // Command & Conquer: Red Alert Win95 demo v1.19: Westwood's own February
+  // 1997 promotional demo, given away free on its site and magazine discs.
+  // Its README states copyright and no redistribution terms either way;
+  // publishing it is the owner's decision (2026-11-24, test/binaries/SOURCES.md).
+  // Only the CD's INSTALL\ tree ships (RA95.EXE plus its manifest's files);
+  // the rest of the Win98 Games A-D archive stays local.
+  'test/binaries/win98-games-a-d/CnC-Red Alert Demo-SW/INSTALL/',
   'test/binaries/candidates/need-for-speed-2-demo/',
   'test/binaries/candidates/need-for-speed-3-demo/',
   'build/nfs2se-browser.json',
@@ -333,8 +355,12 @@ function desktopAssetPaths() {
 
   // index.html offers exactly these three lists and nothing else, so an APPS
   // entry no icon and no selector row can reach is not a live-site asset.
+  // A listed applet that only launches other entries (the Screen Savers
+  // catalog) names them in `launches`; those are reachable, so they ship too.
   const listed = [...DESKTOP_APPS, ...LOCAL_CANDIDATE_APPS, ...DEBUG_ONLY_APPS];
-  for (const [id] of listed) {
+  const ids = new Set(listed.map(([id]) => id));
+  for (const id of [...ids]) for (const child of (APPS[id] && APPS[id].launches) || []) ids.add(child);
+  for (const id of ids) {
     const app = APPS[id];
     if (!app) continue;
     add(app.exe);
@@ -440,7 +466,7 @@ function collectBinaries() {
     for (const f of found) {
       if (seen.has(f.rel)) continue;
       const stat = fs.statSync(f.full);
-      if (stat.size > MAX_BINARY_SIZE &&
+      if (stat.size > (f.rel.startsWith(OG_CARD_DIR) ? MAX_OG_CARD_SIZE : MAX_BINARY_SIZE) &&
           !LARGE_OK.has(path.basename(f.full).toLowerCase()) &&
           !LARGE_OK_PATHS.has(f.rel)) {
         console.log('  SKIP (too large): ' + f.rel + ' (' + (stat.size / 1024).toFixed(0) + 'KB)');
@@ -939,7 +965,7 @@ async function deploy() {
 
   const appMeta = {
     subdomain: SUBDOMAIN,
-    title: 'Wine-Assembly \u2014 Windows 98 Emulator',
+    title: 'Berrry Wine \u2014 Windows 98 Emulator',
     description: 'x86 Windows 98 PE interpreter in WebAssembly. Runs real Win32 executables in the browser.',
   };
 

@@ -1,0 +1,105 @@
+'use strict';
+// Immutable Git-backed, memory-only runtime. No checkout or source archive.
+const fs=require('node:fs'),path=require('node:path'),cp=require('node:child_process');
+const ROOT=path.resolve(__dirname,'..');
+function gitFiles(commit){
+  const names=cp.execFileSync('git',['ls-tree','-r','--name-only',commit,'--','src','lib','tools','index.html','host.js'],{cwd:ROOT,encoding:'utf8'}).trim().split('\n').filter(n=>/\.(js|cjs|json|wat|watx|html)$/.test(n));
+  const packed=cp.execFileSync('git',['cat-file','--batch'],{cwd:ROOT,input:names.map(n=>commit+':'+n+'\n').join(''),maxBuffer:100*1024*1024});let at=0;const files=new Map();
+  for(const n of names){const end=packed.indexOf(10,at),h=packed.subarray(at,end).toString().split(' '),size=Number(h[2]);if(h[1]!=='blob'||!Number.isSafeInteger(size))throw Error('invalid Git blob');files.set(n,Buffer.from(packed.subarray(end+1,end+1+size)));at=end+size+2;}if(at!==packed.length)throw Error('Git framing');return files;
+}
+function compile(files){
+  const read=fs.readFileSync,Module=require('node:module'),extensions={...Module._extensions};
+  fs.readFileSync=function(file,options){const b=typeof file==='string'&&files.get(path.relative(ROOT,path.resolve(file)));if(!b)return read.apply(this,arguments);const enc=typeof options==='string'?options:options?.encoding;return enc?b.toString(enc):Buffer.from(b);};
+  for(const ext of ['.js','.cjs','.json'])Module._extensions[ext]=(m,file)=>{const b=files.get(path.relative(ROOT,file));if(!b)return extensions[ext](m,file);if(ext==='.json')m.exports=JSON.parse(b);else m._compile(b.toString(),file);};
+  try{const {sourceTextFromBytes}=require('./watx.js'),vfs=new Map();for(const [n,b]of files)if(/^src\/.*\.(wat|watx)$/.test(n)){const t=sourceTextFromBytes(b),f=n.slice(4);for(const k of [f,n,'./'+f])vfs.set(k,t);}
+    const r=require('./watx-closure.js').compileClosure({entry:'src/main.watx',source:vfs.get('main.watx'),vfs},{tailCalls:true});if(!r.success)throw Error(r.error);const h=require('./region-layout-hash.js');return h.appendSection(Buffer.from(r.wasmBinary),h.layoutHash(r.regions.regions));
+  }finally{fs.readFileSync=read;for(const e of ['.js','.cjs','.json'])if(extensions[e])Module._extensions[e]=extensions[e];else delete Module._extensions[e];}
+}
+// Passive observer of public decoded GPU records. Preserves returns/errors,
+// makes no guest call, and retains bounded complete PRESENT-delimited windows.
+function installObserver(root,name){
+  const api=root[name];if(!api?.Executor||api.Executor.prototype.__boidsObserved)return;
+  const p=api.Executor.prototype,original=p.execute;p.__boidsObserved=true;
+  const traces=root.__boidsPublicTraces||(root.__boidsPublicTraces={});
+  const trace=traces[name]={kind:'public-gpu-stream-records',executor:name,counts:{},frames:[],pending:[],dropped:0,bytes:0};
+  p.execute=function(rec){
+    root.__boidsPublicTrace=trace;
+    try{trace.counts[rec.name]=(trace.counts[rec.name]||0)+1;
+      if(trace.pending.length<512&&trace.bytes<2097152){const row={name:rec.name,seq:rec.seq,fields:{...rec.fields},inputs:[]};for(const r of rec.refs||[])if(r.input){const b=rec.arena(r.pos,r.len);if(b.length+trace.bytes>2097152){trace.dropped++;continue;}row.inputs.push({pos:r.pos,bytes:Array.from(b)});trace.bytes+=b.length;}trace.pending.push(row);}else trace.dropped++;
+    }catch(e){trace.error=String(e);}
+    const result=original.call(this,rec);
+    if(rec.name==='PRESENT'){trace.frames.push({at:Date.now(),records:trace.pending,stats:this.stats?.()});if(trace.frames.length>2)trace.frames.shift();trace.pending=[];trace.bytes=0;}
+    return result;
+  };
+}
+// Observe only arguments and completed public presentation calls. No readback,
+// guest call, repaint, ownership mutation or extra presentation is performed.
+function installPresentationObserver(root){
+  const p=root.GpuStreamHost?.Presenter?.prototype;if(!p||p.__boidsObserved)return;
+  p.__boidsObserved=true;const original=p.present;
+  const trace=root.__boidsPresentationTrace={count:0,rows:[],errors:0};
+  p.present=function(frame){
+    const row={at:Date.now(),hwnd:frame.hwnd,width:frame.width,height:frame.height,stamp:frame.stamp,dstX:frame.dstX,dstY:frame.dstY,bitmap:!!frame.bitmap,surface:!!frame.surface,before:this.presents};
+    try{const result=original.call(this,frame);row.after=this.presents;row.stale=this.stale;row.window=this.win?.hwnd;row.writeSeq=this.layer?.writeSeq;return result;}
+    catch(error){row.error=String(error);trace.errors++;throw error;}
+    finally{trace.count++;if(trace.rows.length===64)trace.rows.shift();trace.rows.push(row);}
+  };
+}
+function selectWindow(w){
+  const wins=Object.values(w.renderer?.windows||{}).filter(v=>v.visible&&!v.isChild&&v.w>0&&v.h>0&&v.processId===w.processId&&v.wasm===w.instance);
+  if(wins.length!==1)throw Error('ambiguous or missing live app window');return wins[0];
+}
+// Bounded pixel observations at existing completed PRESENT callbacks only.
+// Reading a completed framebuffer never submits a guest operation or flush.
+function installPixelObserver(root){
+  function pixels(bytes,width,height){
+    let hash=2166136261,nonblack=0,opaque=0,transparent=0;const colors={};
+    for(let i=0;i<bytes.length;i++){hash=Math.imul(hash^bytes[i],16777619)>>>0;
+      if(i%4===0){if(bytes[i]||bytes[i+1]||bytes[i+2])nonblack++;if(bytes[i+3]===255)opaque++;if(!bytes[i+3])transparent++;
+        const key=Array.from(bytes.subarray(i,i+4)).join(',');if(Object.keys(colors).length<32||colors[key])colors[key]=(colors[key]||0)+1;}}
+    return {width,height,bytes:bytes.length,fnv1a:hash,nonblack,opaque,transparent,colors};
+  }
+  function canvas(c){return pixels(c.getContext('2d').getImageData(0,0,c.width,c.height).data,c.width,c.height);}
+  function bitmap(b){const c=new root.OffscreenCanvas(b.width,b.height);c.getContext('2d').drawImage(b,0,0);return canvas(c);}
+  root.__boidsSummarizeCanvas=canvas;
+  const trace=root.__boidsPixelStages||(root.__boidsPixelStages={rows:[],errors:[],startedAt:Date.now(),counts:{}});
+  const take=stage=>{trace.counts[stage]=(trace.counts[stage]||0)+1;return Date.now()-trace.startedAt>=12000&&trace.rows.filter(r=>r.stage===stage).length<2;};
+  const keep=row=>{if(trace.rows.length===8)trace.rows.shift();trace.rows.push(row);};
+  const p=root.GpuStreamWebGL?.Executor?.prototype;
+  if(p&&!p.__boidsPixels){p.__boidsPixels=true;const execute=p.execute;
+    p.execute=function(rec){
+      if(rec.name!=='PRESENT'||!take('completed-gpu-default-framebuffer'))return execute.call(this,rec);
+      const callback=this.onPresent;
+      this.onPresent=frame=>{try{root.__boidsCompletedPixel={seq:rec.seq,presentOrdinal:trace.counts['completed-gpu-default-framebuffer']};keep({observation:root.__boidsCompletedPixel,stage:'completed-gpu-default-framebuffer',at:Date.now(),seq:rec.seq,fields:{...rec.fields},hwnd:frame.hwnd,stamp:frame.stamp,pixels:pixels(frame.pixels,frame.width,frame.height)});}catch(e){trace.errors.push(String(e));}return callback?.(frame);};
+      try{return execute.call(this,rec);}finally{this.onPresent=callback;}
+    };
+  }
+  const api=root.GpuStreamRenderWorker;
+  if(api&&!api.__boidsPixels){api.__boidsPixels=true;const create=api.create;
+    api.create=function(options){const send=options.sendFrame;let ordinal=0;
+      return create.call(this,{...options,sendFrame(frame,transfer){try{if(root.__boidsCompletedPixel){frame.__boidsPixelObservation={...root.__boidsCompletedPixel,endpointId:options.endpointId,ordinal:++ordinal};root.__boidsCompletedPixel=null;keep({observation:frame.__boidsPixelObservation,stage:'bitmap-before-transfer',at:Date.now(),endpointId:options.endpointId,hwnd:frame.hwnd,stamp:frame.stamp,pixels:frame.bitmap?bitmap(frame.bitmap):pixels(frame.pixels,frame.width,frame.height)});}}catch(e){trace.errors.push(String(e));}return send(frame,transfer);}});
+    };
+  }
+  const h=root.GpuStreamHost;
+  const pp=h?.Presenter?.prototype;
+  if(pp&&!pp.__boidsPixels){pp.__boidsPixels=true;const present=pp.present;
+    pp.present=function(frame){let row;
+      try{if(frame.__boidsPixelObservation)row={observation:frame.__boidsPixelObservation,stage:'transferred-bitmap-and-window-layer',at:Date.now(),hwnd:frame.hwnd,stamp:frame.stamp,before:this.presents,bitmap:frame.bitmap?bitmap(frame.bitmap):null};}catch(e){trace.errors.push(String(e));}
+      const result=present.call(this,frame);
+      if(row){try{row.after=this.presents;row.writeSeq=this.layer?.writeSeq;row.window=this.win?.hwnd;row.layer=canvas(this.layer.canvas);keep(row);}catch(e){trace.errors.push(String(e));}}
+      return result;
+    };
+  }
+  const rp=root.Win98Renderer?.prototype;
+  if(rp&&!rp.__boidsPixels){rp.__boidsPixels=true;const transfer=rp.observePresentationTransfer;
+    rp.observePresentationTransfer=function(source,destination,geometry){
+      const result=transfer.call(this,source,destination,geometry);
+      const win=Object.values(this.windows||{}).find(w=>w._dxFrameLayer?.canvas===source);
+      if(win&&Date.now()-trace.startedAt>=12000&&trace.rows.filter(r=>r.stage==='ordinary-compositor-transfer').length<2){
+        try{const ctx=destination.getContext('2d');keep({stage:'ordinary-compositor-transfer',at:Date.now(),hwnd:win.hwnd,writeSeq:win._dxFrameLayer.writeSeq,geometry,source:canvas(source),destination:canvas(destination),alpha:ctx.globalAlpha,operation:ctx.globalCompositeOperation,transform:Array.from(ctx.getTransform().toFloat64Array()),exclusiveDestination:destination===this._exclusivePresentationCanvas});}catch(e){trace.errors.push(String(e));}
+      }
+      return result;
+    };
+  }
+}
+module.exports={gitFiles,compile,installObserver,selectWindow,installPresentationObserver,installPixelObserver};

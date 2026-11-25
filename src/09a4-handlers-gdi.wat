@@ -156,14 +156,20 @@
 
   ;; 152: GetViewportOrgEx(hdc, lpPoint)
   (func $handle_GetViewportOrgEx (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (if (i32.ne (local.get $arg1) (i32.const 0)) (then
-      (call $gs32 (local.get $arg1)
-        (call $gdi_dc_get_field (local.get $arg0) (i32.const 56) (i32.const 0)))
-      (call $gs32 (i32.add (local.get $arg1) (i32.const 4))
-        (call $gdi_dc_get_field (local.get $arg0) (i32.const 60) (i32.const 0)))
-    ))
-    (i32.store offset=0 (global.get $reg_base) (i32.const 1))
-    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12))) (return)
+    (local $dc i32) (local $ok i32)
+    ;; Canonical lookup preserves supported live legacy window DC adoption
+    ;; without requesting allocation for an unrecognized handle.
+    (if (local.get $arg1)
+      (then
+        (local.set $dc (call $gdi_dc_state_entry (local.get $arg0) (i32.const 0)))
+        (if (local.get $dc)
+          (then
+            (call $gs32 (local.get $arg1) (i32.load offset=56 (local.get $dc)))
+            (call $gs32 (i32.add (local.get $arg1) (i32.const 4))
+              (i32.load offset=60 (local.get $dc)))
+            (local.set $ok (i32.const 1))))))
+    (i32.store offset=0 (global.get $reg_base) (local.get $ok))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
   )
 
   ;; 153: Rectangle
@@ -254,11 +260,59 @@
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8))))
 
   (func $handle_GetPath (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (i32.store offset=0 (global.get $reg_base) (call $gdi_dc_path_get
-      (local.get $arg0)
-      (if (result i32) (local.get $arg1) (then (call $g2w (local.get $arg1))) (else (i32.const 0)))
-      (if (result i32) (local.get $arg2) (then (call $g2w (local.get $arg2))) (else (i32.const 0)))
-      (local.get $arg3)))
+    (local $count i32) (local $points i32) (local $types i32)
+    (local $temporary i32) (local $result i32) (local $i i32) (local $bytes i32)
+    (local.set $points (if (result i32) (local.get $arg1)
+      (then (call $g2w (local.get $arg1))) (else (i32.const 0))))
+    (local.set $types (if (result i32) (local.get $arg2)
+      (then (call $g2w (local.get $arg2))) (else (i32.const 0))))
+    (block $done
+      ;; Query the retained count without touching either output. Capacity is
+      ;; an upper bound, so only the actual points may be scattered back.
+      (if (i32.and (i32.ne (local.get $arg3) (i32.const 0))
+            (i32.and (i32.ne (local.get $arg1) (i32.const 0))
+              (i32.ne (local.get $arg2) (i32.const 0))))
+        (then
+          (local.set $count (call $gdi_dc_path_get
+            (local.get $arg0) (i32.const 0) (i32.const 0) (i32.const 0)))
+          (if (i32.and (i32.gt_s (local.get $count) (i32.const 0))
+                (i32.ge_u (local.get $arg3) (local.get $count)))
+            (then
+              (local.set $bytes (i32.shl (local.get $count) (i32.const 3)))
+              (local.set $points (call $g2w_affine_span (local.get $arg1) (local.get $bytes)))
+              (local.set $types (call $g2w_affine_span (local.get $arg2) (local.get $count)))
+              (if (i32.or (i32.eq (local.get $points) (global.get $NULL_SENTINEL))
+                    (i32.eq (local.get $types) (global.get $NULL_SENTINEL)))
+                (then
+                  ;; Recorded paths can exceed the bounded span arena. Own a
+                  ;; heap buffer for both arrays, leaving the canonical helper
+                  ;; and its current inverse-transform calculation unchanged.
+                  (local.set $temporary (call $heap_alloc
+                    (i32.add (local.get $bytes) (local.get $count))))
+                  (if (i32.eqz (local.get $temporary))
+                    (then (local.set $result (i32.const -1)) (br $done)))
+                  (local.set $points (call $g2w (local.get $temporary)))
+                  (local.set $types (i32.add (local.get $points) (local.get $bytes)))))))))
+      (local.set $result (call $gdi_dc_path_get
+        (local.get $arg0) (local.get $points) (local.get $types) (local.get $arg3)))
+      (if (i32.and (i32.ne (local.get $temporary) (i32.const 0))
+            (i32.gt_s (local.get $result) (i32.const 0)))
+        (then
+          (block $points_done (loop $copy_points
+            (br_if $points_done (i32.ge_u (local.get $i) (local.get $bytes)))
+            (call $gs8 (i32.add (local.get $arg1) (local.get $i))
+              (i32.load8_u (i32.add (local.get $points) (local.get $i))))
+            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+            (br $copy_points)))
+          (local.set $i (i32.const 0))
+          (block $types_done (loop $copy_types
+            (br_if $types_done (i32.ge_u (local.get $i) (local.get $result)))
+            (call $gs8 (i32.add (local.get $arg2) (local.get $i))
+              (i32.load8_u (i32.add (local.get $types) (local.get $i))))
+            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+            (br $copy_types))))))
+    (if (local.get $temporary) (then (call $heap_free (local.get $temporary))))
+    (i32.store offset=0 (global.get $reg_base) (local.get $result))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 20))))
 
   (func $handle_PathToRegion (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
@@ -363,6 +417,7 @@
   ;; 158: BitBlt
   (func $handle_BitBlt (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $dst i32) (local $src i32) (local $src_hdc i32)
+    (local $dw i32) (local $dh i32)
     (local $sx i32) (local $sy i32) (local $rop i32) (local $rop3 i32)
     (local $dx i32) (local $dy i32) (local $dw i32) (local $dh i32)
     (local $pattern i32) (local $ok i32)
@@ -377,9 +432,8 @@
       (then
         (local.set $dx (call $gdi_line_map_x (local.get $dst) (local.get $arg1)))
         (local.set $dy (call $gdi_line_map_y (local.get $dst) (local.get $arg2)))
-        ;; BitBlt dimensions are logical. Map both destination corners before
-        ;; handing a pixel extent to the rasterizer: an upward-Y mapping can
-        ;; turn a negative logical height into a positive device height.
+        ;; BitBlt extents are logical units, just like its destination origin.
+        ;; Use device extents for both the raster copy and presentation bounds.
         (local.set $dw (i32.sub
           (call $gdi_line_map_x (local.get $dst) (i32.add (local.get $arg1) (local.get $arg3)))
           (local.get $dx)))
@@ -433,6 +487,13 @@
       (then
         (local.set $dx (call $gdi_line_map_x (local.get $desc) (local.get $arg1)))
         (local.set $dy (call $gdi_line_map_y (local.get $desc) (local.get $arg2)))
+        ;; PatBlt dimensions are logical units, just like the origin.
+        (local.set $w (i32.sub
+          (call $gdi_line_map_x (local.get $desc) (i32.add (local.get $arg1) (local.get $w)))
+          (local.get $dx)))
+        (local.set $h (i32.sub
+          (call $gdi_line_map_y (local.get $desc) (i32.add (local.get $arg2) (local.get $h)))
+          (local.get $dy)))
         (if (i32.ne (i32.and
               (i32.xor (local.get $rop3) (i32.shr_u (local.get $rop3) (i32.const 2)))
               (i32.const 0x33)) (i32.const 0))
@@ -463,10 +524,37 @@
 
   ;; 161: TextOutA — hdc(arg0), x(arg1), y(arg2), lpString(arg3), nCount(arg4)
   (func $handle_TextOutA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (i32.store offset=0 (global.get $reg_base) (call $gdi_native_text_out
-      (local.get $arg0) (local.get $arg1) (local.get $arg2)
-      (call $g2w (local.get $arg3)) (local.get $arg4) (i32.const 0)))
-    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24))) (return)
+    (local $text i32) (local $len i32) (local $copy_g i32) (local $i i32) (local $result i32)
+    (local.set $text (call $g2w (local.get $arg3)))
+    (block $done
+      ;; Preserve canonical count validation; copy only a valid counted input.
+      (if (i32.and (i32.ne (local.get $arg3) (i32.const 0))
+            (i32.and (i32.gt_s (local.get $arg4) (i32.const 0))
+              (i32.le_u (local.get $arg4) (i32.const 65536))))
+        (then
+          (local.set $len (local.get $arg4))
+          (local.set $text (call $g2w_affine_span (local.get $arg3) (local.get $len)))
+          (if (i32.eq (local.get $text) (global.get $NULL_SENTINEL))
+            (then
+              ;; A heap block also covers counts larger than the span arena.
+              (local.set $copy_g (call $heap_alloc (local.get $len)))
+              (br_if $done (i32.eqz (local.get $copy_g)))
+              (local.set $text (call $g2w_affine_span (local.get $copy_g) (local.get $len)))
+              (br_if $done (i32.eq (local.get $text) (global.get $NULL_SENTINEL)))
+      (local.set $i (i32.const 0))
+      (block $copy_text_done (loop $copy_text
+        (br_if $copy_text_done (i32.ge_u (local.get $i) (local.get $len)))
+        (i32.store8 (i32.add (local.get $text) (local.get $i))
+          (call $gl8 (i32.add (local.get $arg3) (local.get $i))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $copy_text)))
+            ))))
+      (local.set $result (call $gdi_native_text_out
+        (local.get $arg0) (local.get $arg1) (local.get $arg2)
+        (local.get $text) (local.get $arg4) (i32.const 0))))
+    (if (local.get $copy_g) (then (call $heap_free (local.get $copy_g))))
+    (i32.store offset=0 (global.get $reg_base) (local.get $result))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24)))
   )
 
   ;; 162: GetStockObject(index) → stock object handle (0x30010 + index).
@@ -730,9 +818,22 @@
     ;; first write so invalid and short calls leave caller canaries untouched.
     (if (i32.lt_u (local.get $cb) (local.get $required))
       (then (return (i32.const 0))))
-    (local.set $out (call $g2w_affine_span (local.get $buffer) (local.get $required)))
-    (if (i32.eq (local.get $out) (global.get $NULL_SENTINEL))
+    ;; Preflight every byte before acquiring a gathered span. An affine-span
+    ;; miss can mean valid nonadjacent pages, so it alone cannot reject output.
+    (if (i64.gt_u
+          (i64.add (i64.extend_i32_u (local.get $buffer))
+            (i64.extend_i32_u (local.get $required)))
+          (i64.const 0x100000000))
       (then (return (i32.const 0))))
+    (local.set $i (i32.const 0))
+    (block $output_valid (loop $validate_output
+      (br_if $output_valid (i32.ge_u (local.get $i) (local.get $required)))
+      (if (i32.eqz (call $guest_addr_mapped
+            (i32.add (local.get $buffer) (local.get $i))))
+        (then (return (i32.const 0))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $validate_output)))
+    (local.set $out (call $guest_span_in (local.get $buffer) (local.get $required)))
     (memory.fill (local.get $out) (i32.const 0) (local.get $required))
 
     ;; otmSize describes the fixed OUTLINETEXTMETRIC structure itself; the
@@ -923,6 +1024,7 @@
         (i32.add (i32.const 204) (local.get $shift))) (local.get $style_off))
     (i32.store (i32.add (local.get $out)
         (i32.add (i32.const 208) (local.get $shift))) (local.get $full_off))
+    (call $guest_span_writeback (local.get $buffer) (local.get $out) (local.get $required))
     (local.get $required))
 
   (func $handle_GetOutlineTextMetricsA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
@@ -956,8 +1058,13 @@
   ;; GetTextCharsetInfo(hdc, lpSig, flags). Raster fonts have no Unicode range
   ;; signature; preserve the selected font's charset rather than forcing ANSI.
   (func $handle_GetTextCharsetInfo (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $i i32)
     (if (local.get $arg1)
-      (then (call $zero_memory (call $g2w (local.get $arg1)) (i32.const 24))))
+      (then
+        (loop $zero_signature
+          (call $gs8 (i32.add (local.get $arg1) (local.get $i)) (i32.const 0))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br_if $zero_signature (i32.lt_u (local.get $i) (i32.const 24))))))
     (i32.store offset=0 (global.get $reg_base) (call $gdi_dc_text_charset (local.get $arg0)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))
   )
@@ -978,8 +1085,7 @@
   (func $handle_GetTextFaceA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (i32.store offset=0 (global.get $reg_base) (call $gdi_font_write_text_face
       (local.get $arg0) (local.get $arg1)
-      (if (result i32) (local.get $arg2)
-        (then (call $g2w (local.get $arg2))) (else (i32.const 0)))
+      (local.get $arg2)
       (i32.const 0)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))
   )
@@ -987,7 +1093,11 @@
   ;; 167: CreateFontIndirectA — LOGFONT at arg0
   (func $handle_CreateFontIndirectA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $lf i32) (local $handle i32)
-    (local.set $lf (call $g2w (local.get $arg0)))
+    ;; Keep fields and the inline face together across sparse guest pages.
+    ;; Preserve the existing null-input sentinel behavior.
+    (local.set $lf (if (result i32) (local.get $arg0)
+      (then (call $guest_span_in (local.get $arg0) (i32.const 60)))
+      (else (call $g2w (local.get $arg0)))))
     ;; LOGFONT: lfHeight(+0), lfWeight(+16), lfItalic(+20), lfFaceName(+28)
     (local.set $handle (call $gdi_font_create
       (i32.load (local.get $lf))                              ;; height
@@ -1005,6 +1115,7 @@
       (i32.load8_u offset=21 (local.get $lf)) (i32.load8_u offset=22 (local.get $lf)))
     (call $gdi_bitmap_font_bind (local.get $handle)
       (i32.add (local.get $lf) (i32.const 28)))
+    (call $guest_span_release (local.get $lf) (i32.const 60))
     (i32.store offset=0 (global.get $reg_base) (local.get $handle))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8))) (return)
   )
@@ -1012,6 +1123,8 @@
   ;; 168: CreateFontA — 14 params on stack
   (func $handle_CreateFontA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $handle i32) (local $weight i32) (local $italic i32) (local $face i32)
+    (local $input i32) (local $source i32) (local $length i32) (local $unit i32)
+    (local $copy i32) (local $i i32)
     ;; CreateFontA takes fourteen arguments, so argument n sits at esp+4n:
     ;; nHeight is arg0, fnWeight is the 5th at esp+20, fdwItalic the 6th at
     ;; esp+24, and lpszFace the 14th at esp+56. These offsets used to be one
@@ -1021,8 +1134,39 @@
     ;; 30-point headline is drawn with this call.
     (local.set $weight (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 20))))
     (local.set $italic (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24))))
-    (local.set $face (call $g2w (call $gl32
-      (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 56)))))
+
+    ;; Gather only the bytes the raw-pointer consumers can inspect. ANSI
+    ;; copying/binding reads at most 32 bytes; sfnt family records have a
+    ;; uint16 byte length and can compare 65535 WCHARs plus the terminator.
+    (local.set $input (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 56))))
+    (local.set $source (call $g2w (local.get $input)))
+    (if (local.get $input) (then
+      (block $face_end (loop $face_length
+        (local.set $unit (call $gl8 (i32.add (local.get $input) (local.get $length))))
+        (local.set $length (i32.add (local.get $length) (i32.const 1)))
+        (br_if $face_end (i32.eqz (local.get $unit)))
+        (br_if $face_length (i32.lt_u (local.get $length) (i32.const 32)))))
+      (local.set $source (call $g2w_affine_span (local.get $input) (local.get $length)))
+      (if (i32.eq (local.get $source) (global.get $NULL_SENTINEL)) (then
+        (if (i32.le_u (local.get $length)
+              (i32.sub (global.get $GUEST_SPAN_SCRATCH_SIZE) (global.get $guest_span_cursor)))
+          (then (local.set $source (call $guest_span_in (local.get $input) (local.get $length))))
+          (else
+            ;; An existing span lease or a long sfnt name must not overflow
+            ;; the arena. This temporary never becomes the font's owned face.
+            (local.set $copy (call $heap_alloc (local.get $length)))
+            (if (i32.eqz (local.get $copy)) (then
+              (i32.store (global.get $reg_base) (i32.const 0))
+              (i32.store offset=16 (global.get $reg_base)
+                (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 60)))
+              (return)))
+            (local.set $source (call $g2w (local.get $copy)))
+            (loop $face_copy
+              (i32.store8 (i32.add (local.get $source) (local.get $i))
+                (call $gl8 (i32.add (local.get $input) (local.get $i))))
+              (local.set $i (i32.add (local.get $i) (i32.const 1)))
+              (br_if $face_copy (i32.lt_u (local.get $i) (local.get $length))))))))))
+    (local.set $face (local.get $source))
     (local.set $handle (call $gdi_font_create
       (local.get $arg0)                                              ;; height
       (local.get $weight)                                            ;; weight
@@ -1040,6 +1184,10 @@
       (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28)))
       (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 32))))
     (call $gdi_bitmap_font_bind (local.get $handle) (local.get $face))
+
+    (if (local.get $copy)
+      (then (call $heap_free (local.get $copy)))
+      (else (call $guest_span_release (local.get $source) (local.get $length))))
     (i32.store offset=0 (global.get $reg_base) (local.get $handle))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 60))) (return)
   )
@@ -1051,13 +1199,13 @@
   ;; large. Case-insensitive compare of "display" as two dwords; byte 7 must be
   ;; the terminator, so its OR mask is zero.
   (func $gdi_driver_is_display (param $name i32) (result i32)
-    (local $wa i32)
+    ;; Keep each DWORD address in guest space.
     (if (i32.eqz (local.get $name)) (then (return (i32.const 0))))
-    (local.set $wa (call $g2w (local.get $name)))
+    ;; gl32 also gathers a DWORD crossing nonadjacent backing.
     (i32.and
-      (i32.eq (i32.or (i32.load (local.get $wa)) (i32.const 0x20202020))
+      (i32.eq (i32.or (call $gl32 (local.get $name)) (i32.const 0x20202020))
               (i32.const 0x70736964))                      ;; "disp"
-      (i32.eq (i32.or (i32.load offset=4 (local.get $wa)) (i32.const 0x00202020))
+      (i32.eq (i32.or (call $gl32 (i32.add (local.get $name) (i32.const 4))) (i32.const 0x00202020))
               (i32.const 0x0079616C))))                    ;; "lay\0"
 
   ;; CreateDCA(lpszDriver, lpszDevice, lpszOutput, lpInitData) — 4 args stdcall.
@@ -1245,6 +1393,16 @@
     ;; Both extents have to be non-zero, and each is tested on its own: a raw
     ;; `i32.and` of the two is a bit mask, so SetWindowExtEx(hdc, 1, 2) — or any
     ;; other pair with no bit in common — used to be rejected as if it were zero.
+    ;; Fixed mapping modes ignore extent requests, including zero values.
+    ;; Keep the optional previous-size output and stdcall result unchanged.
+    (if (i32.le_u
+          (call $gdi_dc_get_field (local.get $arg0) (i32.const 36) (i32.const 1))
+          (i32.const 6))
+      (then
+        (i32.store offset=0 (global.get $reg_base) (i32.const 1))
+        (i32.store offset=16 (global.get $reg_base)
+          (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 20)))
+        (return)))
     (if (i32.and (i32.ne (local.get $arg1) (i32.const 0))
                  (i32.ne (local.get $arg2) (i32.const 0)))
       (then
@@ -1367,17 +1525,52 @@
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
   )
 
-  ;; Return the live process capture owner, clearing an HWND that died without
-  ;; going through the ordinary window teardown path.
-  (func $capture_live (result i32)
-    (local $hwnd i32)
-    (local.set $hwnd (global.get $capture_hwnd))
-    (if (i32.and
-          (i32.ne (local.get $hwnd) (i32.const 0))
-          (i32.lt_s (call $wnd_table_find (local.get $hwnd)) (i32.const 0)))
-      (then
-        (global.set $capture_hwnd (i32.const 0))
-        (return (i32.const 0))))
+  ;; Authoritative process capture is shared by every CPUWorker and host shadow.
+  ;; Cursor records use +0/+4/+8; reserve their previously unused +12 words
+  ;; (slots 0..5) for serial, HWND, generation low/high, actor TID and PID.
+  ;; No region moves, heap pointers or actor-local globals are used by readers.
+  (func $capture_word_addr (param $field i32) (result i32)
+    (i32.add (global.get $CURSOR_THREAD_STATE)
+      (i32.add (i32.const 12) (i32.shl (local.get $field) (i32.const 4)))))
+  (func $capture_publication_word (export "capture_publication_word")
+      (param $field i32) (result i32)
+    (if (i32.gt_u (local.get $field) (i32.const 5)) (then (return (i32.const 0))))
+    (i32.atomic.load (call $capture_word_addr (local.get $field))))
+
+  ;; Writers serialize with window lifetime mutation. Publish before callbacks;
+  ;; readers never wait for an actor whose synchronous host import is pending.
+  (func $capture_store (param $hwnd i32)
+    (local $gen i64)
+    (call $lock_wnd_acquire)
+    (drop (i32.atomic.rmw.add (call $capture_word_addr (i32.const 0)) (i32.const 1)))
+    (local.set $gen (call $wnd_lookup_generation (local.get $hwnd)))
+    (i32.atomic.store (call $capture_word_addr (i32.const 1)) (local.get $hwnd))
+    (i32.atomic.store (call $capture_word_addr (i32.const 2)) (i32.wrap_i64 (local.get $gen)))
+    (i32.atomic.store (call $capture_word_addr (i32.const 3))
+      (i32.wrap_i64 (i64.shr_u (local.get $gen) (i64.const 32))))
+    (i32.atomic.store (call $capture_word_addr (i32.const 4))
+      (select (global.get $current_thread_id) (i32.const 0) (i32.ne (local.get $hwnd) (i32.const 0))))
+    (i32.atomic.store (call $capture_word_addr (i32.const 5))
+      (select (call $current_process_id) (i32.const 0) (i32.ne (local.get $hwnd) (i32.const 0))))
+    ;; Legacy diagnostic export only. Routing and USER APIs use shared state.
+    (global.set $capture_hwnd (local.get $hwnd))
+    (drop (i32.atomic.rmw.add (call $capture_word_addr (i32.const 0)) (i32.const 1)))
+    (call $lock_wnd_release))
+
+  (func $capture_live (export "get_authoritative_capture_hwnd") (result i32)
+    (local $serial i32) (local $hwnd i32) (local $gen i64) (local $tid i32)
+    (local.set $serial (call $capture_publication_word (i32.const 0)))
+    (if (i32.and (local.get $serial) (i32.const 1)) (then (return (i32.const 0))))
+    (local.set $hwnd (call $capture_publication_word (i32.const 1)))
+    (if (i32.eqz (local.get $hwnd)) (then (return (i32.const 0))))
+    (local.set $gen (i64.or
+      (i64.extend_i32_u (call $capture_publication_word (i32.const 2)))
+      (i64.shl (i64.extend_i32_u (call $capture_publication_word (i32.const 3))) (i64.const 32))))
+    (local.set $tid (call $capture_publication_word (i32.const 4)))
+    (if (i32.eqz (call $wnd_lookup_live (local.get $hwnd))) (then (return (i32.const 0))))
+    (if (i64.ne (local.get $gen) (call $wnd_lookup_generation (local.get $hwnd))) (then (return (i32.const 0))))
+    (if (i32.ne (local.get $tid) (call $wnd_get_thread (local.get $hwnd))) (then (return (i32.const 0))))
+    (if (i32.ne (local.get $serial) (call $capture_publication_word (i32.const 0))) (then (return (i32.const 0))))
     (local.get $hwnd))
 
   ;; GetCapture and ReleaseCapture are thread-queue APIs: another guest thread
@@ -1397,12 +1590,15 @@
   ;; notification synchronously even when ReleaseCapture itself caused it.
   (func $capture_replace (param $next i32) (result i32)
     (local $previous i32)
+    (call $lock_wnd_acquire)
     (local.set $previous (call $capture_live))
     (if (i32.eq (local.get $previous) (local.get $next))
-      (then (return (local.get $previous))))
-    (global.set $capture_hwnd (local.get $next))
+      (then (call $lock_wnd_release) (return (local.get $previous))))
+    (call $capture_store (local.get $next))
+    (call $lock_wnd_release)
     (if (i32.ne (local.get $previous) (i32.const 0))
       (then
+        (global.set $capture_lost_hwnd (local.get $previous))
         (drop (call $wnd_send_message
           (local.get $previous) (i32.const 0x0215) ;; WM_CAPTURECHANGED
           (i32.const 0) (local.get $next)))))
@@ -1443,21 +1639,49 @@
   )
 
   (func $handle_CreateBitmapIndirect (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $bitmap i32)
+    ;; The complete BITMAP can cross physically separate guest mappings.
+    (local.set $bitmap (call $guest_span_in (local.get $arg0) (i32.const 24)))
     (i32.store offset=0 (global.get $reg_base) (call $gdi_bitmap_create_indirect
-      (if (result i32) (local.get $arg0)
-        (then (call $g2w (local.get $arg0))) (else (i32.const 0)))))
+      (local.get $bitmap)))
+    (call $guest_span_release (local.get $bitmap) (i32.const 24))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8))))
 
   (func $handle_GetBitmapBits (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (i32.store offset=0 (global.get $reg_base) (call $gdi_bitmap_bits (local.get $arg0) (local.get $arg1)
-      (if (result i32) (local.get $arg2)
-        (then (call $g2w (local.get $arg2))) (else (i32.const 0))) (i32.const 0)))
+    (local $len i32) (local $buffer i32)
+    ;; Reuse canonical BITMAP metadata to clamp the guest span to stored bytes.
+    (if (i32.gt_s (local.get $arg1) (i32.const 0))
+      (then
+        (if (call $gdi_bitmap_write_object (call $gdi_object_record (local.get $arg0))
+              (global.get $GDI_BITMAP_PLAN) (i32.const 24))
+          (then
+            (local.set $len (i32.mul (i32.load offset=12 (global.get $GDI_BITMAP_PLAN))
+              (i32.load offset=8 (global.get $GDI_BITMAP_PLAN))))
+            (if (i32.gt_u (local.get $len) (local.get $arg1))
+              (then (local.set $len (local.get $arg1))))))))
+    (local.set $buffer (call $guest_span_in (local.get $arg2) (local.get $len)))
+    (i32.store offset=0 (global.get $reg_base) (call $gdi_bitmap_bits
+      (local.get $arg0) (local.get $arg1) (local.get $buffer) (i32.const 0)))
+    (if (local.get $buffer)
+      (then (call $guest_span_writeback (local.get $arg2) (local.get $buffer) (local.get $len))))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))))
 
   (func $handle_SetBitmapBits (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (i32.store offset=0 (global.get $reg_base) (call $gdi_bitmap_bits (local.get $arg0) (local.get $arg1)
-      (if (result i32) (local.get $arg2)
-        (then (call $g2w (local.get $arg2))) (else (i32.const 0))) (i32.const 1)))
+    (local $len i32) (local $buffer i32)
+    ;; Reuse canonical BITMAP metadata to clamp the guest span to stored bytes.
+    (if (i32.gt_s (local.get $arg1) (i32.const 0))
+      (then
+        (if (call $gdi_bitmap_write_object (call $gdi_object_record (local.get $arg0))
+              (global.get $GDI_BITMAP_PLAN) (i32.const 24))
+          (then
+            (local.set $len (i32.mul (i32.load offset=12 (global.get $GDI_BITMAP_PLAN))
+              (i32.load offset=8 (global.get $GDI_BITMAP_PLAN))))
+            (if (i32.gt_u (local.get $len) (local.get $arg1))
+              (then (local.set $len (local.get $arg1))))))))
+    (local.set $buffer (call $guest_span_in (local.get $arg2) (local.get $len)))
+    (i32.store offset=0 (global.get $reg_base) (call $gdi_bitmap_bits
+      (local.get $arg0) (local.get $arg1) (local.get $buffer) (i32.const 1)))
+    (call $guest_span_release (local.get $buffer) (local.get $len))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))))
 
   (func $handle_GetBitmapDimensionEx (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
@@ -1753,8 +1977,7 @@
   (func $handle_GetCharABCWidthsW (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (i32.store offset=0 (global.get $reg_base) (call $gdi_char_abc_widths
       (local.get $arg0) (local.get $arg1) (local.get $arg2)
-      (if (result i32) (local.get $arg3)
-        (then (call $g2w (local.get $arg3))) (else (i32.const 0))) (i32.const 1)))
+      (local.get $arg3) (i32.const 1)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 20))))
 
   (func $handle_GetGlyphOutlineW (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
@@ -1780,33 +2003,104 @@
   (func $handle_GetCharABCWidthsA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (i32.store offset=0 (global.get $reg_base) (call $gdi_char_abc_widths
       (local.get $arg0) (local.get $arg1) (local.get $arg2)
-      (if (result i32) (local.get $arg3)
-        (then (call $g2w (local.get $arg3))) (else (i32.const 0))) (i32.const 0)))
+      (local.get $arg3) (i32.const 0)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 20))))
 
   (func $handle_GetGlyphOutlineA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $buffer_g i32) (local $mat2_g i32) (local $result i32)
     (local $metrics_wa i32) (local $buffer_wa i32) (local $mat2_wa i32)
+    (local $size i32) (local $sizing i32) (local $needed i32)
+    (local $copy_g i32) (local $copy_wa i32) (local $cursor i32) (local $chunk i32) (local $i i32)
     (local.set $buffer_g (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24))))
     (local.set $mat2_g (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28))))
-    (if (local.get $arg3) (then (local.set $metrics_wa (call $g2w (local.get $arg3)))))
+    ;; These fixed-size structs may cross nonadjacent sparse backing pages.
+    ;; Gather initialized metrics too: a helper may fail or write only part.
+    (if (local.get $arg3) (then (local.set $metrics_wa (call $guest_span_in (local.get $arg3) (i32.const 20)))))
     (if (local.get $buffer_g) (then (local.set $buffer_wa (call $g2w (local.get $buffer_g)))))
-    (if (local.get $mat2_g) (then (local.set $mat2_wa (call $g2w (local.get $mat2_g)))))
+    (if (local.get $mat2_g) (then (local.set $mat2_wa (call $guest_span_in (local.get $mat2_g) (i32.const 16)))))
+    ;; Size through the selected backend before considering any output copy.
+    ;; cjBuffer is a capacity, not an allocation size. Keep query/short-buffer
+    ;; policy in the helpers, including zero-sized glyphs and unsupported modes.
+    (local.set $size (local.get $arg4))
+    (if (i32.and (i32.ne (local.get $buffer_g) (i32.const 0))
+          (i32.and (i32.ne (local.get $arg4) (i32.const 0))
+            (i32.ne (i32.and (local.get $arg2) (i32.const 127)) (i32.const 0))))
+      (then (local.set $size (i32.const 0)) (local.set $sizing (i32.const 1))))
+    (block $output_done (loop $output_pass
     (local.set $result (call $tt_gdi_glyph_outline_a
       (local.get $arg0) (local.get $arg1) (local.get $arg2)
       (local.get $metrics_wa)
-      (local.get $arg4)
+      (local.get $size)
       (local.get $buffer_wa) (local.get $mat2_wa)))
     (if (i32.eq (local.get $result) (i32.const -2))
       (then (local.set $result (call $gdi_bitmap_glyph_outline_a
         (local.get $arg0) (local.get $arg1) (local.get $arg2)
         (local.get $metrics_wa)
-        (local.get $arg4)
+        (local.get $size)
         (local.get $buffer_wa) (local.get $mat2_wa)))))
     (if (i32.eq (local.get $result) (i32.const -2))
       (then (local.set $result (call $gdi_glyph_metrics_a
         (local.get $arg0) (local.get $arg1) (local.get $arg2)
         (local.get $metrics_wa)))))
+
+      (br_if $output_done (i32.eqz (local.get $sizing)))
+      (br_if $output_done (i32.lt_s (local.get $result) (i32.const 0)))
+      (if (i32.and (i32.gt_s (local.get $result) (i32.const 0))
+            (i32.le_u (local.get $result) (local.get $arg4)))
+        (then
+          (local.set $needed (local.get $result))
+          (block $output_ready
+            ;; Preserve the legacy raw-pointer path for invalid/wrapping spans.
+            ;; Only valid nonadjacent pages need different buffer transport.
+            (br_if $output_ready (i64.gt_u
+              (i64.add (i64.extend_i32_u (local.get $buffer_g))
+                (i64.extend_i32_u (local.get $needed))) (i64.const 4294967296)))
+            (local.set $copy_wa (call $g2w_affine_span (local.get $buffer_g) (local.get $needed)))
+            (if (i32.ne (local.get $copy_wa) (global.get $NULL_SENTINEL))
+              (then (local.set $buffer_wa (local.get $copy_wa)) (br $output_ready)))
+            (local.set $cursor (i32.const 0))
+            (loop $validate_output
+              (br_if $output_ready (i32.eq
+                (call $g2w (i32.add (local.get $buffer_g) (local.get $cursor)))
+                (global.get $NULL_SENTINEL)))
+              (local.set $chunk (i32.sub (i32.const 4096)
+                (i32.and (i32.add (local.get $buffer_g) (local.get $cursor)) (i32.const 4095))))
+              (local.set $cursor (i32.add (local.get $cursor) (local.get $chunk)))
+              (br_if $validate_output (i32.lt_u (local.get $cursor) (local.get $needed))))
+            (local.set $copy_g (call $heap_alloc (local.get $needed)))
+            (if (i32.eqz (local.get $copy_g))
+              (then (local.set $result (i32.const -1)) (br $output_done)))
+            (local.set $copy_wa (call $g2w_affine_span (local.get $copy_g) (local.get $needed)))
+            (if (i32.eq (local.get $copy_wa) (global.get $NULL_SENTINEL))
+              (then
+                (call $heap_free (local.get $copy_g))
+                (local.set $copy_g (i32.const 0))
+                (local.set $result (i32.const -1)) (br $output_done)))
+            ;; Retain initialized bytes: a helper failure may leave all or part
+            ;; of the output untouched. Scatter that same span on every result.
+            (local.set $i (i32.const 0))
+            (loop $gather_output
+              (i32.store8 (i32.add (local.get $copy_wa) (local.get $i))
+                (call $gl8 (i32.add (local.get $buffer_g) (local.get $i))))
+              (local.set $i (i32.add (local.get $i) (i32.const 1)))
+              (br_if $gather_output (i32.lt_u (local.get $i) (local.get $needed))))
+            (local.set $buffer_wa (local.get $copy_wa)))))
+      (local.set $sizing (i32.const 0))
+      (local.set $size (local.get $arg4))
+      (br $output_pass)))
+    (if (local.get $copy_g)
+      (then
+        (local.set $i (i32.const 0))
+        (loop $scatter_output
+          (call $gs8 (i32.add (local.get $buffer_g) (local.get $i))
+            (i32.load8_u (i32.add (local.get $copy_wa) (local.get $i))))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br_if $scatter_output (i32.lt_u (local.get $i) (local.get $needed))))
+        (call $heap_free (local.get $copy_g))))
+    ;; Release the read-only matrix before scattering metrics (LIFO arena).
+    (call $guest_span_release (local.get $mat2_wa) (i32.const 16))
+    (if (local.get $arg3)
+      (then (call $guest_span_writeback (local.get $arg3) (local.get $metrics_wa) (i32.const 20))))
     (i32.store offset=0 (global.get $reg_base) (local.get $result))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 32))))
 
@@ -1827,6 +2121,7 @@
     (local $dc i32) (local $handle i32) (local $face i32) (local $object i32)
     (local $data i32) (local $size i32) (local $tag i32)
     (local $off i32) (local $len i32) (local $avail i32) (local $n i32) (local $record i32)
+    (local $dst i32) (local $src i32) (local $left i32) (local $chunk i32)
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24)))
     (i32.store offset=0 (global.get $reg_base) (i32.const -1))
     (local.set $dc (call $gdi_dc_state_entry (local.get $arg0) (i32.const 0)))
@@ -1887,11 +2182,23 @@
       (i32.lt_u (local.get $arg4) (local.get $avail))))
     (if (local.get $n)
       (then
-        (memory.copy
-          (call $g2w (local.get $arg3))
-          (i32.add (local.get $data)
-            (i32.add (local.get $off) (local.get $arg2)))
-          (local.get $n))))
+        ;; sfnt table offsets address physical font storage. Only the output
+        ;; is guest memory: translate each destination page separately.
+        (local.set $dst (local.get $arg3))
+        (local.set $src (i32.add (local.get $data)
+          (i32.add (local.get $off) (local.get $arg2))))
+        (local.set $left (local.get $n))
+        (loop $copy_pages
+          (local.set $chunk (i32.sub (i32.const 4096)
+            (i32.and (local.get $dst) (i32.const 4095))))
+          (if (i32.gt_u (local.get $chunk) (local.get $left))
+            (then (local.set $chunk (local.get $left))))
+          (memory.copy (call $g2w (local.get $dst))
+            (local.get $src) (local.get $chunk))
+          (local.set $dst (i32.add (local.get $dst) (local.get $chunk)))
+          (local.set $src (i32.add (local.get $src) (local.get $chunk)))
+          (local.set $left (i32.sub (local.get $left) (local.get $chunk)))
+          (br_if $copy_pages (local.get $left)))))
     (i32.store offset=0 (global.get $reg_base) (local.get $n)))
 
   ;; CreateScalableFontResource writes a .FOT wrapper which AddFontResource
@@ -2034,38 +2341,139 @@
       (i32.const 1) (i32.const 0xFF)))
 
   (func $handle_SetMetaFileBitsEx (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $data i32)
-    (if (local.get $arg1) (then (local.set $data (call $g2w (local.get $arg1)))))
-    (i32.store offset=0 (global.get $reg_base) (if (result i32) (call $gdi_metafile_valid_wmf (local.get $data) (local.get $arg0))
-        (then (call $gdi_metafile_create
-          ;; The input allocation may have trailing padding. METAHEADER's
-          ;; bounded size is the actual metafile extent, in 16-bit words.
-          (i32.const 6) (local.get $data)
-          (i32.shl (i32.load offset=6 (local.get $data)) (i32.const 1))))
-        (else (i32.const 0))))
+    (local $header i32) (local $valid i32) (local $size i32)
+    (local $data i32) (local $temporary i32) (local $result i32)
+    (local $offset i32) (local $guest i32) (local $chunk i32)
+    (block $done
+      (br_if $done (i32.or (i32.eqz (local.get $arg1))
+        (i32.lt_u (local.get $arg0) (i32.const 18))))
+      ;; Validate only the bounded header before choosing the retained extent.
+      (local.set $header (call $guest_span_in (local.get $arg1) (i32.const 18)))
+      (local.set $valid (call $gdi_metafile_valid_wmf (local.get $header) (local.get $arg0)))
+      (local.set $size (i32.shl (i32.load offset=6 (local.get $header)) (i32.const 1)))
+      (call $guest_span_release (local.get $header) (i32.const 18))
+      (br_if $done (i32.eqz (local.get $valid)))
+      ;; WMF's declared words exclude allocation padding; EMF keeps nSize.
+      (br_if $done (i32.gt_u (local.get $size) (global.get $DIB_BACKING_BASE_SIZE)))
+      (local.set $data (call $g2w_affine_span (local.get $arg1) (local.get $size)))
+      (if (i32.eq (local.get $data) (global.get $NULL_SENTINEL)) (then
+        ;; The DIB allocator supplies contiguous, length-bounded storage.
+        ;; Never feed a long stream into the fixed guest-span arena.
+        (local.set $temporary (call $dib_alloc (local.get $size)))
+        (br_if $done (i32.eqz (local.get $temporary)))
+        (local.set $data (call $g2w (local.get $temporary)))
+        (block $copied (loop $gather
+          (br_if $copied (i32.ge_u (local.get $offset) (local.get $size)))
+          (local.set $guest (i32.add (local.get $arg1) (local.get $offset)))
+          (local.set $chunk (i32.sub (i32.const 4096)
+            (i32.and (local.get $guest) (i32.const 4095))))
+          (if (i32.gt_u (local.get $chunk) (i32.sub (local.get $size) (local.get $offset)))
+            (then (local.set $chunk (i32.sub (local.get $size) (local.get $offset)))))
+          (memory.copy (i32.add (local.get $data) (local.get $offset))
+            (call $g2w (local.get $guest)) (local.get $chunk))
+          (local.set $offset (i32.add (local.get $offset) (local.get $chunk)))
+          (br $gather)))))
+      (local.set $result (call $gdi_metafile_create
+        (i32.const 6) (local.get $data) (local.get $size)))
+      (if (local.get $temporary) (then (call $dib_free_wasm (local.get $data)))))
+    (i32.store offset=0 (global.get $reg_base) (local.get $result))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12))))
 
   (func $handle_GetMetaFileBitsEx (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (i32.store offset=0 (global.get $reg_base) (call $gdi_metafile_bits
-      (local.get $arg0) (i32.const 6) (local.get $arg1)
-      (if (result i32) (local.get $arg2)
-        (then (call $g2w (local.get $arg2))) (else (i32.const 0)))))
+    (local $copy i32) (local $source i32) (local $dest i32)
+    (local $offset i32) (local $chunk i32) (local $physical i32)
+    ;; The shared helper retains its physical-destination ABI. Query the size
+    ;; first, then scatter only the unsigned bounded prefix to guest pages.
+    (local.set $copy (call $gdi_metafile_bits
+      (local.get $arg0) (i32.const 6) (local.get $arg1) (i32.const 0)))
+    (if (local.get $arg2) (then
+      (if (i32.gt_u (local.get $copy) (local.get $arg1))
+        (then (local.set $copy (local.get $arg1))))
+      (if (local.get $copy) (then
+        (local.set $source (i32.load offset=24
+          (call $gdi_metafile_record (local.get $arg0) (i32.const 6))))
+        (block $done (loop $scatter
+          (br_if $done (i32.ge_u (local.get $offset) (local.get $copy)))
+          (local.set $dest (i32.add (local.get $arg2) (local.get $offset)))
+          (local.set $chunk (i32.sub (i32.const 4096)
+            (i32.and (local.get $dest) (i32.const 4095))))
+          (if (i32.gt_u (local.get $chunk) (i32.sub (local.get $copy) (local.get $offset)))
+            (then (local.set $chunk (i32.sub (local.get $copy) (local.get $offset)))))
+          (local.set $physical (call $g2w (local.get $dest)))
+          (memory.copy (local.get $physical)
+            (i32.add (local.get $source) (local.get $offset)) (local.get $chunk))
+          (call $page_watch_write (local.get $physical) (local.get $chunk))
+          (local.set $offset (i32.add (local.get $offset) (local.get $chunk)))
+          (br $scatter)))))))
+    (i32.store offset=0 (global.get $reg_base) (local.get $copy))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))))
 
   (func $handle_SetEnhMetaFileBits (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $data i32)
-    (if (local.get $arg1) (then (local.set $data (call $g2w (local.get $arg1)))))
-    (i32.store offset=0 (global.get $reg_base) (if (result i32) (call $gdi_metafile_valid_emf (local.get $data) (local.get $arg0))
-        (then (call $gdi_metafile_create
-          (i32.const 7) (local.get $data) (local.get $arg0)))
-        (else (i32.const 0))))
+    (local $header i32) (local $valid i32) (local $size i32)
+    (local $data i32) (local $temporary i32) (local $result i32)
+    (local $offset i32) (local $guest i32) (local $chunk i32)
+    (block $done
+      (br_if $done (i32.or (i32.eqz (local.get $arg1))
+        (i32.lt_u (local.get $arg0) (i32.const 88))))
+      ;; Validate only the bounded header before choosing the retained extent.
+      (local.set $header (call $guest_span_in (local.get $arg1) (i32.const 88)))
+      (local.set $valid (call $gdi_metafile_valid_emf (local.get $header) (local.get $arg0)))
+      (local.set $size (local.get $arg0))
+      (call $guest_span_release (local.get $header) (i32.const 88))
+      (br_if $done (i32.eqz (local.get $valid)))
+      ;; WMF's declared words exclude allocation padding; EMF keeps nSize.
+      (br_if $done (i32.gt_u (local.get $size) (global.get $DIB_BACKING_BASE_SIZE)))
+      (local.set $data (call $g2w_affine_span (local.get $arg1) (local.get $size)))
+      (if (i32.eq (local.get $data) (global.get $NULL_SENTINEL)) (then
+        ;; The DIB allocator supplies contiguous, length-bounded storage.
+        ;; Never feed a long stream into the fixed guest-span arena.
+        (local.set $temporary (call $dib_alloc (local.get $size)))
+        (br_if $done (i32.eqz (local.get $temporary)))
+        (local.set $data (call $g2w (local.get $temporary)))
+        (block $copied (loop $gather
+          (br_if $copied (i32.ge_u (local.get $offset) (local.get $size)))
+          (local.set $guest (i32.add (local.get $arg1) (local.get $offset)))
+          (local.set $chunk (i32.sub (i32.const 4096)
+            (i32.and (local.get $guest) (i32.const 4095))))
+          (if (i32.gt_u (local.get $chunk) (i32.sub (local.get $size) (local.get $offset)))
+            (then (local.set $chunk (i32.sub (local.get $size) (local.get $offset)))))
+          (memory.copy (i32.add (local.get $data) (local.get $offset))
+            (call $g2w (local.get $guest)) (local.get $chunk))
+          (local.set $offset (i32.add (local.get $offset) (local.get $chunk)))
+          (br $gather)))))
+      (local.set $result (call $gdi_metafile_create
+        (i32.const 7) (local.get $data) (local.get $size)))
+      (if (local.get $temporary) (then (call $dib_free_wasm (local.get $data)))))
+    (i32.store offset=0 (global.get $reg_base) (local.get $result))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12))))
 
   (func $handle_GetEnhMetaFileBits (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (i32.store offset=0 (global.get $reg_base) (call $gdi_metafile_bits
-      (local.get $arg0) (i32.const 7) (local.get $arg1)
-      (if (result i32) (local.get $arg2)
-        (then (call $g2w (local.get $arg2))) (else (i32.const 0)))))
+    (local $copy i32) (local $source i32) (local $dest i32)
+    (local $offset i32) (local $chunk i32) (local $physical i32)
+    ;; The shared helper retains its physical-destination ABI. Query the size
+    ;; first, then scatter only the unsigned bounded prefix to guest pages.
+    (local.set $copy (call $gdi_metafile_bits
+      (local.get $arg0) (i32.const 7) (local.get $arg1) (i32.const 0)))
+    (if (local.get $arg2) (then
+      (if (i32.gt_u (local.get $copy) (local.get $arg1))
+        (then (local.set $copy (local.get $arg1))))
+      (if (local.get $copy) (then
+        (local.set $source (i32.load offset=24
+          (call $gdi_metafile_record (local.get $arg0) (i32.const 7))))
+        (block $done (loop $scatter
+          (br_if $done (i32.ge_u (local.get $offset) (local.get $copy)))
+          (local.set $dest (i32.add (local.get $arg2) (local.get $offset)))
+          (local.set $chunk (i32.sub (i32.const 4096)
+            (i32.and (local.get $dest) (i32.const 4095))))
+          (if (i32.gt_u (local.get $chunk) (i32.sub (local.get $copy) (local.get $offset)))
+            (then (local.set $chunk (i32.sub (local.get $copy) (local.get $offset)))))
+          (local.set $physical (call $g2w (local.get $dest)))
+          (memory.copy (local.get $physical)
+            (i32.add (local.get $source) (local.get $offset)) (local.get $chunk))
+          (call $page_watch_write (local.get $physical) (local.get $chunk))
+          (local.set $offset (i32.add (local.get $offset) (local.get $chunk)))
+          (br $scatter)))))))
+    (i32.store offset=0 (global.get $reg_base) (local.get $copy))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))))
 
   (func $handle_CopyEnhMetaFileA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
@@ -2081,9 +2489,7 @@
 
   (func $handle_GetEnhMetaFileHeader (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (i32.store offset=0 (global.get $reg_base) (call $gdi_enh_metafile_header
-      (local.get $arg0) (local.get $arg1)
-      (if (result i32) (local.get $arg2)
-        (then (call $g2w (local.get $arg2))) (else (i32.const 0)))))
+      (local.get $arg0) (local.get $arg1) (local.get $arg2)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))))
 
   (func $handle_GetEnhMetaFilePaletteEntries (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
@@ -2093,26 +2499,28 @@
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))))
 
   (func $handle_PlayEnhMetaFile (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $rect i32)
+    ;; The player takes a physical RECT; guest pages may have separate backing.
+    (local.set $rect (call $guest_span_in (local.get $arg2) (i32.const 16)))
     (i32.store offset=0 (global.get $reg_base) (call $gdi_metafile_play_emf
-      (local.get $arg0) (local.get $arg1)
-      (if (result i32) (local.get $arg2)
-        (then (call $g2w (local.get $arg2))) (else (i32.const 0)))))
+      (local.get $arg0) (local.get $arg1) (local.get $rect)))
+    (call $guest_span_release (local.get $rect) (i32.const 16))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))))
 
   (func $handle_GetWinMetaFileBits (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $temporary i32)
-    (if (i32.eqz (call $gdi_metafile_record (local.get $arg0) (i32.const 7)))
-      (then (i32.store offset=0 (global.get $reg_base) (i32.const 0)))
-      (else
-        (local.set $temporary (call $gdi_metafile_convert_emf_to_wmf (local.get $arg0)))
-        (if (i32.eqz (local.get $temporary))
-          (then (i32.store offset=0 (global.get $reg_base) (i32.const 0)))
-          (else
-            (i32.store offset=0 (global.get $reg_base) (call $gdi_metafile_bits
-              (local.get $temporary) (i32.const 6) (local.get $arg1)
-              (if (result i32) (local.get $arg2)
-                (then (call $g2w (local.get $arg2))) (else (i32.const 0)))))
-            (drop (call $gdi_object_delete_full (local.get $temporary)))))))
+    (local $temporary i32) (local $n i32) (local $src i32) (local $dst i32) (local $left i32) (local $chunk i32)
+    (if (i32.eqz (call $gdi_metafile_record (local.get $arg0) (i32.const 7))) (then (i32.store offset=0 (global.get $reg_base) (i32.const 0))) (else
+      (local.set $temporary (call $gdi_metafile_convert_emf_to_wmf (local.get $arg0)))
+      (if (i32.eqz (local.get $temporary)) (then (i32.store offset=0 (global.get $reg_base) (i32.const 0))) (else
+        ;; Query the physical helper, then scatter only the bounded prefix; keep the temporary alive through the final partial page.
+        (local.set $n (call $gdi_metafile_bits (local.get $temporary) (i32.const 6) (local.get $arg1) (i32.const 0)))
+        (if (local.get $arg2) (then (local.set $n (select (local.get $arg1) (local.get $n) (i32.lt_u (local.get $arg1) (local.get $n))))
+          (local.set $src (i32.load offset=24 (call $gdi_metafile_record (local.get $temporary) (i32.const 6)))) (local.set $dst (local.get $arg2)) (local.set $left (local.get $n))
+          (block $done (loop $copy_pages (br_if $done (i32.eqz (local.get $left)))
+            (local.set $chunk (i32.sub (i32.const 4096) (i32.and (local.get $dst) (i32.const 4095))))
+            (if (i32.gt_u (local.get $chunk) (local.get $left)) (then (local.set $chunk (local.get $left)))) (memory.copy (call $g2w (local.get $dst)) (local.get $src) (local.get $chunk))
+            (local.set $src (i32.add (local.get $src) (local.get $chunk))) (local.set $dst (i32.add (local.get $dst) (local.get $chunk))) (local.set $left (i32.sub (local.get $left) (local.get $chunk))) (br $copy_pages)))))
+        (i32.store offset=0 (global.get $reg_base) (local.get $n)) (drop (call $gdi_object_delete_full (local.get $temporary)))))))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24))))
 
   (func $handle_SetWinMetaFileBits (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
@@ -2146,15 +2554,16 @@
             (if (local.get $profile_g)
               (then (call $guest_strcpy (local.get $arg2) (local.get $profile_g)))
               (else
-                (local.set $dst (call $g2w (local.get $arg2)))
-                (i32.store (local.get $dst) (i32.const 0x42475273))
-                (i32.store offset=4 (local.get $dst) (i32.const 0x6C6F4320))
-                (i32.store offset=8 (local.get $dst) (i32.const 0x5320726F))
-                (i32.store offset=12 (local.get $dst) (i32.const 0x65636170))
-                (i32.store offset=16 (local.get $dst) (i32.const 0x6F725020))
-                (i32.store offset=20 (local.get $dst) (i32.const 0x656C6966))
-                (i32.store offset=24 (local.get $dst) (i32.const 0x6D63692E))
-                (i32.store8 offset=28 (local.get $dst) (i32.const 0))))
+                ;; Keep the destination in guest space; each word may cross a mapping.
+                (local.set $dst (local.get $arg2))
+                (call $gs32 (local.get $dst) (i32.const 0x42475273))
+                (call $gs32 (i32.add (local.get $dst) (i32.const 4)) (i32.const 0x6C6F4320))
+                (call $gs32 (i32.add (local.get $dst) (i32.const 8)) (i32.const 0x5320726F))
+                (call $gs32 (i32.add (local.get $dst) (i32.const 12)) (i32.const 0x65636170))
+                (call $gs32 (i32.add (local.get $dst) (i32.const 16)) (i32.const 0x6F725020))
+                (call $gs32 (i32.add (local.get $dst) (i32.const 20)) (i32.const 0x656C6966))
+                (call $gs32 (i32.add (local.get $dst) (i32.const 24)) (i32.const 0x6D63692E))
+                (call $gs8 (i32.add (local.get $dst) (i32.const 28)) (i32.const 0))))
             (call $gs32 (local.get $arg1) (local.get $required))
             (i32.store offset=0 (global.get $reg_base) (i32.const 1))))))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))))
@@ -2330,6 +2739,16 @@
           (call $gdi_dc_get_field (local.get $arg0) (i32.const 68) (i32.const 1)))))
     ;; Each extent is tested on its own — see $handle_SetWindowExtEx. A raw
     ;; `i32.and` here is a bit mask, and rejected (1, 2) as if it were zero.
+    ;; Fixed mapping modes ignore extent requests, including zero values.
+    ;; Keep the optional previous-size output and stdcall result unchanged.
+    (if (i32.le_u
+          (call $gdi_dc_get_field (local.get $arg0) (i32.const 36) (i32.const 1))
+          (i32.const 6))
+      (then
+        (i32.store offset=0 (global.get $reg_base) (i32.const 1))
+        (i32.store offset=16 (global.get $reg_base)
+          (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 20)))
+        (return)))
     (if (i32.and (i32.ne (local.get $arg1) (i32.const 0))
                  (i32.ne (local.get $arg2) (i32.const 0)))
       (then
@@ -2342,16 +2761,11 @@
 
   ;; 254: GetTextExtentPoint32A — font-aware via host
   (func $handle_GetTextExtentPoint32A (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $packed i32)
-    (local.set $packed (call $host_get_text_metrics (local.get $arg0)))
-    (call $gs32 (local.get $arg3)
-      (call $gdi_text_span_logical_x (local.get $arg0)
-        (call $host_measure_text (local.get $arg0) (call $g2w (local.get $arg1))
-          (local.get $arg2) (i32.const 0))))
-    (call $gs32 (i32.add (local.get $arg3) (i32.const 4))
-      (call $gdi_text_span_logical_y (local.get $arg0)
-        (i32.and (local.get $packed) (i32.const 0xFFFF))))
-    (i32.store offset=0 (global.get $reg_base) (i32.const 1))
+    ;; ExPoint with no fit/dx outputs shares the same string extent contract.
+    (i32.store offset=0 (global.get $reg_base) (call $gdi_text_extent_ex
+      (local.get $arg0) (call $g2w (local.get $arg1)) (local.get $arg2)
+      (i32.const 0) (i32.const 0) (i32.const 0)
+      (call $g2w (local.get $arg3)) (i32.const 0)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 20)))
   )
 
@@ -2408,16 +2822,37 @@
   ;; 315: CreateFontIndirectW — LOGFONTW at arg0
   (func $handle_CreateFontIndirectW (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $lf i32) (local $face i32) (local $handle i32) (local $face_wa i32)
-    (local.set $lf (call $g2w (local.get $arg0)))
+    (local $chars i32) (local $bytes i32)
+    (local.set $lf (if (result i32) (local.get $arg0)
+      (then (call $guest_span_in (local.get $arg0) (i32.const 92)))
+      (else (call $g2w (local.get $arg0)))))
     (local.set $face (call $heap_alloc (i32.const 64)))
     (if (i32.eqz (local.get $face))
       (then
+        (call $guest_span_release (local.get $lf) (i32.const 92))
         (i32.store offset=0 (global.get $reg_base) (i32.const 0))
         (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
         (return)))
     ;; LOGFONTW: lfHeight(+0), lfWeight(+16), lfItalic(+20), lfFaceName(+28 wchar[32])
     (if (i32.eqz (call $tt_wide_family (i32.add (local.get $lf) (i32.const 28)) (call $g2w (local.get $face))))
-      (then (drop (call $wide_to_ansi (i32.add (local.get $arg0) (i32.const 28)) (local.get $face) (i32.const 64)))))
+      (then
+        (if (local.get $arg0)
+          (then
+            ;; The gathered span is linear, not a guest address. Use the
+            ;; same ANSI encoder with the inline WCHAR count and reserve
+            ;; one byte of the existing 64-byte conversion for its NUL.
+            (block $face_end (loop $face_length
+              (br_if $face_end (i32.ge_u (local.get $chars) (i32.const 32)))
+              (br_if $face_end (i32.eqz (i32.load16_u
+                (i32.add (local.get $lf)
+                  (i32.add (i32.const 28) (i32.shl (local.get $chars) (i32.const 1)))))))
+              (local.set $chars (i32.add (local.get $chars) (i32.const 1)))
+              (br $face_length)))
+            (local.set $bytes (call $wide_wa_to_ansi_wa
+              (i32.add (local.get $lf) (i32.const 28)) (local.get $chars)
+              (call $g2w (local.get $face)) (i32.const 63)))
+            (i32.store8 (i32.add (call $g2w (local.get $face)) (local.get $bytes)) (i32.const 0)))
+          (else (drop (call $wide_to_ansi (i32.add (local.get $arg0) (i32.const 28)) (local.get $face) (i32.const 64)))))))
     (local.set $face_wa (call $g2w (local.get $face))) (local.set $handle (call $gdi_font_create
       (i32.load (local.get $lf))                              ;; height
       (i32.load (i32.add (local.get $lf) (i32.const 16)))    ;; weight
@@ -2434,6 +2869,7 @@
       (i32.load8_u offset=21 (local.get $lf)) (i32.load8_u offset=22 (local.get $lf)))
     (call $gdi_bitmap_font_bind (local.get $handle) (local.get $face_wa))
     (if (local.get $face) (then (call $heap_free (local.get $face))))
+    (call $guest_span_release (local.get $lf) (i32.const 92))
     (i32.store offset=0 (global.get $reg_base) (local.get $handle))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8))) (return)
   )
@@ -2452,7 +2888,10 @@
   (func $handle_GetPixel (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $desc i32)
     (local.set $desc (global.get $GDI_BLIT_DST_DESC))
-    (if (call $gdi_surface_descriptor (local.get $arg0) (local.get $desc))
+    (if (i32.and
+          (call $gdi_surface_descriptor (local.get $arg0) (local.get $desc))
+          (call $gdi_dc_clip_point_visible
+            (local.get $arg0) (local.get $arg1) (local.get $arg2)))
       (then (i32.store offset=0 (global.get $reg_base) (call $gdi_raster_get_pixel
         (local.get $desc)
         (call $gdi_line_map_x (local.get $desc) (local.get $arg1))
@@ -2588,23 +3027,74 @@
   ;; 364: ExtTextOutW(hdc, x, y, options, lprect, lpString, c, lpDx) — 8 args stdcall
   ;; Selected FNT strikes consume lpDx in WAT; the generic host path ignores it.
   (func $handle_ExtTextOutW (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $lpString i32) (local $count i32) (local $rect_wa i32) (local $text_wa i32)
-    (local $dx_wa i32) (local $lpDx i32)
-    (local.set $lpString (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24)))) ;; arg5
-    (local.set $count    (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28)))) ;; arg6 (wchar count)
-    (if (local.get $arg4)
-      (then (local.set $rect_wa (call $g2w (local.get $arg4)))))
-    (if (local.get $lpString)
-      (then (local.set $text_wa (call $g2w (local.get $lpString)))))
+    (local $lpString i32) (local $count i32) (local $lpDx i32)
+    (local $text i32) (local $dx i32) (local $rect i32)
+    (local $text_len i32) (local $dx_len i32) (local $rect_len i32)
+    (local $total i32) (local $copy_g i32) (local $copy i32) (local $i i32) (local $result i32)
+    (local.set $lpString (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24))))
+    (local.set $count (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28))))
     (local.set $lpDx (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 32))))
-    (if (local.get $lpDx)
-      (then (local.set $dx_wa (call $g2w (local.get $lpDx)))))
-    ;; Printable low/high bytes are also valid UCS-2 (e.g. U+4E46).
-    ;; Never infer an ANSI stream from the contents of a W API buffer.
-    (i32.store offset=0 (global.get $reg_base) (call $gdi_native_ext_text_out
-      (local.get $arg0) (local.get $arg1) (local.get $arg2)
-      (local.get $arg3) (local.get $rect_wa)
-      (local.get $text_wa) (local.get $count) (local.get $dx_wa) (i32.const 1)))
+    (if (local.get $lpString) (then (local.set $text (call $g2w (local.get $lpString)))))
+    (if (local.get $lpDx) (then (local.set $dx (call $g2w (local.get $lpDx)))))
+    ;; The public rectangle is consumed only for clipping or opaque fill.
+    (if (i32.and (i32.ne (local.get $arg4) (i32.const 0))
+          (i32.ne (i32.and (local.get $arg3) (i32.const 6)) (i32.const 0)))
+      (then (local.set $rect_len (i32.const 16))
+        (local.set $rect (call $g2w (local.get $arg4)))))
+    (block $done
+      (if (i32.and (i32.le_u (local.get $count) (i32.const 65536))
+            (i32.or (i32.eqz (local.get $count)) (i32.ne (local.get $lpString) (i32.const 0))))
+        (then
+          (local.set $text_len (i32.shl (local.get $count) (i32.const 1)))
+          (if (local.get $lpDx)
+            (then (local.set $dx_len (i32.shl (local.get $count)
+              (i32.add (i32.const 2) (i32.ne (i32.and (local.get $arg3) (i32.const 0x2000)) (i32.const 0)))))))
+          (if (local.get $text_len) (then (local.set $text (call $g2w_affine_span (local.get $lpString) (local.get $text_len)))))
+          (if (local.get $dx_len) (then (local.set $dx (call $g2w_affine_span (local.get $lpDx) (local.get $dx_len)))))
+          (if (local.get $rect_len) (then (local.set $rect (call $g2w_affine_span (local.get $arg4) (local.get $rect_len)))))
+          (if (i32.or (i32.eq (local.get $text) (global.get $NULL_SENTINEL))
+                (i32.or (i32.eq (local.get $dx) (global.get $NULL_SENTINEL))
+                  (i32.eq (local.get $rect) (global.get $NULL_SENTINEL))))
+            (then
+              ;; One contiguous temporary retains all counted bytes, including
+              ;; long runs, WORD glyph indices and ETO_PDY spacing pairs.
+              (local.set $total (i32.add (local.get $text_len) (i32.add (local.get $dx_len) (local.get $rect_len))))
+              (local.set $copy_g (call $heap_alloc (local.get $total)))
+              (br_if $done (i32.eqz (local.get $copy_g)))
+              (local.set $copy (call $g2w_affine_span (local.get $copy_g) (local.get $total)))
+              (br_if $done (i32.eq (local.get $copy) (global.get $NULL_SENTINEL)))
+              (local.set $text (local.get $copy))
+      (local.set $i (i32.const 0))
+      (block $copy_text_done (loop $copy_text
+        (br_if $copy_text_done (i32.ge_u (local.get $i) (local.get $text_len)))
+        (i32.store8 (i32.add (local.get $text) (local.get $i))
+          (call $gl8 (i32.add (local.get $lpString) (local.get $i))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $copy_text)))
+              (local.set $dx (if (result i32) (local.get $dx_len)
+                (then (i32.add (local.get $copy) (local.get $text_len))) (else (i32.const 0))))
+      (local.set $i (i32.const 0))
+      (block $copy_dx_done (loop $copy_dx
+        (br_if $copy_dx_done (i32.ge_u (local.get $i) (local.get $dx_len)))
+        (i32.store8 (i32.add (local.get $dx) (local.get $i))
+          (call $gl8 (i32.add (local.get $lpDx) (local.get $i))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $copy_dx)))
+              (local.set $rect (if (result i32) (local.get $rect_len)
+                (then (i32.add (local.get $copy) (i32.add (local.get $text_len) (local.get $dx_len)))) (else (i32.const 0))))
+      (local.set $i (i32.const 0))
+      (block $copy_rect_done (loop $copy_rect
+        (br_if $copy_rect_done (i32.ge_u (local.get $i) (local.get $rect_len)))
+        (i32.store8 (i32.add (local.get $rect) (local.get $i))
+          (call $gl8 (i32.add (local.get $arg4) (local.get $i))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $copy_rect)))
+            ))))
+      (local.set $result (call $gdi_native_ext_text_out
+        (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $arg3)
+        (local.get $rect) (local.get $text) (local.get $count) (local.get $dx) (i32.const 1))))
+    (if (local.get $copy_g) (then (call $heap_free (local.get $copy_g))))
+    (i32.store offset=0 (global.get $reg_base) (local.get $result))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 36)))
   )
 
@@ -2688,19 +3178,19 @@
 
   ;; UTF-16 twin of $gdi_driver_is_display.
   (func $gdi_driver_is_display_w (param $name i32) (result i32)
-    (local $wa i32)
+    ;; Keep each DWORD address in guest space.
     (if (i32.eqz (local.get $name)) (then (return (i32.const 0))))
-    (local.set $wa (call $g2w (local.get $name)))
+    ;; gl32 also gathers a DWORD crossing nonadjacent backing.
     (i32.and
       (i32.and
-        (i32.eq (i32.or (i32.load (local.get $wa)) (i32.const 0x00200020))
+        (i32.eq (i32.or (call $gl32 (local.get $name)) (i32.const 0x00200020))
                 (i32.const 0x00690064))                    ;; "di"
-        (i32.eq (i32.or (i32.load offset=4 (local.get $wa)) (i32.const 0x00200020))
+        (i32.eq (i32.or (call $gl32 (i32.add (local.get $name) (i32.const 4))) (i32.const 0x00200020))
                 (i32.const 0x00700073)))                   ;; "sp"
       (i32.and
-        (i32.eq (i32.or (i32.load offset=8 (local.get $wa)) (i32.const 0x00200020))
+        (i32.eq (i32.or (call $gl32 (i32.add (local.get $name) (i32.const 8))) (i32.const 0x00200020))
                 (i32.const 0x0061006C))                    ;; "la"
-        (i32.eq (i32.or (i32.load offset=12 (local.get $wa)) (i32.const 0x00000020))
+        (i32.eq (i32.or (call $gl32 (i32.add (local.get $name) (i32.const 12))) (i32.const 0x00000020))
                 (i32.const 0x00000079)))))                 ;; "y\0"
 
   ;; 372: CreateDCW — wide printer/display DC owns a canonical page surface.
@@ -2724,16 +3214,49 @@
 
   ;; 374: RectVisible(hdc, lprc) — query the WAT-owned explicit clip.
   (func $handle_RectVisible (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $rect i32)
+    ;; The helper reads a linear RECT; gather valid separately backed pages.
+    (local.set $rect (call $g2w (local.get $arg1)))
+    (if (local.get $arg1)
+      (then (local.set $rect (call $guest_span_in (local.get $arg1) (i32.const 16)))))
     (i32.store offset=0 (global.get $reg_base) (call $gdi_dc_clip_rect_visible
-      (local.get $arg0) (call $g2w (local.get $arg1))))
+      (local.get $arg0) (local.get $rect)))
+    (call $guest_span_release (local.get $rect) (i32.const 16))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
   )
 
   ;; 375: TextOutW(hdc, x, y, lpString, c) — 5 args stdcall, host reads UTF-16 LE.
   (func $handle_TextOutW (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (i32.store offset=0 (global.get $reg_base) (call $gdi_native_text_out
-      (local.get $arg0) (local.get $arg1) (local.get $arg2)
-      (call $g2w (local.get $arg3)) (local.get $arg4) (i32.const 1)))
+    (local $text i32) (local $len i32) (local $copy_g i32) (local $i i32) (local $result i32)
+    (local.set $text (call $g2w (local.get $arg3)))
+    (block $done
+      ;; Preserve canonical count validation; copy only a valid counted input.
+      (if (i32.and (i32.ne (local.get $arg3) (i32.const 0))
+            (i32.and (i32.gt_s (local.get $arg4) (i32.const 0))
+              (i32.le_u (local.get $arg4) (i32.const 65536))))
+        (then
+          (local.set $len (i32.shl (local.get $arg4) (i32.const 1)))
+          (local.set $text (call $g2w_affine_span (local.get $arg3) (local.get $len)))
+          (if (i32.eq (local.get $text) (global.get $NULL_SENTINEL))
+            (then
+              ;; A heap block also covers counts larger than the span arena.
+              (local.set $copy_g (call $heap_alloc (local.get $len)))
+              (br_if $done (i32.eqz (local.get $copy_g)))
+              (local.set $text (call $g2w_affine_span (local.get $copy_g) (local.get $len)))
+              (br_if $done (i32.eq (local.get $text) (global.get $NULL_SENTINEL)))
+      (local.set $i (i32.const 0))
+      (block $copy_text_done (loop $copy_text
+        (br_if $copy_text_done (i32.ge_u (local.get $i) (local.get $len)))
+        (i32.store8 (i32.add (local.get $text) (local.get $i))
+          (call $gl8 (i32.add (local.get $arg3) (local.get $i))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $copy_text)))
+            ))))
+      (local.set $result (call $gdi_native_text_out
+        (local.get $arg0) (local.get $arg1) (local.get $arg2)
+        (local.get $text) (local.get $arg4) (i32.const 1))))
+    (if (local.get $copy_g) (then (call $heap_free (local.get $copy_g))))
+    (i32.store offset=0 (global.get $reg_base) (local.get $result))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24)))
   )
 
@@ -2864,8 +3387,15 @@
 
   ;; 439: GetDIBColorTable(hdc, startIndex, numEntries, pColors) → count
   (func $handle_GetDIBColorTable (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (i32.store offset=0 (global.get $reg_base) (call $gdi_native_get_dib_color_table
-      (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $arg3)))
+    (local $dest i32) (local $len i32)
+    ;; Preserve bytes beyond the retrieved entries when the output is gathered.
+    (if (local.get $arg3)
+      (then
+        (local.set $len (call $gdi_palette_span_bytes (local.get $arg2)))
+        (local.set $dest (call $guest_span_in (local.get $arg3) (local.get $len)))))
+    (i32.store offset=0 (global.get $reg_base) (call $gdi_get_dib_color_table
+      (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $dest)))
+    (call $guest_span_writeback (local.get $arg3) (local.get $dest) (local.get $len))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 20))))
 
   ;; 440: SetDIBColorTable(hdc, startIndex, numEntries, pColors) → count
@@ -3048,10 +3578,11 @@
 
   ;; 448: GetDIBits(hdc, hbmp, uStartScan, cScanLines, lpvBits, lpbmi, uUsage) — 7 args stdcall
   (func $handle_GetDIBits (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $wa_esp i32) (local $lpbmi i32) (local $uUsage i32) (local $bmi_wa i32)
-    (local.set $wa_esp (call $g2w (i32.load offset=16 (global.get $reg_base))))
-    (local.set $lpbmi (i32.load (i32.add (local.get $wa_esp) (i32.const 24))))
-    (local.set $uUsage (i32.load (i32.add (local.get $wa_esp) (i32.const 28))))
+    (local $esp i32) (local $lpbmi i32) (local $uUsage i32) (local $bmi_wa i32)
+    ;; Stack DWORDs may cross guest pages with nonadjacent backing.
+    (local.set $esp (i32.load offset=16 (global.get $reg_base)))
+    (local.set $lpbmi (call $gl32 (i32.add (local.get $esp) (i32.const 24))))
+    (local.set $uUsage (call $gl32 (i32.add (local.get $esp) (i32.const 28))))
     ;; This one is an output buffer as well: GetDIBits describes the bitmap in
     ;; the caller's header. A straddling BITMAPINFO is read through a gathered
     ;; copy, so what the call wrote there has to be put back afterwards.
@@ -3070,22 +3601,57 @@
 
   ;; 449: CreateDIBitmap(hdc, lpbmih, fdwInit, lpbInit, lpbmi, fuUsage) — 6 args
   (func $handle_CreateDIBitmap (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $info i32) (local $pixels i32) (local $init i32) (local $usage i32)
+    (local $len i32) (local $copy_g i32) (local $i i32) (local $result i32)
     ;; CBM_INIT=4. lpbmi carries the RGBQUAD table; lpbmih is sufficient for
     ;; true-color callers that omit the duplicate BITMAPINFO pointer.
-    (i32.store offset=0 (global.get $reg_base) (call $gdi_bitmap_create_dibitmap
-      (local.get $arg0)
-      (call $gdi_bitmap_info_wa (select (local.get $arg4) (local.get $arg1)
-        (i32.ne (local.get $arg4) (i32.const 0))))
-      (if (result i32) (local.get $arg3)
-        (then (call $g2w (local.get $arg3))) (else (i32.const 0)))
-      (i32.ne (i32.and (local.get $arg2) (i32.const 4)) (i32.const 0))
-      (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24)))))
+    (local.set $info (call $gdi_bitmap_info_wa
+      (select (local.get $arg4) (local.get $arg1)
+        (i32.ne (local.get $arg4) (i32.const 0)))))
+    (local.set $init (i32.ne (i32.and (local.get $arg2) (i32.const 4)) (i32.const 0)))
+    (local.set $usage (call $gl32
+      (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24))))
+    (local.set $pixels (if (result i32) (local.get $arg3)
+      (then (call $g2w (local.get $arg3))) (else (i32.const 0))))
+    (block $done
+      ;; The canonical plan supplies the exact input size, including padded
+      ;; rows (or the encoded byte count for RLE). Only CBM_INIT reads pixels.
+      (if (i32.and (local.get $init)
+            (i32.and (i32.ne (local.get $arg3) (i32.const 0))
+              (i32.le_u (local.get $usage) (i32.const 1))))
+        (then
+          (br_if $done (i32.eqz (call $gdi_bitmap_plan_info
+            (local.get $info) (global.get $GDI_BITMAP_PLAN))))
+          (local.set $len (i32.load offset=32 (global.get $GDI_BITMAP_PLAN)))
+          (if (i32.ne (i32.load offset=44 (global.get $GDI_BITMAP_PLAN)) (i32.const 0))
+            (then (local.set $len (i32.load offset=44 (global.get $GDI_BITMAP_PLAN)))))
+          (local.set $pixels (call $g2w_affine_span (local.get $arg3) (local.get $len)))
+          (if (i32.eq (local.get $pixels) (global.get $NULL_SENTINEL))
+            (then
+              ;; A heap temporary also covers legitimate inputs above the
+              ;; 16KB guest-span arena; never copy across physical page gaps.
+              (local.set $copy_g (call $heap_alloc (local.get $len)))
+              (br_if $done (i32.eqz (local.get $copy_g)))
+              (local.set $pixels (call $g2w_affine_span (local.get $copy_g) (local.get $len)))
+              (br_if $done (i32.eq (local.get $pixels) (global.get $NULL_SENTINEL)))
+              (block $copy_done (loop $copy
+                (br_if $copy_done (i32.ge_u (local.get $i) (local.get $len)))
+                (i32.store8 (i32.add (local.get $pixels) (local.get $i))
+                  (call $gl8 (i32.add (local.get $arg3) (local.get $i))))
+                (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                (br $copy)))))))
+      (local.set $result (call $gdi_bitmap_create_dibitmap
+        (local.get $arg0) (local.get $info) (local.get $pixels)
+        (local.get $init) (local.get $usage))))
+    (if (local.get $copy_g) (then (call $heap_free (local.get $copy_g))))
+    (i32.store offset=0 (global.get $reg_base) (local.get $result))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28))) ;; 6 args + ret
   )
 
   ;; 450: StretchBlt(hdcDest, xDest, yDest, wDest, hDest, hdcSrc, xSrc, ySrc, wSrc, hSrc, dwRop)
   (func $handle_StretchBlt (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $dst i32) (local $src i32) (local $src_hdc i32)
+    (local $dw i32) (local $dh i32)
     (local $sx i32) (local $sy i32) (local $sw i32) (local $sh i32)
     (local $rop i32) (local $rop3 i32)
     (local $dx i32) (local $dy i32) (local $pattern i32) (local $ok i32)
@@ -3102,12 +3668,27 @@
       (then
         (local.set $dx (call $gdi_line_map_x (local.get $dst) (local.get $arg1)))
         (local.set $dy (call $gdi_line_map_y (local.get $dst) (local.get $arg2)))
+        ;; Both origins and extents are logical units. Map the endpoints before
+        ;; raster clipping/sampling; transforming only the origin leaves a
+        ;; scaled viewport with the wrong footprint and source sampling ratio.
+        (local.set $dw (i32.sub
+          (call $gdi_line_map_x (local.get $dst) (i32.add (local.get $arg1) (local.get $arg3)))
+          (local.get $dx)))
+        (local.set $dh (i32.sub
+          (call $gdi_line_map_y (local.get $dst) (i32.add (local.get $arg2) (local.get $arg4)))
+          (local.get $dy)))
         (if (local.get $src_hdc)
           (then
             (if (i32.eqz (call $gdi_surface_descriptor (local.get $src_hdc) (local.get $src)))
               (then (local.set $src (i32.const 0))))
             (if (local.get $src)
               (then
+                (local.set $sw (i32.sub
+                  (call $gdi_line_map_x (local.get $src) (i32.add (local.get $sx) (local.get $sw)))
+                  (call $gdi_line_map_x (local.get $src) (local.get $sx))))
+                (local.set $sh (i32.sub
+                  (call $gdi_line_map_y (local.get $src) (i32.add (local.get $sy) (local.get $sh)))
+                  (call $gdi_line_map_y (local.get $src) (local.get $sy))))
                 (local.set $sx (call $gdi_line_map_x (local.get $src) (local.get $sx)))
                 (local.set $sy (call $gdi_line_map_y (local.get $src) (local.get $sy))))))
           (else (local.set $src (i32.const 0))))
@@ -3120,14 +3701,14 @@
           (else
             (local.set $ok (call $gdi_raster_stretch_blt
               (local.get $arg0) (local.get $src_hdc) (local.get $dst) (local.get $dx) (local.get $dy)
-              (local.get $arg3) (local.get $arg4) (local.get $src)
+              (local.get $dw) (local.get $dh) (local.get $src)
               (local.get $sx) (local.get $sy) (local.get $sw) (local.get $sh)
               (local.get $pattern) (local.get $rop)))))
         (if (local.get $ok)
           (then (call $gdi_geometry_present (local.get $arg0) (local.get $dst)
             (local.get $dx) (local.get $dy)
-            (i32.add (local.get $dx) (local.get $arg3))
-            (i32.add (local.get $dy) (local.get $arg4))))))
+            (i32.add (local.get $dx) (local.get $dw))
+            (i32.add (local.get $dy) (local.get $dh))))))
       (else (local.set $ok (i32.const 0))))
     (i32.store offset=0 (global.get $reg_base) (local.get $ok))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 48)))  ;; stdcall, 11 args
@@ -3503,6 +4084,13 @@
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
   )
 
+  ;; GetArcDirection(hdc) -> the existing per-DC arc direction, default AD_COUNTERCLOCKWISE.
+  (func $handle_GetArcDirection (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (i32.store offset=0 (global.get $reg_base) (call $gdi_dc_aux_get
+      (local.get $arg0) (i32.const 4) (i32.const 1)))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
+  )
+
   ;; 573: ArcTo — connect current position to the projected arc start and update it.
   (func $handle_ArcTo (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (if (call $gdi_dc_path_is_open (local.get $arg0))
@@ -3616,14 +4204,20 @@
 
   ;; 586: GetWindowOrgEx(hdc, lpPoint) → BOOL
   (func $handle_GetWindowOrgEx (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (if (local.get $arg1) (then
-      (call $gs32 (local.get $arg1)
-        (call $gdi_dc_get_field (local.get $arg0) (i32.const 40) (i32.const 0)))
-      (call $gs32 (i32.add (local.get $arg1) (i32.const 4))
-        (call $gdi_dc_get_field (local.get $arg0) (i32.const 44) (i32.const 0)))
-    ))
-    (i32.store offset=0 (global.get $reg_base) (i32.const 1))
-    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12))) (return)
+    (local $dc i32) (local $ok i32)
+    ;; Canonical lookup preserves supported live legacy window DC adoption
+    ;; without requesting allocation for an unrecognized handle.
+    (if (local.get $arg1)
+      (then
+        (local.set $dc (call $gdi_dc_state_entry (local.get $arg0) (i32.const 0)))
+        (if (local.get $dc)
+          (then
+            (call $gs32 (local.get $arg1) (i32.load offset=40 (local.get $dc)))
+            (call $gs32 (i32.add (local.get $arg1) (i32.const 4))
+              (i32.load offset=44 (local.get $dc)))
+            (local.set $ok (i32.const 1))))))
+    (i32.store offset=0 (global.get $reg_base) (local.get $ok))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
   )
 
   ;; 587: SetWindowOrgEx(hdc, X, Y, lpPoint) → BOOL. Stores new logical origin; subsequent GDI
@@ -3643,16 +4237,18 @@
 
   ;; 588: GetCurrentPositionEx(hdc, lpPoint) -> BOOL
   (func $handle_GetCurrentPositionEx (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (if (i32.eqz (local.get $arg1))
+    (local $dc i32) (local $ok i32)
+    (if (local.get $arg1)
       (then
-        (i32.store offset=0 (global.get $reg_base) (i32.const 0))
-        (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
-        (return)))
-    (call $gs32 (local.get $arg1)
-      (call $gdi_dc_get_field (local.get $arg0) (i32.const 12) (i32.const 0)))
-    (call $gs32 (i32.add (local.get $arg1) (i32.const 4))
-      (call $gdi_dc_get_field (local.get $arg0) (i32.const 16) (i32.const 0)))
-    (i32.store offset=0 (global.get $reg_base) (i32.const 1))
+        ;; Canonical lookup retains supported lazy window DC adoption.
+        (local.set $dc (call $gdi_dc_state_entry (local.get $arg0) (i32.const 0)))
+        (if (local.get $dc)
+          (then
+            (call $gs32 (local.get $arg1) (i32.load offset=12 (local.get $dc)))
+            (call $gs32 (i32.add (local.get $arg1) (i32.const 4))
+              (i32.load offset=16 (local.get $dc)))
+            (local.set $ok (i32.const 1))))))
+    (i32.store offset=0 (global.get $reg_base) (local.get $ok))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
   )
 
@@ -3672,6 +4268,16 @@
     (if (i32.and (i32.ne (local.get $arg2) (i32.const 0))
                  (i32.ne (local.get $arg4) (i32.const 0)))
       (then
+        ;; The system fixes extents in modes 1..6. Preserve the previous SIZE
+        ;; and existing denominator validation before ignoring the request.
+        (if (i32.le_u
+              (call $gdi_dc_get_field (local.get $arg0) (i32.const 36) (i32.const 1))
+              (i32.const 6))
+          (then
+            (i32.store offset=0 (global.get $reg_base) (i32.const 1))
+            (i32.store offset=16 (global.get $reg_base)
+              (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28)))
+            (return)))
         (local.set $new_x
           (i32.wrap_i64 (i64.div_s (i64.mul (i64.extend_i32_s (local.get $old_x))
             (i64.extend_i32_s (local.get $arg1))) (i64.extend_i32_s (local.get $arg2)))))
@@ -3712,6 +4318,16 @@
     (if (i32.and (i32.ne (local.get $arg2) (i32.const 0))
                  (i32.ne (local.get $arg4) (i32.const 0)))
       (then
+        ;; The system fixes extents in modes 1..6. Preserve the previous SIZE
+        ;; and existing denominator validation before ignoring the request.
+        (if (i32.le_u
+              (call $gdi_dc_get_field (local.get $arg0) (i32.const 36) (i32.const 1))
+              (i32.const 6))
+          (then
+            (i32.store offset=0 (global.get $reg_base) (i32.const 1))
+            (i32.store offset=16 (global.get $reg_base)
+              (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28)))
+            (return)))
         (local.set $new_x
           (i32.wrap_i64 (i64.div_s (i64.mul (i64.extend_i32_s (local.get $old_x))
             (i64.extend_i32_s (local.get $arg1))) (i64.extend_i32_s (local.get $arg2)))))
@@ -3763,13 +4379,19 @@
 
   ;; 593: GetViewportExtEx(hdc, lpSize) → BOOL
   (func $handle_GetViewportExtEx (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $dc i32) (local $ok i32)
+    ;; Look up existing state without requesting a new DC record. The
+    ;; canonical lookup retains supported live legacy window DC adoption.
     (if (local.get $arg1)
       (then
-        (call $gs32 (local.get $arg1)
-          (call $gdi_dc_get_field (local.get $arg0) (i32.const 64) (i32.const 1)))
-        (call $gs32 (i32.add (local.get $arg1) (i32.const 4))
-          (call $gdi_dc_get_field (local.get $arg0) (i32.const 68) (i32.const 1)))))
-    (i32.store offset=0 (global.get $reg_base) (i32.const 1))
+        (local.set $dc (call $gdi_dc_state_entry (local.get $arg0) (i32.const 0)))
+        (if (local.get $dc)
+          (then
+            (call $gs32 (local.get $arg1) (i32.load offset=64 (local.get $dc)))
+            (call $gs32 (i32.add (local.get $arg1) (i32.const 4))
+              (i32.load offset=68 (local.get $dc)))
+            (local.set $ok (i32.const 1))))))
+    (i32.store offset=0 (global.get $reg_base) (local.get $ok))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
   )
 
@@ -3781,13 +4403,19 @@
 
   ;; 595: GetWindowExtEx(hdc, lpSize) → BOOL
   (func $handle_GetWindowExtEx (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $dc i32) (local $ok i32)
+    ;; Look up existing state without requesting a new DC record. The
+    ;; canonical lookup retains supported live legacy window DC adoption.
     (if (local.get $arg1)
       (then
-        (call $gs32 (local.get $arg1)
-          (call $gdi_dc_get_field (local.get $arg0) (i32.const 48) (i32.const 1)))
-        (call $gs32 (i32.add (local.get $arg1) (i32.const 4))
-          (call $gdi_dc_get_field (local.get $arg0) (i32.const 52) (i32.const 1)))))
-    (i32.store offset=0 (global.get $reg_base) (i32.const 1))
+        (local.set $dc (call $gdi_dc_state_entry (local.get $arg0) (i32.const 0)))
+        (if (local.get $dc)
+          (then
+            (call $gs32 (local.get $arg1) (i32.load offset=48 (local.get $dc)))
+            (call $gs32 (i32.add (local.get $arg1) (i32.const 4))
+              (i32.load offset=52 (local.get $dc)))
+            (local.set $ok (i32.const 1))))))
+    (i32.store offset=0 (global.get $reg_base) (local.get $ok))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
   )
 
@@ -3799,7 +4427,7 @@
 
   ;; 597: GetPolyFillMode(hdc) → current polygon fill mode.
   (func $handle_GetPolyFillMode (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (i32.store offset=0 (global.get $reg_base) (call $gdi_dc_get_field (local.get $arg0) (i32.const 76) (i32.const 1)))
+    (i32.store offset=0 (global.get $reg_base) (call $gdi_dc_get_field (local.get $arg0) (i32.const 76) (i32.const 0)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
   )
 
@@ -3818,7 +4446,7 @@
 
   ;; 600: GetStretchBltMode(hdc) — BLACKONWHITE default
   (func $handle_GetStretchBltMode (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (i32.store offset=0 (global.get $reg_base) (call $gdi_dc_get_field (local.get $arg0) (i32.const 80) (i32.const 1)))
+    (i32.store offset=0 (global.get $reg_base) (call $gdi_dc_get_field (local.get $arg0) (i32.const 80) (i32.const 0)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
   )
 
@@ -3832,6 +4460,8 @@
   ;; 602: CreateFontW — convert the face name, then share the font-provider policy.
   (func $handle_CreateFontW (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $face i32) (local $weight i32) (local $italic i32) (local $handle i32) (local $face_wa i32)
+    (local $input i32) (local $source i32) (local $length i32) (local $unit i32)
+    (local $copy i32) (local $i i32) (local $matched i32)
     ;; Fourteen arguments, so argument n is at esp+4n: fnWeight is the 5th,
     ;; fdwItalic the 6th, lpszFace the 14th. See $handle_CreateFontA.
     (local.set $weight (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 20))))
@@ -3842,9 +4472,45 @@
         (i32.store offset=0 (global.get $reg_base) (i32.const 0))
         (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 60)))
         (return)))
-    (if (i32.eqz (call $tt_wide_family
-          (call $g2w (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 56))))
-          (call $g2w (local.get $face))))
+
+    ;; Gather only the bytes the raw-pointer consumers can inspect. ANSI
+    ;; copying/binding reads at most 32 bytes; sfnt family records have a
+    ;; uint16 byte length and can compare 65535 WCHARs plus the terminator.
+    (local.set $input (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 56))))
+    (local.set $source (call $g2w (local.get $input)))
+    (if (local.get $input) (then
+      (block $face_end (loop $face_length
+        (local.set $unit (call $gl16 (i32.add (local.get $input) (local.get $length))))
+        (local.set $length (i32.add (local.get $length) (i32.const 2)))
+        (br_if $face_end (i32.eqz (local.get $unit)))
+        (br_if $face_length (i32.lt_u (local.get $length) (i32.const 131072)))))
+      (local.set $source (call $g2w_affine_span (local.get $input) (local.get $length)))
+      (if (i32.eq (local.get $source) (global.get $NULL_SENTINEL)) (then
+        (if (i32.le_u (local.get $length)
+              (i32.sub (global.get $GUEST_SPAN_SCRATCH_SIZE) (global.get $guest_span_cursor)))
+          (then (local.set $source (call $guest_span_in (local.get $input) (local.get $length))))
+          (else
+            ;; An existing span lease or a long sfnt name must not overflow
+            ;; the arena. This temporary never becomes the font's owned face.
+            (local.set $copy (call $heap_alloc (local.get $length)))
+            (if (i32.eqz (local.get $copy)) (then
+              (call $heap_free (local.get $face))
+              (i32.store (global.get $reg_base) (i32.const 0))
+              (i32.store offset=16 (global.get $reg_base)
+                (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 60)))
+              (return)))
+            (local.set $source (call $g2w (local.get $copy)))
+            (loop $face_copy
+              (i32.store8 (i32.add (local.get $source) (local.get $i))
+                (call $gl8 (i32.add (local.get $input) (local.get $i))))
+              (local.set $i (i32.add (local.get $i) (i32.const 1)))
+              (br_if $face_copy (i32.lt_u (local.get $i) (local.get $length))))))))))
+    (local.set $matched (call $tt_wide_family
+      (local.get $source) (call $g2w (local.get $face))))
+    (if (local.get $copy)
+      (then (call $heap_free (local.get $copy)))
+      (else (call $guest_span_release (local.get $source) (local.get $length))))
+    (if (i32.eqz (local.get $matched))
       (then (drop (call $wide_to_ansi
         (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 56)))
         (local.get $face) (i32.const 64)))))
@@ -3869,16 +4535,10 @@
 
   ;; 604: GetTextExtentPoint32W — font-aware wide text measurement
   (func $handle_GetTextExtentPoint32W (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $packed i32)
-    (local.set $packed (call $host_get_text_metrics (local.get $arg0)))
-    (call $gs32 (local.get $arg3)
-      (call $gdi_text_span_logical_x (local.get $arg0)
-        (call $host_measure_text (local.get $arg0) (call $g2w (local.get $arg1))
-          (local.get $arg2) (i32.const 1))))
-    (call $gs32 (i32.add (local.get $arg3) (i32.const 4))
-      (call $gdi_text_span_logical_y (local.get $arg0)
-        (i32.and (local.get $packed) (i32.const 0xFFFF))))
-    (i32.store offset=0 (global.get $reg_base) (i32.const 1))
+    (i32.store offset=0 (global.get $reg_base) (call $gdi_text_extent_ex
+      (local.get $arg0) (call $g2w (local.get $arg1)) (local.get $arg2)
+      (i32.const 0) (i32.const 0) (i32.const 0)
+      (call $g2w (local.get $arg3)) (i32.const 1)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 20)))
   )
 
@@ -3903,28 +4563,82 @@
   ;; 949: ExtTextOutA(hdc, x, y, options, lprect, lpString, c, lpDx) — 8 args stdcall
   ;; Selected FNT strikes consume lpDx in WAT; the generic host path ignores it.
   (func $handle_ExtTextOutA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $lpString i32) (local $count i32) (local $rect_wa i32) (local $text_wa i32)
-    (local $lpDx i32) (local $dx_wa i32)
-    (local.set $lpString (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24)))) ;; arg5
-    (local.set $count (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28))))    ;; arg6
-    (if (local.get $arg4)
-      (then (local.set $rect_wa (call $g2w (local.get $arg4)))))
-    (if (local.get $lpString)
-      (then (local.set $text_wa (call $g2w (local.get $lpString)))))
+    (local $lpString i32) (local $count i32) (local $lpDx i32)
+    (local $text i32) (local $dx i32) (local $rect i32)
+    (local $text_len i32) (local $dx_len i32) (local $rect_len i32)
+    (local $total i32) (local $copy_g i32) (local $copy i32) (local $i i32) (local $result i32)
+    (local.set $lpString (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24))))
+    (local.set $count (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 28))))
     (local.set $lpDx (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 32))))
-    (if (local.get $lpDx)
-      (then (local.set $dx_wa (call $g2w (local.get $lpDx)))))
-    (i32.store offset=0 (global.get $reg_base) (call $gdi_native_ext_text_out
-      (local.get $arg0) (local.get $arg1) (local.get $arg2)
-      (local.get $arg3) (local.get $rect_wa)
-      (local.get $text_wa) (local.get $count) (local.get $dx_wa) (i32.const 0)))
-    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 36))) ;; 8 args + ret
+    (if (local.get $lpString) (then (local.set $text (call $g2w (local.get $lpString)))))
+    (if (local.get $lpDx) (then (local.set $dx (call $g2w (local.get $lpDx)))))
+    ;; The public rectangle is consumed only for clipping or opaque fill.
+    (if (i32.and (i32.ne (local.get $arg4) (i32.const 0))
+          (i32.ne (i32.and (local.get $arg3) (i32.const 6)) (i32.const 0)))
+      (then (local.set $rect_len (i32.const 16))
+        (local.set $rect (call $g2w (local.get $arg4)))))
+    (block $done
+      (if (i32.and (i32.le_u (local.get $count) (i32.const 65536))
+            (i32.or (i32.eqz (local.get $count)) (i32.ne (local.get $lpString) (i32.const 0))))
+        (then
+          (local.set $text_len (i32.shl (local.get $count) (i32.ne (i32.and (local.get $arg3) (i32.const 16)) (i32.const 0))))
+          (if (local.get $lpDx)
+            (then (local.set $dx_len (i32.shl (local.get $count)
+              (i32.add (i32.const 2) (i32.ne (i32.and (local.get $arg3) (i32.const 0x2000)) (i32.const 0)))))))
+          (if (local.get $text_len) (then (local.set $text (call $g2w_affine_span (local.get $lpString) (local.get $text_len)))))
+          (if (local.get $dx_len) (then (local.set $dx (call $g2w_affine_span (local.get $lpDx) (local.get $dx_len)))))
+          (if (local.get $rect_len) (then (local.set $rect (call $g2w_affine_span (local.get $arg4) (local.get $rect_len)))))
+          (if (i32.or (i32.eq (local.get $text) (global.get $NULL_SENTINEL))
+                (i32.or (i32.eq (local.get $dx) (global.get $NULL_SENTINEL))
+                  (i32.eq (local.get $rect) (global.get $NULL_SENTINEL))))
+            (then
+              ;; One contiguous temporary retains all counted bytes, including
+              ;; long runs, WORD glyph indices and ETO_PDY spacing pairs.
+              (local.set $total (i32.add (local.get $text_len) (i32.add (local.get $dx_len) (local.get $rect_len))))
+              (local.set $copy_g (call $heap_alloc (local.get $total)))
+              (br_if $done (i32.eqz (local.get $copy_g)))
+              (local.set $copy (call $g2w_affine_span (local.get $copy_g) (local.get $total)))
+              (br_if $done (i32.eq (local.get $copy) (global.get $NULL_SENTINEL)))
+              (local.set $text (local.get $copy))
+      (local.set $i (i32.const 0))
+      (block $copy_text_done (loop $copy_text
+        (br_if $copy_text_done (i32.ge_u (local.get $i) (local.get $text_len)))
+        (i32.store8 (i32.add (local.get $text) (local.get $i))
+          (call $gl8 (i32.add (local.get $lpString) (local.get $i))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $copy_text)))
+              (local.set $dx (if (result i32) (local.get $dx_len)
+                (then (i32.add (local.get $copy) (local.get $text_len))) (else (i32.const 0))))
+      (local.set $i (i32.const 0))
+      (block $copy_dx_done (loop $copy_dx
+        (br_if $copy_dx_done (i32.ge_u (local.get $i) (local.get $dx_len)))
+        (i32.store8 (i32.add (local.get $dx) (local.get $i))
+          (call $gl8 (i32.add (local.get $lpDx) (local.get $i))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $copy_dx)))
+              (local.set $rect (if (result i32) (local.get $rect_len)
+                (then (i32.add (local.get $copy) (i32.add (local.get $text_len) (local.get $dx_len)))) (else (i32.const 0))))
+      (local.set $i (i32.const 0))
+      (block $copy_rect_done (loop $copy_rect
+        (br_if $copy_rect_done (i32.ge_u (local.get $i) (local.get $rect_len)))
+        (i32.store8 (i32.add (local.get $rect) (local.get $i))
+          (call $gl8 (i32.add (local.get $arg4) (local.get $i))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $copy_rect)))
+            ))))
+      (local.set $result (call $gdi_native_ext_text_out
+        (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $arg3)
+        (local.get $rect) (local.get $text) (local.get $count) (local.get $dx) (i32.const 0))))
+    (if (local.get $copy_g) (then (call $heap_free (local.get $copy_g))))
+    (i32.store offset=0 (global.get $reg_base) (local.get $result))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 36)))
   )
 
   ;; 947: SetPixelV(hdc, x, y, color) — 4 args stdcall, like SetPixel but returns BOOL
   (func $handle_SetPixelV (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (drop (call $gdi_native_set_pixel (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $arg3)))
-    (i32.store offset=0 (global.get $reg_base) (i32.const 1))
+    (i32.store offset=0 (global.get $reg_base)
+      (i32.ne (call $gdi_native_set_pixel (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $arg3))
+        (i32.const -1)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 20)))
   )
 
@@ -3958,8 +4672,9 @@
             (local.set $wide (i32.add (local.get $scratch) (i32.const 36)))
             (local.set $wide_out_g (i32.add (local.get $wide_g) (i32.shl (local.get $arg2) (i32.const 1))))
             (local.set $wide_out (i32.add (local.get $wide) (i32.shl (local.get $arg2) (i32.const 1))))
-            (local.set $results (call $g2w (local.get $arg4)))
+            (local.set $results (call $guest_span_in (local.get $arg4) (i32.const 36)))
             (memory.copy (local.get $scratch) (local.get $results) (i32.const 36))
+            (call $guest_span_release (local.get $results) (i32.const 36))
             (local.set $ansi_out_g (i32.load offset=4 (local.get $scratch)))
             (if (local.get $ansi_out_g)
               (then (i32.store offset=4 (local.get $scratch) (local.get $wide_out_g))))
@@ -3973,8 +4688,8 @@
               (local.get $arg0) (local.get $wide) (local.get $arg2) (local.get $arg3)
               (local.get $scratch) (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24)))))
             (local.set $included (i32.load offset=28 (local.get $scratch)))
-            (i32.store offset=28 (local.get $results) (local.get $included))
-            (i32.store offset=32 (local.get $results) (i32.load offset=32 (local.get $scratch)))
+            (call $gs32 (i32.add (local.get $arg4) (i32.const 28)) (local.get $included))
+            (call $gs32 (i32.add (local.get $arg4) (i32.const 32)) (i32.load offset=32 (local.get $scratch)))
             (if (local.get $ansi_out_g)
               (then
                 (local.set $i (i32.const 0))
@@ -4013,13 +4728,13 @@
       (i32.const 0) (local.get $name_ptr)))
 
   (func $handle_GetCharWidth32A (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $out i32)
-    (if (local.get $arg3) (then (local.set $out (call $g2w (local.get $arg3)))))
     (i32.store offset=0 (global.get $reg_base) (call $gdi_font_char_widths
-      (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $out) (i32.const 0)))
+      (local.get $arg0) (local.get $arg1) (local.get $arg2)
+      (local.get $arg3) ;; Guest output: helper stores translate each INT.
+      (i32.const 0)))
     (if (i32.load (global.get $reg_base))
       (then (call $gdi_char_widths_to_logical
-        (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $out))))
+        (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $arg3))))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 20))))
 
   (func $handle_InvertRgn (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)

@@ -1127,11 +1127,32 @@
   )
 
   ;; 430: RegOpenKeyW — STUB: unimplemented
+  ;; Legacy RegOpenKeyA/W return the original handle for an empty subkey.
+  ;; Extended opens instead retain an independent allocated-key handle.
+  (func $reg_open_key_legacy (param $key i32) (param $subkey i32)
+                             (param $wide i32) (result i32)
+    (local $opened i32) (local $empty i32)
+    (local.set $opened (call $host_reg_open_key
+      (local.get $key) (call $g2w (local.get $subkey)) (local.get $wide)))
+    (if (local.get $opened)
+      (then
+        (local.set $empty (if (result i32) (i32.eqz (local.get $subkey))
+          (then (i32.const 1))
+          (else (i32.eqz (if (result i32) (local.get $wide)
+            (then (i32.load16_u (call $g2w (local.get $subkey))))
+            (else (i32.load8_u (call $g2w (local.get $subkey)))))))))
+        (if (local.get $empty)
+          (then
+            (if (i32.ne (local.get $opened) (local.get $key))
+              (then (drop (call $host_reg_close_key (local.get $opened)))))
+            (local.set $opened (local.get $key))))))
+    (local.get $opened))
+
   (func $handle_RegOpenKeyW (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     ;; RegOpenKeyW(hKey, lpSubKey, phkResult) — 3 args stdcall
     (local $hResult i32)
-    (local.set $hResult (call $host_reg_open_key
-      (local.get $arg0) (call $g2w (local.get $arg1)) (i32.const 1)))
+    (local.set $hResult (call $reg_open_key_legacy
+      (local.get $arg0) (local.get $arg1) (i32.const 1)))
     (if (local.get $hResult)
       (then (call $gs32 (local.get $arg2) (local.get $hResult))
              (i32.store offset=0 (global.get $reg_base) (i32.const 0)))
@@ -1156,8 +1177,8 @@
       (if (result i32) (local.get $subkey_g)
         (then (call $g2w (local.get $subkey_g)))
         (else (i32.const 0))))
-    ;; Even an empty subkey is opened into a normal host handle: predefined
-    ;; root constants are not writable handles in the storage backend.
+    ;; Close only a separately opened/created handle. The backend can return
+    ;; a predefined root unchanged; the caller retains its original key.
     (local.set $target (call $host_reg_open_key
       (local.get $hkey) (local.get $sub_wa) (local.get $wide)))
     (if (i32.eqz (local.get $target))
@@ -1174,7 +1195,8 @@
     (local.set $res (call $host_reg_set_value
       (local.get $target) (i32.const 0) (local.get $type)
       (local.get $data_g) (local.get $cb) (local.get $wide)))
-    (drop (call $host_reg_close_key (local.get $target)))
+    (if (i32.ne (local.get $target) (local.get $hkey))
+      (then (drop (call $host_reg_close_key (local.get $target)))))
     (local.get $res))
 
   ;; 432: RegSetValueW — 5 args stdcall.
@@ -1251,10 +1273,10 @@
   (func $handle_RegCreateKeyExW (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     ;; RegCreateKeyExW(hKey, lpSubKey, Reserved, lpClass, dwOptions, samDesired, lpSecurityAttrs, phkResult, lpdwDisposition)
     ;; 9 args stdcall
-    (local $wa_esp i32) (local $phkResult i32) (local $lpdwDisposition i32)
-    (local.set $wa_esp (call $g2w (i32.load offset=16 (global.get $reg_base))))
-    (local.set $phkResult (i32.load (i32.add (local.get $wa_esp) (i32.const 32))))
-    (local.set $lpdwDisposition (i32.load (i32.add (local.get $wa_esp) (i32.const 36))))
+    (local $esp i32) (local $phkResult i32) (local $lpdwDisposition i32)
+    (local.set $esp (i32.load offset=16 (global.get $reg_base)))
+    (local.set $phkResult (call $gl32 (i32.add (local.get $esp) (i32.const 32))))
+    (local.set $lpdwDisposition (call $gl32 (i32.add (local.get $esp) (i32.const 36))))
     (i32.store offset=0 (global.get $reg_base) (call $host_reg_create_key
       (local.get $arg0) (call $g2w (local.get $arg1)) (local.get $phkResult)
       (i32.const 1) (local.get $lpdwDisposition)))
@@ -1263,10 +1285,10 @@
 
   ;; RegCreateKeyExA — same as ExW, 9 args stdcall
   (func $handle_RegCreateKeyExA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $wa_esp i32) (local $phkResult i32) (local $lpdwDisposition i32)
-    (local.set $wa_esp (call $g2w (i32.load offset=16 (global.get $reg_base))))
-    (local.set $phkResult (i32.load (i32.add (local.get $wa_esp) (i32.const 32))))
-    (local.set $lpdwDisposition (i32.load (i32.add (local.get $wa_esp) (i32.const 36))))
+    (local $esp i32) (local $phkResult i32) (local $lpdwDisposition i32)
+    (local.set $esp (i32.load offset=16 (global.get $reg_base)))
+    (local.set $phkResult (call $gl32 (i32.add (local.get $esp) (i32.const 32))))
+    (local.set $lpdwDisposition (call $gl32 (i32.add (local.get $esp) (i32.const 36))))
     (i32.store offset=0 (global.get $reg_base) (call $host_reg_create_key
       (local.get $arg0) (call $g2w (local.get $arg1)) (local.get $phkResult)
       (i32.const 0) (local.get $lpdwDisposition)))
@@ -1445,12 +1467,10 @@
 
   ;; 459: GetCaretPos(lpPoint) — report the last USER caret coordinates.
   (func $handle_GetCaretPos (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (local $wa i32)
     (if (local.get $arg0)
       (then
-        (local.set $wa (call $g2w (local.get $arg0)))
-        (i32.store (local.get $wa) (global.get $caret_x))
-        (i32.store offset=4 (local.get $wa) (global.get $caret_y))))
+        (call $gs32 (local.get $arg0) (global.get $caret_x))
+        (call $gs32 (i32.add (local.get $arg0) (i32.const 4)) (global.get $caret_y))))
     (i32.store offset=0 (global.get $reg_base) (i32.const 1))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8))) ;; 1 arg stdcall
   )

@@ -11,9 +11,15 @@
 // but only launches and samples frame timing; it has no mouse scripting.
 // Anything of the form "WAT looks right, the browser looks wrong" needs this.
 //
-// Coordinates are GUEST canvas pixels (the same numbers test/run.js takes for
-// --input=B:mousemove:X:Y). They are converted to page coordinates through the
-// canvas bounding rect, so the CSS scaling of #screen-wrap is accounted for.
+// Coordinates are GUEST canvas pixels. They are converted to page coordinates
+// through the canvas bounding rect, so the CSS scaling of #screen-wrap is
+// accounted for. They match test/run.js --input=B:click:X:Y only while both
+// canvases have the same size: the CLI keeps its 640x480 canvas and scales an
+// app's larger fullscreen mode into it, while the page's #screen takes the
+// mode's size. AoE's menus run at 800x600, so CLI click:320:200 (Single
+// Player) is page-probe click:400,250, and probe click:320,200 lands above the
+// button (2026-11-16, scratch/runs/20261116-aoe-fixes). Read #screen's
+// width/height before reusing CLI coordinates here.
 //
 // Steps (semicolon separated, left to right):
 //   move:X,Y      move the pointer to guest pixel X,Y
@@ -40,6 +46,9 @@
 //   eval:EXPR     evaluate EXPR in the page and print its result
 //   evalfile:PATH evaluate the contents of PATH in the page (no ';' escaping)
 //   shot:PATH     screenshot to PATH
+//   profstart[:US] start the V8 sampling profiler (interval US, default 200)
+//                 on the page and every Worker target, nested ones included
+//   profstop:DIR  stop it and write one .cpuprofile per thread into DIR
 //
 // `--eval=@PATH` reads the final readout expression from a file too. Reach for
 // the file forms for anything longer than one expression: steps split on ';',
@@ -55,7 +64,7 @@
 // it regardless of the emulated screen size).
 //
 // --gpu runs the page on SwiftShader instead of Chrome's default --disable-gpu,
-// so the WebGL presentation paths (scale-auto, fsr1, dedither, CRT) actually
+// so the WebGL presentation paths (scale-auto, fsr1, CRT) actually
 // run. Without it every presentation falls back to 2D canvas and a GPU-only
 // bug looks fixed.
 //
@@ -631,8 +640,16 @@ async function main() {
     // The lobby appears asynchronously (it is awaited inside launchApp), so
     // poll for it rather than assuming it is up on the next tick.
     for (let i = 0; i < 60; i++) {
-      const answered = await page.evaluate(answer => {
+      const answered = await page.evaluate((answer, app) => {
         const overlay = document.querySelector('.vln-lobby');
+        // An app with no `lan` entry never shows a lobby, so once it is
+        // running there is nothing to answer. Without this every non-LAN
+        // launch sat out all 60 polls (15 s of guest time the steps never
+        // saw) before its first step. LAN apps keep polling: an on-demand
+        // lobby (app.lan.onDemand) opens while the app is already running.
+        const lan = typeof apps !== 'undefined' && apps[app] && apps[app].lan;
+        if (!overlay && !lan && typeof runningApps !== 'undefined' &&
+            runningApps.some(r => r && r.name === app)) return 'none (app running)';
         if (!overlay) return null;
         const buttons = [...overlay.querySelectorAll('button')];
         const want = { solo: /play solo/i, local: /both players/i, cancel: /cancel/i }[answer];
@@ -640,7 +657,7 @@ async function main() {
         if (!button) return `no ${answer} button (saw: ${buttons.map(b => b.textContent).join(', ')})`;
         button.click();
         return `clicked "${button.textContent}"`;
-      }, LAN_ANSWER);
+      }, LAN_ANSWER, APP);
       if (answered) { console.log(`lan lobby: ${answered}`); break; }
       await wait(250);
     }
@@ -678,12 +695,45 @@ async function main() {
     await wait(READY_MS);
     console.log(`ready  cursor=${JSON.stringify(await readCursor(page))}`);
 
+    const profSessions = [];
     for await (const step of probeSteps()) {
       const colon = step.indexOf(':');
       const kind = colon < 0 ? step : step.slice(0, colon);
       const rest = colon < 0 ? '' : step.slice(colon + 1);
       if (kind === 'wait') {
         await wait(Number(rest) || 0);
+      } else if (kind === 'profstart') {
+        // V8 sampling profiler on the page and on every live Worker target
+        // (guest Workers and the render Worker, nested ones included -- they
+        // are browser targets, not only page.workers()).
+        profSessions.length = 0;
+        const short = u => u.replace(/^https?:\/\/[^/]+\//, '').replace(/\?.*$/, '');
+        const targets = [{ label: 'page', session: await page.target().createCDPSession() },
+          ...page.workers().filter(w => w.client).map((w, i) => ({ label: `worker${i} ${short(w.url())}`, session: w.client }))];
+        for (const t of targets) {
+          try {
+            await t.session.send('Profiler.enable');
+            await t.session.send('Profiler.setSamplingInterval', { interval: Number(rest) || 200 });
+            await t.session.send('Profiler.start');
+            profSessions.push(t);
+          } catch (e) { console.log(`profstart: ${t.label}: ${e.message}`); }
+        }
+        console.log(`profstart ${profSessions.map(s => s.label).join(', ')}`);
+        continue;
+      } else if (kind === 'profstop') {
+        // profstop:DIR writes one .cpuprofile per thread (DevTools-loadable).
+        fs.mkdirSync(rest, { recursive: true });
+        let n = 0;
+        for (const s of profSessions) {
+          try {
+            const { profile } = await s.session.send('Profiler.stop');
+            const file = path.join(rest, `${n++}-${s.label.replace(/[^\w.-]+/g, '_')}.cpuprofile`);
+            fs.writeFileSync(file, JSON.stringify(profile));
+            console.log(`profstop ${s.label} -> ${file}`);
+          } catch (e) { console.log(`profstop ${s.label}: ${e.message}`); }
+        }
+        profSessions.length = 0;
+        continue;
       } else if (kind === 'eval') {
         const v = await page.evaluate(async expr => {
           try { return JSON.stringify(await eval(expr)); } catch (e) { return 'ERROR: ' + e.message; }

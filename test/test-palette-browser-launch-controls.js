@@ -5,13 +5,15 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const {spawnSync} = require('child_process');
 const controls = require('./helpers/palette-browser-launch');
 const dir = fs.mkdtempSync(path.join(os.tmpdir(),'palette-launch-controls-'));
-const fixture = path.join(__dirname,'test-d3dim-palette-gpu-web.js');
+// The browser fixture that exposed --launch-config-check
+// (test-d3dim-palette-gpu-web.js) went with the deleted JS D3DIM executor;
+// its boundary was launchConfiguration() before anything else, called here.
 function boundary(chrome) {
-  return spawnSync(process.execPath,[...process.execArgv,fixture,'--launch-config-check'],
-    {env:{...process.env,CHROME:chrome},encoding:'utf8',timeout:10000,maxBuffer:8192});
+  try {
+    return {status:0, stdout:JSON.stringify(controls.launchConfiguration({...process.env,CHROME:chrome})), stderr:''};
+  } catch (error) { return {status:1, stdout:'', stderr:String(error && error.message)}; }
 }
 try {
   // Exact production fixture boundary first; sentinel must never be invoked.
@@ -35,7 +37,8 @@ try {
   // that a mock received a proposed argument. Node keeps its original DATA.
   const limitsBefore = fs.readFileSync('/proc/self/limits','utf8');
   const log = path.join(dir,'git-limits');
-  fs.writeFileSync(path.join(dir,'git'),`#!/usr/bin/python3\nimport resource,sys,json\nwith open(${JSON.stringify(log)},'a') as f:f.write(json.dumps(resource.getrlimit(resource.RLIMIT_DATA))+'\\n')\nprint('synthetic-head' if 'rev-parse' in sys.argv else '')\n`,{mode:0o700});
+  // getrlimit(RLIMIT_DATA) as [soft, hard] from this exec'd process's own limits.
+  fs.writeFileSync(path.join(dir,'git'),`#!${process.execPath}\nconst fs=require('fs');\nconst row=fs.readFileSync('/proc/self/limits','utf8').split('\\n').find(l=>l.startsWith('Max data size'));\nconst limit=row.slice('Max data size'.length).trim().split(/\\s+/).slice(0,2).map(x=>x==='unlimited'?-1:Number(x));\nfs.appendFileSync(${JSON.stringify(log)},JSON.stringify(limit)+'\\n');\nconsole.log(process.argv.includes('rev-parse')?'synthetic-head':'');\n`,{mode:0o700});
   const oldPath=process.env.PATH;
   try {
     process.env.PATH=dir+path.delimiter+oldPath;

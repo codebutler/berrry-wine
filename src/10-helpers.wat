@@ -3541,7 +3541,15 @@
     ;; after retirement or when the image has no resource directory.
     (global.set $rsrc_ctx_base (local.get $hInstance))
     (global.set $rsrc_ctx_dll_pin (call $dll_pin_module (local.get $hInstance)))
-    (if (i32.eqz (global.get $rsrc_ctx_dll_pin)) (then (return)))
+    (if (i32.eqz (global.get $rsrc_ctx_dll_pin))
+      (then
+        ;; A statically dispatched system module is a header-only image that
+        ;; is never retired; its own optional header names any resource
+        ;; section it carries (COMCTL32's property-sheet templates).
+        (if (call $static_sys_dll_from_handle (local.get $hInstance))
+          (then (global.set $rsrc_ctx_rva (call $gl32
+            (i32.add (local.get $hInstance) (i32.const 264))))))
+        (return)))
     (local.set $idx (i32.sub (global.get $rsrc_ctx_dll_pin) (i32.const 1)))
     (local.set $rva (i32.load (i32.add (global.get $DLL_RSRC_TABLE)
       (i32.mul (local.get $idx) (i32.const 8)))))
@@ -6788,15 +6796,14 @@
       ;; Dialog combos must remain eligible: guest-worker input queues the
       ;; selected HWND instead of invoking the synchronous dialog router.
       ;; Skipping the combo there routed Turok's selector click to its frame.
+      ;; Transparent means the decoration's own pixels, not its children: a
+      ;; group box answers HTTRANSPARENT, but USER finds the deepest child
+      ;; under the point before it hit-tests, so a control parented to a
+      ;; group box still takes its click. VB6's Frame is a BS_GROUPBOX
+      ;; superclass that parents its controls -- every SimCity 2001 tool
+      ;; button sits in one, and skipping the frame routed those clicks to
+      ;; the form. Such a decoration competes only when a child is hit.
       (local.set $cls (call $ctrl_table_get_class (local.get $ch)))
-      (if (i32.or
-            (i32.or (i32.eq (local.get $cls) (i32.const 3))
-                    (i32.eq (local.get $cls) (i32.const 6)))
-            (i32.and (i32.eq (local.get $cls) (i32.const 1))
-              (i32.eq (i32.and (local.get $style) (i32.const 15)) (i32.const 7))))
-        (then
-          (local.set $slot (i32.add (local.get $slot) (i32.const 1)))
-          (br $scan)))
       (local.set $x (call $wnd_window_screen_x (local.get $ch)))
       (local.set $y (call $wnd_window_screen_y (local.get $ch)))
       (local.set $w (call $wnd_screen_w (local.get $ch)))
@@ -6805,6 +6812,23 @@
       ;; window it was created with; see $combobox_hit_h.
       (if (i32.eq (local.get $cls) (i32.const 5))
         (then (local.set $h (call $combobox_hit_h (local.get $ch) (local.get $h)))))
+      (if (i32.and
+            (i32.and (i32.ge_s (local.get $sx) (local.get $x))
+                     (i32.lt_s (local.get $sx) (i32.add (local.get $x) (local.get $w))))
+            (i32.and (i32.ge_s (local.get $sy) (local.get $y))
+                     (i32.lt_s (local.get $sy) (i32.add (local.get $y) (local.get $h)))))
+        (then
+          (if (i32.and
+                (i32.or
+                  (i32.or (i32.eq (local.get $cls) (i32.const 3))
+                          (i32.eq (local.get $cls) (i32.const 6)))
+                  (i32.and (i32.eq (local.get $cls) (i32.const 1))
+                    (i32.eq (i32.and (local.get $style) (i32.const 15)) (i32.const 7))))
+                (i32.eqz (call $wnd_child_from_point_deep
+                  (local.get $ch) (local.get $sx) (local.get $sy))))
+            (then
+              (local.set $slot (i32.add (local.get $slot) (i32.const 1)))
+              (br $scan)))))
       (if (i32.and
             (i32.and (i32.ge_s (local.get $sx) (local.get $x))
                      (i32.lt_s (local.get $sx) (i32.add (local.get $x) (local.get $w))))
@@ -6896,6 +6920,21 @@
       (br_if $done (i32.lt_s (local.get $slot) (i32.const 0)))
       (local.set $ch (call $wnd_slot_hwnd (local.get $slot)))
       (local.set $style (call $wnd_get_style (local.get $ch)))
+      ;; A visible enabled non-tab child is still a search starting point.
+      (if (i32.and
+            (i32.eq (local.get $ch) (local.get $focus))
+            (i32.eqz (i32.and (local.get $style) (i32.const 0x00010000))))
+        (then
+          (if (i32.and
+                (i32.ne (call $wnd_is_effectively_visible (local.get $ch)) (i32.const 0))
+                (i32.eqz (i32.and (local.get $style)
+                           (i32.shl (i32.const 1) (i32.const 27)))))
+            (then
+              (if (i32.and
+                    (i32.lt_s (local.get $dir) (i32.const 0))
+                    (i32.ne (local.get $prev) (i32.const 0)))
+                (then (return (local.get $prev))))
+              (local.set $seen (i32.const 1))))))
       (if (i32.and
             (i32.and
               (i32.ne (call $wnd_is_effectively_visible (local.get $ch)) (i32.const 0))
@@ -8290,8 +8329,11 @@
     (local $slot i32)
     (local.set $slot (call $win98_sys_color_slot (local.get $idx)))
     (if (i32.eqz (local.get $slot)) (then (return)))
+    (call $lock_acquire (global.get $GDI_ALLOC_LOCK))
     (i32.store offset=4 (local.get $slot) (local.get $color))
-    (i32.store offset=0 (local.get $slot) (i32.const 1)))
+    (i32.store offset=0 (local.get $slot) (i32.const 1))
+    (call $gdi_system_brush_recolor (local.get $idx) (local.get $color))
+    (call $lock_release (global.get $GDI_ALLOC_LOCK)))
 
   (func $win98_sys_color (param $idx i32) (result i32)
     (local $slot i32)
@@ -8330,6 +8372,10 @@
     (if (i32.eq (local.get $idx) (i32.const 21)) (then (return (i32.const 0x00000000)))) ;; 3DDKSHADOW
     (if (i32.eq (local.get $idx) (i32.const 23)) (then (return (i32.const 0x00000000)))) ;; INFOTEXT
     (if (i32.eq (local.get $idx) (i32.const 24)) (then (return (i32.const 0x00E1FFFF)))) ;; INFOBK
+    (if (i32.eq (local.get $idx) (i32.const 26)) (then (return (i32.const 0x00800000)))) ;; HOTLIGHT
+    (if (i32.eq (local.get $idx) (i32.const 27)) (then (return (i32.const 0x00D08410)))) ;; GRADIENTACTIVECAPTION
+    (if (i32.eq (local.get $idx) (i32.const 28)) (then (return (i32.const 0x00808080)))) ;; GRADIENTINACTIVECAPTION
+    (if (i32.eq (local.get $idx) (i32.const 29)) (then (return (i32.const 0x00800000)))) ;; MENUHILIGHT
     (i32.const 0x00C0C0C0))
 
   ;; LockWindowUpdate is USER state, shared by every guest thread/instance.
@@ -9932,6 +9978,45 @@
     (call $heap_free (local.get $tmp))
     (call $heap_free (local.get $scratch))
     (local.get $required))
+
+  ;; ExpandEnvironmentStringsW core: the ANSI expansion of the source taken
+  ;; through the process code page both ways, so %NAME% lookup is the same
+  ;; $env_expand_a path. Returns required WCHARs including the NUL; the
+  ;; destination is written only when $size (WCHARs) holds all of it.
+  (func $env_expand_w (param $src i32) (param $dst i32) (param $size i32) (result i32)
+    (local $wlen i32) (local $asrc i32) (local $areq i32) (local $abuf i32)
+    (local $wtmp i32) (local $required i32)
+    (if (i32.eqz (local.get $src)) (then (return (i32.const 0))))
+    (local.set $wlen (call $guest_wcslen (local.get $src)))
+    (local.set $asrc (call $heap_alloc (i32.add (i32.shl (local.get $wlen) (i32.const 1)) (i32.const 1))))
+    (if (i32.eqz (local.get $asrc)) (then (return (i32.const 0))))
+    (drop (call $wide_to_ansi (local.get $src) (local.get $asrc)
+      (i32.add (i32.shl (local.get $wlen) (i32.const 1)) (i32.const 1))))
+    (local.set $areq (call $env_expand_a (local.get $asrc) (i32.const 0) (i32.const 0)))
+    (local.set $abuf (call $heap_alloc (i32.add (local.get $areq) (i32.const 1))))
+    (local.set $wtmp (call $heap_alloc (i32.shl (i32.add (local.get $areq) (i32.const 1)) (i32.const 1))))
+    (if (i32.or (i32.eqz (local.get $areq))
+          (i32.or (i32.eqz (local.get $abuf)) (i32.eqz (local.get $wtmp)))) (then
+      (call $heap_free (local.get $asrc))
+      (if (local.get $abuf) (then (call $heap_free (local.get $abuf))))
+      (if (local.get $wtmp) (then (call $heap_free (local.get $wtmp))))
+      (return (i32.const 0))))
+    (drop (call $env_expand_a (local.get $asrc) (local.get $abuf) (local.get $areq)))
+    (local.set $required (i32.add (call $ansi_to_wide (local.get $abuf) (local.get $wtmp)
+      (i32.add (local.get $areq) (i32.const 1))) (i32.const 1)))
+    (if (i32.and (i32.ne (local.get $dst) (i32.const 0))
+                 (i32.ge_u (local.get $size) (local.get $required)))
+      (then (drop (call $ansi_to_wide (local.get $abuf) (local.get $dst) (local.get $required)))))
+    (call $heap_free (local.get $wtmp))
+    (call $heap_free (local.get $abuf))
+    (call $heap_free (local.get $asrc))
+    (local.get $required))
+
+  ;; ExpandEnvironmentStrings entry shared by both spellings.
+  (func $env_expand (param $src i32) (param $dst i32) (param $size i32) (param $wide i32) (result i32)
+    (if (result i32) (local.get $wide)
+      (then (call $env_expand_w (local.get $src) (local.get $dst) (local.get $size)))
+      (else (call $env_expand_a (local.get $src) (local.get $dst) (local.get $size)))))
 
   ;; SetEnvironmentVariable: replaces or removes one entry. A NULL value
   ;; deletes. Returns TRUE unless the block has no room left.

@@ -5,19 +5,19 @@
     ;; Ordinary filesystem reads keep the signed import count; negative
     ;; counts copy no bytes. Positioned reads explicitly normalize to uint32.
     (if (i32.gt_s (local.get $a2) (i32.const 0)) (then
-      (call $d3dim_host_write_fence (local.get $a1) (local.get $a2))))
-    (if (local.get $a3) (then (call $d3dim_host_write_fence (local.get $a3) (i32.const 4))))
+      (call $gps_lazy_host_write_fence (local.get $a1) (local.get $a2))))
+    (if (local.get $a3) (then (call $gps_lazy_host_write_fence (local.get $a3) (i32.const 4))))
     (call $host_fs_read_file_owned (local.get $a0) (local.get $a1) (local.get $a2) (local.get $a3) (global.get $current_thread_id)))
   (func $host_fs_read_file_at (param $a0 i32) (param $a1 i32) (param $a2 i32) (param $a3 i32) (param $a4 i32) (param $a5 i32) (result i32)
-    (call $d3dim_host_write_fence (local.get $a1) (local.get $a2))
-    (if (local.get $a3) (then (call $d3dim_host_write_fence (local.get $a3) (i32.const 4))))
+    (call $gps_lazy_host_write_fence (local.get $a1) (local.get $a2))
+    (if (local.get $a3) (then (call $gps_lazy_host_write_fence (local.get $a3) (i32.const 4))))
     (call $host_fs_read_file_at_owned (local.get $a0) (local.get $a1) (local.get $a2) (local.get $a3) (local.get $a4) (local.get $a5) (global.get $current_thread_id)))
   (func $host_fs_read_pending  (result i32)
     (call $host_fs_read_pending_owned  (global.get $current_thread_id)))
   (func $host_fs_read_file_result (param $a0 i32) (param $a1 i32) (param $a2 i32) (param $a3 i32) (result i32)
     (if (i32.gt_s (local.get $a2) (i32.const 0)) (then
-      (call $d3dim_host_write_fence (local.get $a1) (local.get $a2))))
-    (if (local.get $a3) (then (call $d3dim_host_write_fence (local.get $a3) (i32.const 4))))
+      (call $gps_lazy_host_write_fence (local.get $a1) (local.get $a2))))
+    (if (local.get $a3) (then (call $gps_lazy_host_write_fence (local.get $a3) (i32.const 4))))
     (call $host_fs_read_file_result_owned (local.get $a0) (local.get $a1) (local.get $a2) (local.get $a3) (global.get $current_thread_id)))
   (func $host_fs_map_view_of_file (param $a0 i32) (param $a1 i32) (param $a2 i32) (param $a3 i32) (param $a4 i32) (result i32)
     (call $host_fs_map_view_of_file_owned (local.get $a0) (local.get $a1) (local.get $a2) (local.get $a3) (local.get $a4) (global.get $current_thread_id)))
@@ -66,8 +66,16 @@
   ;; ExpandEnvironmentStringsA(lpSrc, lpDst, nSize) -> required chars,
   ;; including the terminating NUL. Unknown variables remain verbatim.
   (func $handle_ExpandEnvironmentStringsA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (i32.store offset=0 (global.get $reg_base) (call $env_expand_a
-      (local.get $arg0) (local.get $arg1) (local.get $arg2)))
+    (i32.store offset=0 (global.get $reg_base) (call $env_expand
+      (local.get $arg0) (local.get $arg1) (local.get $arg2) (i32.const 0)))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))
+  )
+
+  ;; ExpandEnvironmentStringsW(lpSrc, lpDst, nSize WCHARs): same contract in
+  ;; WCHARs (GameMaker:Studio's runner expands its save-path template).
+  (func $handle_ExpandEnvironmentStringsW (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (i32.store offset=0 (global.get $reg_base) (call $env_expand
+      (local.get $arg0) (local.get $arg1) (local.get $arg2) (i32.const 1)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))
   )
 
@@ -78,26 +86,25 @@
   ;; winver uses GetVersion format: high word = build (bit 31: set=Win9x, clear=NT)
   ;; low word = (minor<<8)|major
   (func $version_info (param $out_g i32)
-    (local $w0 i32)
-    (local.set $w0 (call $g2w (local.get $out_g)))
+    ;; Translate each guest field, including DWORDs split across backing pages.
     ;; dwMajorVersion at +4
-    (i32.store (i32.add (local.get $w0) (i32.const 4))
+    (call $gs32 (i32.add (local.get $out_g) (i32.const 4))
       (i32.and (global.get $winver) (i32.const 0xFF)))
     ;; dwMinorVersion at +8
-    (i32.store (i32.add (local.get $w0) (i32.const 8))
+    (call $gs32 (i32.add (local.get $out_g) (i32.const 8))
       (i32.and (i32.shr_u (global.get $winver) (i32.const 8)) (i32.const 0xFF)))
     ;; dwBuildNumber at +12 (bits 16-30, mask off platform bit)
-    (i32.store (i32.add (local.get $w0) (i32.const 12))
+    (call $gs32 (i32.add (local.get $out_g) (i32.const 12))
       (i32.and (i32.shr_u (global.get $winver) (i32.const 16)) (i32.const 0x7FFF)))
     ;; dwPlatformId at +16: bit 31 set = Win9x (1), clear = NT (2)
-    (i32.store (i32.add (local.get $w0) (i32.const 16))
+    (call $gs32 (i32.add (local.get $out_g) (i32.const 16))
       (if (result i32) (i32.and (global.get $winver) (i32.const 0x80000000))
         (then (i32.const 1))    ;; VER_PLATFORM_WIN32_WINDOWS
         (else (i32.const 2))))  ;; VER_PLATFORM_WIN32_NT
     ;; szCSDVersion at +20: empty string. Two zero bytes terminate it whether
     ;; the caller reads it as CHAR or WCHAR.
-    (i32.store8 (i32.add (local.get $w0) (i32.const 20)) (i32.const 0))
-    (i32.store8 (i32.add (local.get $w0) (i32.const 21)) (i32.const 0)))
+    (call $gs8 (i32.add (local.get $out_g) (i32.const 20)) (i32.const 0))
+    (call $gs8 (i32.add (local.get $out_g) (i32.const 21)) (i32.const 0)))
 
   ;; 472: GetVersionExA — fill OSVERSIONINFOA (148 bytes min) from $winver
   (func $handle_GetVersionExA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
@@ -482,7 +489,7 @@
   ;; sector per cluster, nothing free, and the disc's own block count — because
   ;; era CD checks read exactly these numbers (Diablo XOR-folds BytesPerSector
   ;; with the drive type and the filesystem name and compares the fold against
-  ;; a constant, so 512-byte sectors here read as "not a CD"). Anything else is
+  ;; a constant, so 512-byte sectors here read as "not a CD"). Other valid media use
   ;; the fixed disk: just under 1GB free of just under 2GB at 8 sectors/cluster,
   ;; 512 bytes/sector. Keep both byte products below INT32_MAX: some Win95-era
   ;; installers multiply this legacy geometry with signed 32-bit arithmetic.
@@ -508,10 +515,28 @@
         (if (local.get $free) (then (call $gs32 (local.get $free) (i32.const 262143))))
         (if (local.get $total) (then (call $gs32 (local.get $total) (i32.const 524287)))))))
 
+  (func $disk_path_valid (param $root i32) (param $wide i32) (param $directory i32) (result i32)
+    (local $error i32)
+    (local.set $error (call $host_fs_disk_path_error
+      (if (result i32) (local.get $root)
+        (then (call $g2w (local.get $root))) (else (i32.const 0)))
+      (local.get $wide) (local.get $directory)))
+    (if (local.get $error)
+      (then (global.set $last_error (local.get $error)) (return (i32.const 0))))
+    (i32.const 1))
+
+  (func $disk_free_space_checked (param $root i32) (param $spc i32) (param $bps i32)
+      (param $free i32) (param $total i32) (param $wide i32) (result i32)
+    (if (i32.eqz (call $disk_path_valid (local.get $root) (local.get $wide) (i32.const 0)))
+      (then (return (i32.const 0))))
+    (call $disk_free_space (local.get $root) (local.get $spc) (local.get $bps)
+      (local.get $free) (local.get $total) (local.get $wide))
+    (i32.const 1))
+
   (func $handle_GetDiskFreeSpaceA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (call $disk_free_space (local.get $arg0) (local.get $arg1) (local.get $arg2)
-      (local.get $arg3) (local.get $arg4) (i32.const 0))
-    (i32.store offset=0 (global.get $reg_base) (i32.const 1))
+    (i32.store offset=0 (global.get $reg_base) (call $disk_free_space_checked
+      (local.get $arg0) (local.get $arg1) (local.get $arg2)
+      (local.get $arg3) (local.get $arg4) (i32.const 0)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24)))  ;; stdcall, 5 args
   )
 
@@ -525,6 +550,8 @@
   (func $disk_free_space_ex (param $dir i32) (param $avail i32) (param $total_out i32)
                             (param $free_out i32) (param $wide i32) (result i32)
     (local $geo i32) (local $unit i64) (local $free i64) (local $total i64)
+    (if (i32.eqz (call $disk_path_valid (local.get $dir) (local.get $wide) (i32.const 1)))
+      (then (return (i32.const 0))))
     (local.set $geo (call $heap_alloc (i32.const 16)))
     (if (i32.eqz (local.get $geo))
       (then
@@ -572,7 +599,7 @@
   (func $logical_drive_strings
         (param $length i32) (param $buffer_g i32) (param $wide i32) (result i32)
     (local $mask i32) (local $letter i32) (local $count i32)
-    (local $required i32) (local $buf i32) (local $out i32) (local $stride i32)
+    (local $required i32) (local $out i32) (local $stride i32)
     (local.set $mask (call $host_fs_logical_drive_mask))
     (local.set $letter (i32.const 0))
     (block $count_done (loop $count_loop
@@ -588,7 +615,6 @@
       (then
         (global.set $last_error (i32.const 87)) ;; ERROR_INVALID_PARAMETER
         (return (i32.const 0))))
-    (local.set $buf (call $g2w (local.get $buffer_g)))
     (local.set $stride (select (i32.const 2) (i32.const 1) (local.get $wide)))
     (local.set $letter (i32.const 0))
     (block $write_done (loop $write_loop
@@ -597,23 +623,23 @@
         (then
           (if (local.get $wide)
             (then
-              (i32.store16 (i32.add (local.get $buf) (local.get $out))
+              (call $gs16 (i32.add (local.get $buffer_g) (local.get $out))
                 (i32.add (i32.const 0x41) (local.get $letter)))
-              (i32.store16 (i32.add (local.get $buf) (i32.add (local.get $out) (i32.const 2))) (i32.const 0x3A))
-              (i32.store16 (i32.add (local.get $buf) (i32.add (local.get $out) (i32.const 4))) (i32.const 0x5C))
-              (i32.store16 (i32.add (local.get $buf) (i32.add (local.get $out) (i32.const 6))) (i32.const 0)))
+              (call $gs16 (i32.add (local.get $buffer_g) (i32.add (local.get $out) (i32.const 2))) (i32.const 0x3A))
+              (call $gs16 (i32.add (local.get $buffer_g) (i32.add (local.get $out) (i32.const 4))) (i32.const 0x5C))
+              (call $gs16 (i32.add (local.get $buffer_g) (i32.add (local.get $out) (i32.const 6))) (i32.const 0)))
             (else
-              (i32.store8 (i32.add (local.get $buf) (local.get $out))
+              (call $gs8 (i32.add (local.get $buffer_g) (local.get $out))
                 (i32.add (i32.const 0x41) (local.get $letter)))
-              (i32.store8 (i32.add (local.get $buf) (i32.add (local.get $out) (i32.const 1))) (i32.const 0x3A))
-              (i32.store8 (i32.add (local.get $buf) (i32.add (local.get $out) (i32.const 2))) (i32.const 0x5C))
-              (i32.store8 (i32.add (local.get $buf) (i32.add (local.get $out) (i32.const 3))) (i32.const 0))))
+              (call $gs8 (i32.add (local.get $buffer_g) (i32.add (local.get $out) (i32.const 1))) (i32.const 0x3A))
+              (call $gs8 (i32.add (local.get $buffer_g) (i32.add (local.get $out) (i32.const 2))) (i32.const 0x5C))
+              (call $gs8 (i32.add (local.get $buffer_g) (i32.add (local.get $out) (i32.const 3))) (i32.const 0))))
           (local.set $out (i32.add (local.get $out) (i32.mul (i32.const 4) (local.get $stride))))))
       (local.set $letter (i32.add (local.get $letter) (i32.const 1)))
       (br $write_loop)))
     (if (local.get $wide)
-      (then (i32.store16 (i32.add (local.get $buf) (local.get $out)) (i32.const 0)))
-      (else (i32.store8 (i32.add (local.get $buf) (local.get $out)) (i32.const 0))))
+      (then (call $gs16 (i32.add (local.get $buffer_g) (local.get $out)) (i32.const 0)))
+      (else (call $gs8 (i32.add (local.get $buffer_g) (local.get $out)) (i32.const 0))))
     (i32.sub (local.get $required) (i32.const 1)))
 
   (func $handle_GetLogicalDriveStringsA (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
@@ -774,6 +800,22 @@
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
   )
 
+  ;; GetKeyboardLayoutNameW(pwszKLID) — widen the existing US KLID including NUL.
+  (func $handle_GetKeyboardLayoutNameW (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $i i32)
+    (call $handle_GetKeyboardLayoutNameA (local.get $arg0) (local.get $arg1) (local.get $arg2) (local.get $arg3) (local.get $arg4) (local.get $name_ptr))
+    ;; A owns the BOOL result, NULL compatibility and one-argument stack cleanup.
+    (if (i32.load (global.get $reg_base))
+      (then
+        ;; Work backwards so expansion never overwrites an unread ANSI byte.
+        (local.set $i (i32.const 9))
+        (loop $widen_klid
+          (local.set $i (i32.sub (local.get $i) (i32.const 1)))
+          (call $gs16 (i32.add (local.get $arg0) (i32.shl (local.get $i) (i32.const 1)))
+            (call $gl8 (i32.add (local.get $arg0) (local.get $i))))
+          (br_if $widen_klid (local.get $i)))))
+  )
+
   ;; GetKeyboardLayoutList(nBuff, lpList) — report one layout (US English).
   ;; If lpList non-NULL and nBuff>=1, write HKL 0x04090409. Return total count (1).
   (func $handle_GetKeyboardLayoutList (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
@@ -871,6 +913,38 @@
     (i32.store offset=0 (global.get $reg_base) (call $drive_type (local.get $arg0) (i32.const 0)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))  ;; stdcall, 1 arg
   )
+
+  ;; EncodePointer/DecodePointer treat every DWORD, including NULL and -1, as
+  ;; opaque bits. No guest address translation or pointer dereference occurs.
+  ;; This is a reversible process-specific obfuscation, not Windows' private
+  ;; bit representation or a claim of equivalent security against the host.
+  (global $POINTER_SECRET i32 (region.addr $POINTER_SECRET 0))
+  (global $POINTER_SECRET_SIZE i32 (region.size $POINTER_SECRET))
+  (func $pointer_secret (result i32)
+    (local $key i32) (local $candidate i32)
+    (local.set $key (i32.atomic.load (region.addr $POINTER_SECRET 0)))
+    (if (local.get $key) (then (return (local.get $key))))
+    (loop $sample
+      (local.set $candidate (call $host_entropy_u32))
+      (br_if $sample (i32.eqz (local.get $candidate))))
+    (local.set $key (i32.atomic.rmw.cmpxchg (region.addr $POINTER_SECRET 0)
+      (i32.const 0) (local.get $candidate)))
+    (if (i32.eqz (local.get $key)) (then (local.set $key (local.get $candidate))))
+    (local.get $key))
+
+  (func $handle_EncodePointer (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $key i32)
+    (local.set $key (call $pointer_secret))
+    (i32.store offset=0 (global.get $reg_base)
+      (i32.rotr (i32.xor (local.get $arg0) (local.get $key)) (local.get $key)))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8))))
+
+  (func $handle_DecodePointer (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+    (local $key i32)
+    (local.set $key (call $pointer_secret))
+    (i32.store offset=0 (global.get $reg_base)
+      (i32.xor (i32.rotl (local.get $arg0) (local.get $key)) (local.get $key)))
+    (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8))))
 
   ;; 491: GetCurrentProcessId — return this emulated process's stable PID
   (func $handle_GetCurrentProcessId (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
@@ -1420,6 +1494,8 @@
   ;; deliberately never changes last error, on either success or failure.
   (func $handle_HeapValidate (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
     (local $valid i32)
+    (if (call $shared_heap_handle (local.get $arg0)) (then
+      (call $toolhelp_return (call $host_shared_heap (i32.const 7) (local.get $arg0) (local.get $arg1) (local.get $arg2) (i32.const 0)) (i32.const 3)) (return)))
     (block $done
       (br_if $done
         (i32.ne (i32.and (local.get $arg1) (i32.const -2)) (i32.const 0)))
@@ -2628,10 +2704,10 @@
     (local.set $end (call $dll_retired_reservation_end (local.get $page)))
     (if (local.get $end)
       (then
-        (memory.fill (local.get $buf) (i32.const 0) (i32.const 28))
-        (i32.store (local.get $buf) (local.get $page))
-        (i32.store offset=12 (local.get $buf) (i32.sub (local.get $end) (local.get $page)))
-        (i32.store offset=16 (local.get $buf) (i32.const 0x10000))
+        (call $guest_memset (local.get $arg1) (i32.const 0) (i32.const 28))
+        (call $gs32 (local.get $arg1) (local.get $page))
+        (call $gs32 (i32.add (local.get $arg1) (i32.const 12)) (i32.sub (local.get $end) (local.get $page)))
+        (call $gs32 (i32.add (local.get $arg1) (i32.const 16)) (i32.const 0x10000))
         (i32.store (global.get $reg_base) (i32.const 28))
         (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))
         (return)))
@@ -2658,7 +2734,7 @@
         ;; section-specific current protection.
         (local.set $allocation_protect (i32.const 0x80)) ;; PAGE_EXECUTE_WRITECOPY
         (local.set $state (i32.const 0x1000)) ;; MEM_COMMIT
-        (i32.store offset=24 (local.get $buf) (i32.const 0x01000000))) ;; MEM_IMAGE
+        (call $gs32 (i32.add (local.get $arg1) (i32.const 24)) (i32.const 0x01000000))) ;; MEM_IMAGE
       (else
         (local.set $allocation_base
           (call $virtual_query_sparse_base (local.get $page)))
@@ -2703,7 +2779,7 @@
               (br $sparse_pages)))
             (local.set $end (select (local.get $next) (local.get $end)
               (i32.lt_u (local.get $next) (local.get $end))))
-            (i32.store offset=24 (local.get $buf) (i32.const 0x00020000))) ;; MEM_PRIVATE
+            (call $gs32 (i32.add (local.get $arg1) (i32.const 24)) (i32.const 0x00020000))) ;; MEM_PRIVATE
           (else
             (local.set $direct_start
               (i32.sub (global.get $image_base) (global.get $GUEST_BASE)))
@@ -2721,7 +2797,7 @@
                 (local.set $allocation_protect (i32.const 0x04))
                 (local.set $state (i32.const 0x1000))
                 (local.set $end (local.get $direct_end))
-                (i32.store offset=24 (local.get $buf) (i32.const 0x00020000)))
+                (call $gs32 (i32.add (local.get $arg1) (i32.const 24)) (i32.const 0x00020000)))
               (else
                 (local.set $end
                   (call $virtual_query_next_allocation (local.get $page)))
@@ -2731,13 +2807,13 @@
                 (local.set $allocation_protect (i32.const 0))
                 (local.set $state (i32.const 0x10000)) ;; MEM_FREE
                 (local.set $protect (i32.const 0))
-                (i32.store offset=24 (local.get $buf) (i32.const 0))))))))
-    (i32.store (local.get $buf) (local.get $page))
-    (i32.store offset=4 (local.get $buf) (local.get $allocation_base))
-    (i32.store offset=8 (local.get $buf) (local.get $allocation_protect))
-    (i32.store offset=12 (local.get $buf) (i32.sub (local.get $end) (local.get $page)))
-    (i32.store offset=16 (local.get $buf) (local.get $state))
-    (i32.store offset=20 (local.get $buf) (local.get $protect))
+                (call $gs32 (i32.add (local.get $arg1) (i32.const 24)) (i32.const 0))))))))
+    (call $gs32 (local.get $arg1) (local.get $page))
+    (call $gs32 (i32.add (local.get $arg1) (i32.const 4)) (local.get $allocation_base))
+    (call $gs32 (i32.add (local.get $arg1) (i32.const 8)) (local.get $allocation_protect))
+    (call $gs32 (i32.add (local.get $arg1) (i32.const 12)) (i32.sub (local.get $end) (local.get $page)))
+    (call $gs32 (i32.add (local.get $arg1) (i32.const 16)) (local.get $state))
+    (call $gs32 (i32.add (local.get $arg1) (i32.const 20)) (local.get $protect))
     (i32.store offset=0 (global.get $reg_base) (i32.const 28))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))))
 
@@ -2875,9 +2951,9 @@
   ;; returns is a number written through a caller pointer; only the root
   ;; string's encoding differs, and $disk_free_space takes that as a flag.
   (func $handle_GetDiskFreeSpaceW (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
-    (call $disk_free_space (local.get $arg0) (local.get $arg1) (local.get $arg2)
-      (local.get $arg3) (local.get $arg4) (i32.const 1))
-    (i32.store offset=0 (global.get $reg_base) (i32.const 1))
+    (i32.store offset=0 (global.get $reg_base) (call $disk_free_space_checked
+      (local.get $arg0) (local.get $arg1) (local.get $arg2)
+      (local.get $arg3) (local.get $arg4) (i32.const 1)))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24)))  ;; stdcall, 5 args
   )
 

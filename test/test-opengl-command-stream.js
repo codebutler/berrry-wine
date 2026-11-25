@@ -5,7 +5,6 @@ const assert = require('assert');
 const vm = require('vm');
 const Stream = require('./helpers/gl-reference-encoder');
 const RPC = require('../lib/guest-rpc');
-const { OpenGLHostBridge } = require('../lib/gl-compat');
 
 const memory = new ArrayBuffer(64 * 1024);
 const dv = new DataView(memory);
@@ -82,7 +81,9 @@ const submit = batch => {
       opcode, aux, capture,
       arg0: stackView.getUint32(capture.stackOffset + 4, true),
     });
-    return opcode === 12 ? 0x504 : 0;
+    // glIsList (129): a synchronous barrier. glGetError (12) was used here
+    // until GPU stream v2 G1 answered it in WAT, where it is never a record.
+    return opcode === 129 ? 0x504 : 0;
   });
 };
 
@@ -102,8 +103,8 @@ dv.setUint32(stack + 4, 0x0BE2, true);
 encoder.call(10, stack, 0); // glEnable
 dv.setUint32(stack + 4, 0x0B71, true);
 assert.strictEqual(submissions.length, 0, 'ordinary GL calls stay local until a barrier');
-assert.strictEqual(encoder.call(12, stack, 0), 0x504, 'query returns the last replay result');
-assert.deepStrictEqual(executed.map(x => x.opcode), [10, 12], 'barrier preserves command order');
+assert.strictEqual(encoder.call(129, stack, 0), 0x504, 'query returns the last replay result');
+assert.deepStrictEqual(executed.map(x => x.opcode), [10, 129], 'barrier preserves command order');
 assert.strictEqual(executed[0].arg0, 0x0BE2, 'queued stack arguments are copied immediately');
 
 // Newly appended GL entry points retain the established opcode ABI and copy
@@ -298,55 +299,32 @@ assert.strictEqual(borrowed.pointerOffset, 0, 'texture bytes are not copied into
 assert.strictEqual(borrowed.pointerLength, textureBytes);
 assert(borrowed.stackBytes + Stream.HEADER_BYTES < 128,
   'large upload batch contains only command metadata and arguments');
+// G2: the canonical finished-RGBA8 upload (158 _glTexImage2D) carries tight
+// RGBA8 rows on the stream. (Host replay into the retired JS GL frontend,
+// with its raw-45 refusal and per-owner current context, went with
+// lib/gl-compat.js: WAT owns WGL and executes its own records.)
 let replayPixels = null;
-const bridge = new OpenGLHostBridge({
-  getMemory: () => memory,
-  exports: { guest_to_wasm: pointer => pointer },
-});
-assert.strictEqual(bridge._dv(), bridge._dv(),
-  'host replay reuses one DataView for fixed guest memory');
-bridge.current = 1;
-bridge.contexts.set(1, {
-  frontend: {
-    gl: {},
-    texImage(_level, _internal, _width, _height, _border, _format, _type, pixels) {
-      replayPixels = pixels;
-    },
-  },
-});
-const bridgeEncoder = new Stream.Encoder({
+const uploadBatches = [];
+const uploadEncoder = new Stream.Encoder({
   getMemory: () => memory,
   guestToWasm: pointer => pointer,
   shared: false,
-  submit: batch => bridge.replay(batch),
+  submit: batch => { uploadBatches.push({ ...batch }); return 0; },
 });
-bridgeEncoder.call(45, stack, 0);
-assert.strictEqual(replayPixels.buffer, memory,
-  'GL frontend receives a view of guest memory, not a copied texture payload');
-assert.strictEqual(replayPixels.byteOffset, texture);
-
-// A buffered stream can outlive another guest thread's wglMakeCurrent call.
-// Replay therefore resolves the current context by originating Worker slot.
-const ownerCalls = [];
-const ownerBridge = new OpenGLHostBridge({ getMemory: () => memory, exports: {} });
-ownerBridge.contexts.set(11, { frontend: { gl: {}, setEnabled: value => ownerCalls.push(['a', value]) } });
-ownerBridge.contexts.set(22, { frontend: { gl: {}, setEnabled: value => ownerCalls.push(['b', value]) } });
-ownerBridge.currentByOwner.set(1, 11);
-ownerBridge.currentByOwner.set(2, 22);
-dv.setUint32(stack + 4, 0x0BE2, true);
-const ownerBatches = [];
-const ownerEncoder = new Stream.Encoder({
-  getMemory: () => memory,
-  guestToWasm: pointer => pointer,
-  shared: false,
-  submit: batch => { ownerBatches.push({ ...batch }); return 0; },
+dv.setUint32(stack + 4 + 3 * 4, 16, true);
+dv.setUint32(stack + 4 + 4 * 4, 16, true);
+uploadEncoder.call(158, stack, 0);
+uploadEncoder.flush();
+Stream.replay(uploadBatches[0], (code, _aux, capture) => {
+  if (code !== 158) return 0;
+  const pointer = new DataView(capture.buffer, capture.stackOffset).getUint32(4 + 8 * 4, true);
+  replayPixels = capture.pointerGuest === pointer && !capture.pointerBorrowed && capture.pointerOffset
+    ? new Uint8Array(capture.buffer, capture.pointerOffset, 16 * 16 * 4)
+    : new Uint8Array(memory, pointer, 16 * 16 * 4);
+  return 0;
 });
-ownerEncoder.call(10, stack, 0);
-ownerEncoder.flush();
-ownerBridge.replay(ownerBatches[0], 2);
-ownerBridge.replay(ownerBatches[0], 1);
-assert.deepStrictEqual(ownerCalls, [['b', 0x0BE2], ['a', 0x0BE2]],
-  'batch replay retains per-thread WGL current-context ownership');
+assert.strictEqual(replayPixels.length, 16 * 16 * 4, 'canonical upload carries tight RGBA8 rows');
+assert(replayPixels.every(b => b === 0xA7), 'canonical upload carries the guest texels');
 
 // Pin the Worker-side protocol endpoint independently of WebGL: one pending
 // RPC status is acknowledged only after the whole batch has replayed.
@@ -366,7 +344,7 @@ const brokerEncoder = new Stream.Encoder({
   submit: batch => { brokerBatch = batch; return 0; },
 });
 brokerEncoder.call(10, stack, 0);
-brokerEncoder.call(12, stack, 0);
+brokerEncoder.call(129, stack, 0);
 Atomics.store(rpcView, RPC.SLOT.STATUS, RPC.STATUS_REQ);
 const brokerOffset = 0x10000;
 new Uint8Array(rpcMemory.buffer, brokerOffset, brokerBatch.bytes)
@@ -374,7 +352,7 @@ new Uint8Array(rpcMemory.buffer, brokerOffset, brokerBatch.bytes)
 assert.strictEqual(broker.serveGlBatch({
   slot: 0, memoryOffset: brokerOffset, bytes: brokerBatch.bytes,
 }), true);
-assert.deepStrictEqual(brokerOps, [10, 12], 'main broker replays one ordered GL batch');
+assert.deepStrictEqual(brokerOps, [10, 129], 'main broker replays one ordered GL batch');
 assert.strictEqual(Atomics.load(rpcView, RPC.SLOT.RESULT), 77);
 assert.strictEqual(Atomics.load(rpcView, RPC.SLOT.STATUS), RPC.STATUS_RESP,
   'worker is acknowledged only after replay completes');
@@ -389,8 +367,8 @@ const nativeMessages = [], nativeOps = [];
 const nativeBroker = RPC.createMainBroker(rpcMemory, {
   gpu_gl_batch: (batch, owner) => {
     assert.strictEqual(owner, 0);
-    assert.deepStrictEqual(batch, { memoryOffset: nativeOffset, bytes: brokerBatch.bytes,
-      softwareFront: 0 }, 'no software front buffer without a gl_sw_front export');
+    assert.deepStrictEqual(batch, { memoryOffset: nativeOffset, bytes: brokerBatch.bytes },
+      'the broker forwards only the shared-memory range');
     assert.strictEqual(Atomics.load(rpcView, RPC.SLOT.STATUS), RPC.STATUS_REQ);
     return Stream.replay(Stream.memoryBatch(rpcMemory, batch.memoryOffset, batch.bytes),
       (opcode, _aux, capture) => {
@@ -409,57 +387,12 @@ const nativeWorker = RPC.createWorkerImports(rpcMemory, {
 }, {});
 assert.strictEqual(nativeWorker.imports.host.gpu_gl_call(Stream.WAT_STREAM_FLUSH_OPCODE,
   nativeOffset, brokerBatch.bytes), 91);
-assert.deepStrictEqual(nativeOps, [10, 12]);
+assert.deepStrictEqual(nativeOps, [10, 129]);
 assert.deepStrictEqual(nativeMessages, [{ t: 'glBatch', slot: 0,
-  memoryOffset: nativeOffset, bytes: brokerBatch.bytes, softwareFront: 0,
-  softwareConfig: undefined, pool: undefined }],
-  "without pool exports the worker sends an undefined descriptor; the broker omits it");
+  memoryOffset: nativeOffset, bytes: brokerBatch.bytes }],
+  "the worker sends only the batch's shared-memory range");
 assert.strictEqual(new DataView(rpcMemory.buffer).getUint32(nativeOffset - 4, true), 123);
 assert.strictEqual(Atomics.load(rpcView, RPC.SLOT.STATUS), RPC.STATUS_IDLE);
-
-// Pool metadata is optional transport information, independent of command replay.
-// A supported native pool advertises all three ranges; old/disabled producers
-// still submit the same shared-memory batch without a descriptor at the broker.
-const nativePool = { version: 1, capacity: 4096,
-  offsets: [nativeOffset, nativeOffset + 4096, nativeOffset + 8192] };
-for (const [version, thirdBase, expectedPool] of [
-  [1, nativePool.offsets[2], nativePool],
-  [2, nativePool.offsets[2], undefined],
-  [1, 0, undefined],
-]) {
-  const poolMessages = [], poolOps = [];
-  let receivedBatch;
-  const poolBroker = RPC.createMainBroker(rpcMemory, {
-    gpu_gl_batch: batch => {
-      receivedBatch = batch;
-      return Stream.replay(Stream.memoryBatch(rpcMemory, batch.memoryOffset, batch.bytes),
-        opcode => { poolOps.push(opcode); return 91; });
-    },
-  }, {});
-  const poolWorker = RPC.createWorkerImports(rpcMemory, {
-    gpu_gl_call: { params: ['i32', 'i32', 'i32'], results: ['i32'] },
-  }, message => {
-    poolMessages.push(message);
-    poolBroker.serveGlBatch(message);
-  }, { getExports: () => ({
-    gl_wat_stream_pool_version: () => version,
-    gl_wat_stream_pool_base: i => i === 2 ? thirdBase : nativePool.offsets[i],
-    gl_wat_stream_capacity: () => nativePool.capacity,
-  }) });
-  assert.strictEqual(poolWorker.imports.host.gpu_gl_call(Stream.WAT_STREAM_FLUSH_OPCODE,
-    nativeOffset, brokerBatch.bytes), 91);
-  assert.deepStrictEqual(poolMessages, [{ t: 'glBatch', slot: 0,
-    memoryOffset: nativeOffset, bytes: brokerBatch.bytes, softwareFront: 0,
-    softwareConfig: undefined, pool: expectedPool }],
-    "only supported, enabled native pools are advertised by the worker");
-  const expectedBatch = { memoryOffset: nativeOffset, bytes: brokerBatch.bytes,
-    softwareFront: 0 };
-  if (expectedPool) expectedBatch.pool = expectedPool;
-  assert.deepStrictEqual(receivedBatch, expectedBatch,
-    "the broker forwards a present descriptor and omits an unavailable pool");
-  assert.deepStrictEqual(poolOps, [10, 12], "pool metadata preserves ordered replay");
-  assert.strictEqual(Atomics.load(rpcView, RPC.SLOT.STATUS), RPC.STATUS_IDLE);
-}
 
 // A query that writes into guest memory has to have written it by the time the
 // call returns, because the guest's very next instruction may read it. Warcraft
@@ -477,9 +410,11 @@ const queryEncoder = new Stream.Encoder({
 });
 queryEncoder.call(10, stack, 0);           // glEnable: buffered
 assert.strictEqual(querySubmissions.length, 0, 'ordinary state calls stay buffered');
-queryEncoder.call(103, stack, 0);          // glGetIntegerv: must submit now
+queryEncoder.call(74, stack, 0);           // glGenTextures: must submit now
 assert.deepStrictEqual(querySubmissions, [2],
-  'glGetIntegerv flushes the pending batch so its answer is in guest memory on return');
-assert(Stream.BARRIERS.has(103), 'glGetIntegerv is a command-stream barrier');
+  'a guest-output call flushes the pending batch so its answer is in guest memory on return');
+// GPU stream v2 G1: glGetIntegerv is answered in WAT before anything is
+// recorded, so the answer is in guest memory on return with no barrier.
+assert(!Stream.BARRIERS.has(103), 'glGetIntegerv is answered in WAT, not a stream barrier');
 
 console.log('PASS buffered OpenGL ordering, overflow, barriers, and zero-copy textures');

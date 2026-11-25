@@ -5312,10 +5312,31 @@
   ;; activation, and close/switch behavior.
   (func $menu_handle_mouse_open (export "menu_handle_mouse_open")
         (param $sx i32) (param $sy i32) (result i32)
+    (i32.ne (call $menu_handle_mouse_open_result (local.get $sx) (local.get $sy)) (i32.const 0)))
+
+  ;; Separate tracking from command selection. Low bits: 0 declined, 1
+  ;; tracking/cancellation, 2 command selected; upper bits carry the command.
+  ;; This is a synchronous tracker result, never a client mouse MSG receipt.
+  (func $menu_handle_mouse_open_result
+        (param $sx i32) (param $sy i32) (result i32)
+    (local $hwnd i32) (local $generation i64) (local $result i32)
+    (local.set $hwnd (call $menu_open_hwnd_get))
+    (local.set $generation (call $wnd_lookup_generation (local.get $hwnd)))
+    (local.set $result (call $menu_handle_mouse_open_impl (local.get $sx) (local.get $sy)))
+    (if (local.get $result) (then
+      (call $menu_pointer_record (local.get $hwnd) (local.get $generation)
+        (local.get $sx) (local.get $sy)
+        (select (i32.const 2) (i32.const 3)
+          (i32.eq (i32.and (local.get $result) (i32.const 3)) (i32.const 2)))
+        (i32.shr_u (local.get $result) (i32.const 2)))))
+    (local.get $result))
+
+  (func $menu_handle_mouse_open_impl
+        (param $sx i32) (param $sy i32) (result i32)
     (local $hwnd i32) (local $top i32)
     (local $bar_x i32) (local $bar_y i32) (local $bar_h i32)
     (local $dx i32) (local $dy i32) (local $idx i32)
-    (local $sdx i32) (local $sdy i32) (local $dw i32)
+    (local $sdx i32) (local $sdy i32) (local $dw i32) (local $command i32)
     (local.set $hwnd (call $menu_open_hwnd_get))
     (if (i32.eqz (local.get $hwnd)) (then (return (i32.const 0))))
     (local.set $top (call $menu_open_top_get))
@@ -5334,7 +5355,9 @@
       (then
         (call $menu_open_hover_set (local.get $idx))
         (call $menu_open_sub_hover_set (i32.const -1))
-        (drop (call $menu_activate))
+        (local.set $command (call $menu_activate))
+        (if (local.get $command) (then (return
+          (i32.or (i32.shl (local.get $command) (i32.const 2)) (i32.const 2)))))
         (return (i32.const 1))))
 
     (if (i32.ge_s (call $menu_open_hover_get) (i32.const 0))
@@ -5350,7 +5373,9 @@
         (if (i32.ge_s (local.get $idx) (i32.const 0))
           (then
             (call $menu_open_sub_hover_set (local.get $idx))
-            (drop (call $menu_activate))
+            (local.set $command (call $menu_activate))
+            (if (local.get $command) (then (return
+              (i32.or (i32.shl (local.get $command) (i32.const 2)) (i32.const 2)))))
             (return (i32.const 1))))))
 
     ;; TrackPopupMenu popups have an explicit screen anchor. They are not a
@@ -5364,7 +5389,9 @@
         (if (i32.ge_s (local.get $idx) (i32.const 0))
           (then
             (if (call $menu_activate_bar_command (local.get $hwnd) (local.get $idx))
-              (then (return (i32.const 1))))
+              (then (return (i32.or
+                (i32.shl (call $menu_bar_id (local.get $hwnd) (local.get $idx)) (i32.const 2))
+                (i32.const 2)))))
             (call $menu_open (local.get $hwnd) (local.get $idx))
             (return (i32.const 1))))))
 
@@ -5539,7 +5566,7 @@
 
   ;; Open a top-level menu item for a particular hwnd and point. Used by the
   ;; browser event shell after it has already selected the top-level window.
-  (func $menu_handle_bar_click (export "menu_handle_bar_click")
+  (func $menu_handle_bar_click_impl
         (param $hwnd i32) (param $sx i32) (param $sy i32) (result i32)
     (local $idx i32)
     (local.set $idx (call $menu_hittest_bar
@@ -5549,7 +5576,9 @@
       (local.get $sx) (local.get $sy)))
     (if (i32.lt_s (local.get $idx) (i32.const 0)) (then (return (i32.const 0))))
     (if (call $menu_activate_bar_command (local.get $hwnd) (local.get $idx))
-      (then (return (i32.const 1))))
+      (then (return (i32.or
+        (i32.shl (call $menu_bar_id (local.get $hwnd) (local.get $idx)) (i32.const 2))
+        (i32.const 2)))))
     (call $menu_open (local.get $hwnd) (local.get $idx))
     (i32.const 1))
 
@@ -6791,3 +6820,56 @@
     (i32.store offset=0 (global.get $reg_base) (call $dynamic_menu_create))
     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
   )
+
+  ;; Per-instance evidence of a completed real pointer-menu dispatch. No queued
+  ;; WM_LBUTTONDOWN is produced by USER menu tracking. Observation never pumps.
+  (global $menu_pointer_sequence (mut i64) (i64.const 0))
+  (global $menu_pointer_generation (mut i64) (i64.const 0))
+  (global $menu_pointer_hwnd (mut i32) (i32.const 0))
+  (global $menu_pointer_pid (mut i32) (i32.const 0))
+  (global $menu_pointer_tid (mut i32) (i32.const 0))
+  (global $menu_pointer_x (mut i32) (i32.const 0))
+  (global $menu_pointer_y (mut i32) (i32.const 0))
+  (global $menu_pointer_kind (mut i32) (i32.const 0))
+  (global $menu_pointer_command (mut i32) (i32.const 0))
+  (func (export "native_menu_pointer_receipt") (param $field i32) (result i64)
+    (if (i32.eq (local.get $field) (i32.const 0)) (then (return (global.get $menu_pointer_sequence))))
+    (if (i32.eq (local.get $field) (i32.const 1)) (then (return (global.get $menu_pointer_generation))))
+    (if (i32.eq (local.get $field) (i32.const 2)) (then (return (i64.extend_i32_u (global.get $menu_pointer_hwnd)))))
+    (if (i32.eq (local.get $field) (i32.const 3)) (then (return (i64.extend_i32_u (global.get $menu_pointer_pid)))))
+    (if (i32.eq (local.get $field) (i32.const 4)) (then (return (i64.extend_i32_u (global.get $menu_pointer_tid)))))
+    (if (i32.eq (local.get $field) (i32.const 5)) (then (return (i64.extend_i32_u (global.get $menu_pointer_x)))))
+    (if (i32.eq (local.get $field) (i32.const 6)) (then (return (i64.extend_i32_u (global.get $menu_pointer_y)))))
+    (if (i32.eq (local.get $field) (i32.const 7)) (then (return (i64.extend_i32_u (global.get $menu_pointer_kind)))))
+    (if (i32.eq (local.get $field) (i32.const 8)) (then (return (i64.extend_i32_u (global.get $menu_pointer_command)))))
+    (i64.const 0))
+  (func $menu_pointer_record (param $hwnd i32) (param $generation i64)
+        (param $sx i32) (param $sy i32) (param $kind i32) (param $command i32)
+    (global.set $menu_pointer_generation (local.get $generation))
+    (global.set $menu_pointer_hwnd (local.get $hwnd))
+    (global.set $menu_pointer_pid (call $current_process_id))
+    (global.set $menu_pointer_tid (call $wnd_get_thread (local.get $hwnd)))
+    (global.set $menu_pointer_x (local.get $sx))
+    (global.set $menu_pointer_y (local.get $sy))
+    (global.set $menu_pointer_kind (local.get $kind))
+    (global.set $menu_pointer_command (local.get $command))
+    (global.set $menu_pointer_sequence (i64.add (global.get $menu_pointer_sequence) (i64.const 1))))
+  (func $menu_handle_bar_click (export "menu_handle_bar_click") (param $hwnd i32) (param $sx i32) (param $sy i32) (result i32)
+    (local $generation i64) (local $pid i32) (local $tid i32) (local $handled i32)
+    (local.set $generation (call $wnd_lookup_generation (local.get $hwnd)))
+    (local.set $pid (call $current_process_id))
+    (local.set $tid (call $wnd_get_thread (local.get $hwnd)))
+    (local.set $handled (call $menu_handle_bar_click_impl (local.get $hwnd) (local.get $sx) (local.get $sy)))
+    (if (local.get $handled) (then
+      (global.set $menu_pointer_generation (local.get $generation))
+      (global.set $menu_pointer_hwnd (local.get $hwnd))
+      (global.set $menu_pointer_pid (local.get $pid))
+      (global.set $menu_pointer_tid (local.get $tid))
+      (global.set $menu_pointer_x (local.get $sx))
+      (global.set $menu_pointer_y (local.get $sy))
+      ;; Preserve the actual tracker outcome: direct bar commands select
+      ;; without opening a dropdown; MDI chrome is neither outcome.
+      (global.set $menu_pointer_kind (i32.and (local.get $handled) (i32.const 3)))
+      (global.set $menu_pointer_command (i32.shr_u (local.get $handled) (i32.const 2)))
+      (global.set $menu_pointer_sequence (i64.add (global.get $menu_pointer_sequence) (i64.const 1)))))
+    (i32.ne (local.get $handled) (i32.const 0)))

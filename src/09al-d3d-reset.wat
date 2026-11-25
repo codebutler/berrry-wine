@@ -24,13 +24,14 @@
   (local.set $state (call $d3d9_program_state (local.get $device)))
   (if (i32.eqz (local.get $state)) (then (return)))
   (local.set $old (call $g2w (local.get $state)))
+  ;; Only the creating thread owns this transaction: another thread must
+  ;; not dispose the owner's plan or change lost state.
+  (if (i32.ne (i32.load offset=21780 (local.get $old)) (global.get $current_thread_id))
+    (then (return)))
   (local.set $plan (i32.load offset=21768 (local.get $old)))
   (block $issue
-    (if (local.get $plan) (then
-      (local.set $result (call $d3d_render_poll)) (br $issue)))
     (i32.store offset=21776 (local.get $old) (i32.const 1))
-    (if (i32.or (i32.eqz (local.get $pp))
-      (i32.ne (i32.load offset=21780 (local.get $old)) (global.get $current_thread_id))) (then (return)))
+    (if (i32.eqz (local.get $pp)) (then (return)))
     (if (i32.gt_u (local.get $pp) (i32.const 0xffffffc8)) (then (return)))
     (local.set $ppwa (call $g2w (local.get $pp)))
     (if (i32.or (i32.eqz (call $d3d_shader_vm_range (local.get $ppwa) (i32.const 56)))
@@ -109,14 +110,15 @@
           (local.get $autoformat) (i32.const 0) (i32.const 0)))
         (br_if $allocation_failed (i32.eqz (i32.load offset=12 (local.get $wa))))))
       (i32.store offset=21768 (local.get $old) (local.get $plan))
-      (local.set $result (call $host_gpu_gl_call (i32.const 0x30009) (local.get $wa) (local.get $device)))
+      ;; The ring's targets are per device; $d9g_reset below drops them.
+      (local.set $result (i32.const 1))
       (br $issue))
     (call $d3d9_reset_dispose (local.get $plan)) (return))
-  (if (call $d3d_render_park (local.get $result) (i32.const 0)) (then (return)))
   (local.set $wa (call $g2w (local.get $plan)))
   (i32.store offset=21768 (local.get $old) (i32.const 0))
   (if (i32.ne (local.get $result) (i32.const 1)) (then
     (call $d3d9_reset_dispose (local.get $plan)) (i32.store offset=0 (global.get $reg_base) (i32.const 0x88760868)) (return)))
+  (call $d9g_reset (local.get $device))
   (local.set $next (call $g2w (i32.load offset=4 (local.get $wa))))
   ;; Preserve vtables needed by surviving shaders/managed resources and the
   ;; creation identity, but none of the old bindings or render state.
@@ -133,6 +135,9 @@
   (call $d3d9_reset_preserve (local.get $next) (local.get $old) (i32.const 25604))
   (call $d3d9_reset_preserve (local.get $next) (local.get $old) (i32.const 25608))
   (call $d3d9_reset_preserve (local.get $next) (local.get $old) (i32.const 25612))
+  ;; Creation BehaviorFlags and the vertex-processing mode.
+  (call $d3d9_reset_preserve (local.get $next) (local.get $old) (i32.const 25680))
+  (call $d3d9_reset_preserve (local.get $next) (local.get $old) (i32.const 25684))
   (memory.copy (i32.add (local.get $next) (i32.const 20628)) (i32.add (local.get $old) (i32.const 20628)) (i32.const 36))
   (i32.store offset=25600 (local.get $next)
     (select (i32.const 23) (i32.const 22) (i32.eq (i32.load offset=40 (local.get $wa)) (i32.const 23))))
@@ -157,9 +162,6 @@
   (local.set $shared (i32.load offset=16 (local.get $entry)))
   (store.field DxObject misc0 (local.get $entry) (call $dx_slot_of (call $dx_from_this (i32.load offset=8 (local.get $wa)))))
   (store.field DxObject misc1 (local.get $entry) (i32.load offset=4 (local.get $wa)))
-  (call $d3d9_trace_world (local.get $device) (i32.const 11)
-    (i32.add (local.get $next) (i32.const 2708)) (i32.add (local.get $next) (i32.const 2708))
-    (i32.load offset=4 (local.get $wa)) (i32.add (i32.load offset=4 (local.get $wa)) (i32.const 2708)))
   (i32.store offset=16 (local.get $entry) (i32.load offset=28 (local.get $wa)))
   (call $d3d9_default_output (local.get $device) (i32.load offset=52 (local.get $wa)))
   (call $d3d9_shader_unbind (i32.load (local.get $old))) (call $d3d9_shader_unbind (i32.load offset=4 (local.get $old)))

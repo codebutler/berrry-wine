@@ -1,6 +1,9 @@
 # Hexen II Demo (Raven Software / Activision, 1997)
 
-App `hexen2_demo` (candidate `hexen-2-demo`, localOnly), demo 1.11.
+App `hexen2_demo` (candidate `hexen-2-demo`), demo 1.11. On the public
+desktop since 2026-11-13 by the owner's decision (`test/binaries/SOURCES.md`).
+Starts with Quake-style controls: `lib/hexen2-modern-controls.ini` mounts as
+`data1\config.cfg` and `lib/hexen2-autoexec.ini` (`+mlook`) as `autoexec.cfg`.
 Registered 75a71cc30. Quake-engine game: data in `data1/pak0.pak` and
 `progs.dat`.
 
@@ -17,7 +20,8 @@ and runtime behaviour only.
   setup plus an already installed `Install/Hexen2/` tree. The fetcher copies
   that tree to `installed/`.
 - `HEXEN II SUBLICENSE.doc`: Activision, personal use of one copy, no
-  copies, distribution or reverse engineering. Hence localOnly.
+  copies, distribution or reverse engineering. It was localOnly for that
+  reason until the owner chose to publish it anyway (2026-11-13).
 
 ## Two executables
 
@@ -27,7 +31,8 @@ and runtime behaviour only.
   `LoadLibrary("opengl32.dll")` reaches our GL. (Like Heretic II and Kingpin,
   that load answers `0x00400000`, the exe's own handle; harmless so far.)
   It opens with an informational OK box ("GLHexen is a special, accelerated
-  version…").
+  version…") only while `HKLM\Software\Hexen2` `Flag` (REG_BINARY) is
+  absent, writing it as it shows; the registry seeds `Flag` so it never shows.
 - **`h2.exe`** (software) loads SciTech WinDirect / PM Pro (`wdir32.dll`,
   `pmpro32.dll`, with 16-bit partners `wdir16.dll`/`pmpro16.dll`); both
   stop with MessageBox "Unable to link to KERNEL32.DLL!", presumably the
@@ -35,13 +40,31 @@ and runtime behaviour only.
 
 ## Route (headless, `--batch-size=50000`, `--headless-gl`)
 
-Enter at 50 dismisses the notice; the main menu is up by about b600. Enter at
+No notice since the seeded `Flag`; the main menu is up by about b600. Enter at
 900/1000/1100/1200/1300 goes Single Player → New Mission → class (Paladin) →
-difficulty. The first load then shows "Meshing models/…" until about b7500:
+difficulty. Send each Enter as a `keydown:13` / `keyup:13` pair 20 batches
+apart: bare keydowns open Single Player and then stall (2026-11-13). Gameplay
+is up by b8100; `scratch/runs/20261113-hexen2-site-shot/` is the site shot. The first load then shows "Meshing models/…" until about b7500:
 GLQuake-style triangle-strip building for every model, very slow under
 emulation (its `.ms2` cache would make later loads faster if it persisted).
 First person as the Paladin by b8000; Right turns, Up walks. Evidence:
 `scratch/runs/20261011T0830Z-hexen2_demo-gameplay-claude1863`.
 
+`-width 1024` (via `?app-args=-width%201024`), 2026-11-13: the CLI and a
+headful Chrome on the real GPU both reach the title menu at 1024x768. Headless
+Chrome with `--gpu` (SwiftShader) loses the whole tab ("Target closed", no JS
+error) within about 1,400 slices of the 1024x768 canvas resize, in any
+viewport; the same probe at 640 runs. Without `--gpu` there is no WebGL and
+the game stops at "wglCreateContext failed", as at any size. So it is the
+software GPU giving out at 1024, not the emulator; untested on a machine whose
+Chrome falls back to SwiftShader. Evidence: `scratch/runs/20261113-hexen2-1024/`.
+
 Not looked at: the browser, combat, sound, the software build, why meshing
 is so slow (worth a profile; Kingpin's level load has the same shape).
+
+GPU stream v2 (2026-11-16): the menu and world use GL_CLAMP + GL_LINEAR,
+which the gps producer lowers to BORDER + linear (`$glg_addr`). The WebGL
+executor had no linear-filtered border, so every frame declined with reason
+10 and went to the CPU. It now filters BORDER samplers in the shader
+(`_filteredTex` in `lib/gpu-stream-webgl.js`); at 1950 batches the CLI run
+shows 222 gpu frames, 0 declines. Evidence `scratch/runs/20261116-gps-edges/`.

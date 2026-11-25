@@ -1,5 +1,33 @@
 # Diablo II Shareware demo
 
+## November 12: healing and earned XP401 save
+
+The [native short-combat run](diablo2-native-menu-short-combat-20261112.md),
+commit `0df107e3b`, restores the complete XP380 checkpoint, heals through Akara
+from27/55 to55/55, and earns21 outdoor combat XP. Native Save & Exit returns
+to the title; the complete four-file export then passes normal Load, native
+XP401/life53/55, fresh movement and the still-active Den objective. This
+qualifies the XP401 set in the same browser. The
+[1615 fresh-browser check](diablo2-xp401-fresh-load-den-20261112.md), commit
+`8c4ab88de`, mounts those unchanged four files in a genuinely new browser and
+verifies normal Load, XP401/life53/55, the Den objective and fresh movement.
+Root checked874 references,84 PNGs,18 binding fields and changed document,
+guest and renderer identities against1540. Later navigation stayed in camp;
+command83 was refused before dispatch after its reviewed frame became stale.
+There was no replay, new combat or successor save. The terminal close omitted
+the global input export;54 physical pulses retain acknowledged releases,
+without an all-event trust claim. The Den remains uncleared, and exact monster
+species/count is unproved.
+
+The coordinator checked811 artifact references,75 complete PNGs,18 binding
+fields and balanced trusted input, and inspected six full persistence-sequence
+frames. Preserve all four files together from
+`20261112-diablo2-native-menu-short-combat-1540/earned-save/`; the D2S hash starts
+`8a55786b1923`. The older XP380 and death-outcome sets remain separate.
+Actual remote parent/Chrome exit and kernel drain passed; the local launcher
+returned143 without actual manager/watchdog join receipts, so those joins
+remain unknown. The private box stopped normally. No runtime fix is claimed.
+
 ## Package and installer
 
 The local package is Blizzard's `DiabloIIDemo.exe`:
@@ -1881,3 +1909,40 @@ supervisor, watcher and requester absent, ports closed, profile removed, held
 inputs empty and full flock available. FULLRELEASE was announced 16:48:03.
 Boat/test-box ID/state/expiry are N/A. Recovery and focused checks remain in
 the run directory. This was a docs-only change, with no full build or deployment.
+
+
+## November 12: Den entry and earned XP380 checkpoint
+
+[Current Den progression and complete recovery](diablo2-current-den-quest-20261112.md)
+records original field296 normal Load, two Blood Moor zombies, Den entry and its
+monster objective, and earned combat XP380. Native Save & Exit, the complete
+four-file export, normal Load, retained quest, and fresh movement all passed.
+The coordinator verified954 artifact references/793 unique contents,80 capture
+PNGs,80 command ACKs, balanced trusted input, all four save hashes, and the
+full Den/quest/post-Load stats/movement images. The Den remains uncleared;
+Akara healing is the next native objective. No causal SaveExit fix is claimed.
+
+The stylized digit5 was previously read as6: read-only original v71 save
+decoding gives initial life55/55, Vitality25 and next-level threshold500.
+The earned save restores XP380, life27/55 and gold3; no stats were edited.
+Published notes: `4b5002933`, `00aea67f3`. Tested module:`04c53419…`.
+All three private attempts stopped normally with actual parent joins.
+
+## 2026-11-16: Glide menu drawn in the top-left 512x384
+
+D2Glide calls `grSstWinOpen(hwnd 0x10001, res 7 = 640x480, refresh 0, color fmt 2,
+origin 0, 2 color buffers, 0 aux)` twice for the intro (the board is closed in
+between; `_grSstWinClose@4` is not the path, the closer was not traced) and then `res 8` (800x600)
+for the menus, with the window still 640x480. The GPU stream itself is right:
+800x600 `CREATE`s, `TARGETS` and `PRESENT w=800 h=600` (`--gpu-stream-dump`).
+`glide_display_take` resizes the window and its WAT client rect to 800x600, but
+the window GDI surface is only reallocated by `gdi_window_surface_ensure`, i.e.
+on the next DC handed out, and D2 draws its menu through Glide alone. So the
+renderer back canvas stayed 640x480, and the exclusive compositor stretched the
+800x600 Glide layer to that back canvas (640x480) and then by the 800->640
+exclusive scale again: 0.64, the top-left 512x384. Every other composite path
+already drew a GPU layer at its own size; `lib/renderer.js` now does so here
+too (`test/test-gpu-layer-exclusive-mode-switch.js`). Headless repro:
+`--app=diablo2_glide_demo --batch-size=50000 --max-batches=215` with `--glide-renderer=software`
+or `--headless-gl --glide-renderer=webgl`; the menu is up by batch ~190.
+Evidence `scratch/runs/20261116-d2-glide/`.

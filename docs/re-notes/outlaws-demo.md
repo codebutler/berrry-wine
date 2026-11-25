@@ -10,6 +10,302 @@ That initial audit did not acquire bytes; the completed acquisition below supers
 its unknown package identity. Runtime still requires a separate grant. Main integration
 of these notes is a coordinator action.
 
+## November 12 covered turn/release calibration; store entry still blocked
+
+Run `20261112-outlaws-covered-turn-east-stairs-health-0904` freshly restored
+all nine preferred0802 door files into an empty VFS, checked raw bytes, and
+loaded through native Enter after thumbnail hover. Living rendering stabilized
+for300ms; subsequent genuine movement kept health0.599999845. No healing,
+new mission consequence or new save was earned. All14 sets/126 files passed
+raw/gzip hash checks again.
+
+Original EXE trig routine0x4af8e0 masks its angle with0x3fff; actor-angle
+code0x432c50 also masks the high-word yaw at actor+0x32. Thus a full turn
+is16384 units, not65536. The old supposed-east target64500 reduces to15348
+(337.24 degrees, near +Z), not east4096. Run-local `native-nav.py` now
+records `yaw14=(rawYaw & 0x3fff)` and degrees; raw actor yaw is retained.
+Coordinate directions are +Z=0, +X=4096, -Z=8192, -X=12288. This is a
+helper interpretation correction, not an emulator patch.
+
+Covered Right180 moved raw yaw48673→49207 and Left600 moved49207→45668.
+Each release remained stable through1.8s idle with keys empty and HP/position
+unchanged. Separate native Escape resume/idle, unlocked mouse +100X,
+click-to-Resume and live left-click controls did not change yaw/position.
+Later Space100 and ordinary Up100 also preserved yaw49461 after release
+through1.8s idle. Full before/released/idle PNGs were individually reviewed;
+read-only sampled state is retained. Pointer lock stayed absent: relative
+mouse behavior and the0833 persistent-turn cause remain unisolated. No
+emulator regression is established by these controls.
+
+The changed eastern south-window attempt reached(126.992744,0,166.498993),
+yaw49461 (masked309,6.78955deg), then one native Shift+X+Up300 ended outside
+at(127.759369,0,165.881165), same HP. The frame remained a solid wall; this
+does not prove the window permanently impassable or jump height. Up100 later
+ended(127.936981,0,166.438568), same yaw/HP and released keys. The actual
+blocker is safe store entry: the eastern iron door near(133,202) connects
+inside the store to the stair landing, and neither this exterior window nor
+the previously attempted western entry has been demonstrated traversed.
+No further low-health crawl or repeated western exposure was attempted.
+Next work must establish a changed, native traversable store entry before
+claiming the eastern descent/canteen; the distant jail remains unattempted.
+
+All204 remote evidence paths/172 unique raw hashes were recovered and checked
+before normal stop. Runtime/Chrome closed normally; remote parent wait/EOF
+and process absence passed. Box bx_3tfqraze is archived, expiry cleared,
+stop_ab0b498fb1f8af22 completed unforced; watchdog exited0 without firing.
+The local long-running launcher tool returned143, separately recorded rather
+than substituted for the independently verified remote runtime-parent result.
+
+## November 12 covered-health approach remains open
+
+Run `20261112-outlaws-door-open-covered-health-onward-0833` earned no new
+health, mission consequence or save. The western store approach died after
+turn/movement interpretation drift; native mouse effects and helper behavior
+were not isolated, so no emulator defect is established. The unchanged whole9
+door checkpoint then passed authentic restore/readback, native Enter Load,
+stable living rendering300ms and fresh Shift+Up180 to
+(120.999916,0,162.384171), unchanged health0.6. This position was not saved.
+All14 sets/126 files, including the1.4-health key alternative, remain intact.
+
+Read-only original data identifies a remaining basement canteen at
+(128.73,-10.75,193.27), reached through the store's eastern iron door near
+(133,202), then northbound stairs x134–143 descending to-10.75. Landing and
+basement BGY records do not establish whether those actors remain alive.
+This is a candidate route, not a safe-route result. JAILDOOR01–05 share
+OBJECT102 with the opened telegraph door and are another onward candidate.
+The fresh worker calibrates native turn/release from cover before exposure;
+it must not repeat consumed street-supply searches or assume western entry.
+
+The coordinator checked202 references /185 unique raw hashes, full attempt
+and reloaded movement images. Exact25ac/75ec remains pinned; no code/build/
+commit or healing claim. The box stopped normally with actual runtime/Chrome
+wait0/EOF; outer transport143 remains separate. See the run's recovery notes.
+
+## November 12 authored shove, Steel Key and opened door102
+
+Run `20261112-outlaws-authored-vertical-use-key-route-0802` found original
+sector253 named **SHOVE_ME**. TOWN.INF event32/MORPH_MOVE2 scripts it west4.
+Native crouched Space performed that shove, cleared the previously diagnosed
+collision, and allowed genuine entry. Steel Key pickup text and the acquired
+ISTEEKEY/GSTEEKEY inventory record were retained. Ordinary Space then opened
+TELEGRAPHDOOR02/door102, with its leaf moving west5 as authored.
+
+Preserve both new **whole-nine** sets and their pins:
+
+- `key-progress-saves/`: ninth230616 bytes, SHA256
+  `239ad3acb1bc1ffb79196b59f5fbdabde5187458df35e08dc520bb36f91d1b6f`;
+  key acquired, crate moved, door closed, health1.4.
+- `door-progress-saves/`: ninth231466 bytes, SHA256
+  `47960cef62b0b83ab459b17d2d01f9cc4c7725f9be190f8f9bed238fe95b3c83`;
+  key acquired, door102 open, health0.6, saved
+  (122.108231,.25,156.418686), yaw48673.
+
+Both sets passed fresh whole-nine VFS restoration/raw readback, ordinary Load,
+stable living rendering300ms and fresh movement. From the door save, native
+Shift+Up180 crossed the genuine doorway to (120.148949,0,166.426819), health0.6
+unchanged. This final outside position was not saved. Original108 ancestral
+files remain unchanged. No healing or mission completion is claimed.
+
+Two initial key-load checks incorrectly demanded exact yaw despite native
+menu mouse movement; those exposed attempts died. Saved living bytes remained
+unchanged. Corrected native Enter Load records yaw and verifies position,
+health and rendered stability, rather than enforcing the false yaw predicate.
+Both successful reload/movement results and failed attempts remain retained.
+
+The coordinator checked393 references /328 unique raw hashes, both complete
+raw/gzip save sets, full key/door/fresh-movement frames and original script/live
+geometry. Source remains exact25ac/75ec, with no emulator fix/build/commit.
+The box stopped normally; actual runtime owner/Chrome and watchdog waits passed,
+with outer transport143 separate. The next task seeks covered native health
+and onward progress from the door-open checkpoint, retaining the1.4 alternative.
+
+## November 12 native aperture collision cause
+
+Run `20261112-outlaws-aperture-collision-key-route-0738` tested a changed
+southern approach with bounded passive native tracing. Blocking branches
+0x4e6825/0x4e6833 after recursive query0x4e6990 selected two walls: raised
+sector253 corner0x10d9414, floor4.25, and aperture73 southern lip0x1193374.
+Crouching reduces height5.99→2, fitting the opening's3-unit clearance, but
+keeps radius1.5. Original wall test0x4e80a0 expands the wall interval at each
+end by radius, rather than using the previously hypothesized circle-corner
+metric. The raised obstacle extends south149.5+1.5=151; aperture73 requires
+center z≤150.5 at its south boundary. These forbidden extents overlap0.5.
+This explains the horizontal stall for this approach; no emulator defect or
+global impossibility of earning the key follows.
+
+The unsaved diagnostic ended (134.760681,.25,150.270660), health2.2,
+without x134 crossing, SteelKey or door102. All nine restored VFS files remain
+byte-identical, and all12 ancestral sets/108 files remain preserved. Continue
+from the0710 east-threat whole9 save. The next investigation targets authored
+vertical/use behavior or a different access route; repeated horizontal crawls
+and unsupported counter jumps add no evidence. Actor+0x38 is a sector pointer;
+earlier helper fields calling it a descriptor do not prove actor metadata.
+
+The coordinator checked172 references /149 unique raw hashes, the full final
+native frame and causal trace summary. Runtime remains exact25ac/75ec, with
+no source change/build/commit. Tracing affects timing and is not a benchmark.
+Some initial intermediate captures were reviewed only at final audit; completed
+live/paused frames were reviewed before dependent actions, and later diagnostic
+frames were each reviewed before further action. Actual runtime owner wait0/EOF,
+Chrome0 and normal box stop passed. Outer client143/missing client wait remains
+separate. Exact findings/recovery are in the run's `RESULT.md`/`RECOVERY.md`.
+
+## November 12 east gunman defeat and aperture limit
+
+Run `20261112-outlaws-east-corner-threat-supplies-0710` identified the armed
+east-corner gunman directly in view and defeated him with one aimed native
+shot: loaded ammunition4→3, health stayed2.2. Full upright/collapse images and
+authentic saved actor data establish the new corpse at (148.73146,0,157.70334).
+Attribution of the earlier unseen bullet remains an inference.
+
+Prefer **all nine** `east-threat-saves/` with `east-threat-save-pins.json`.
+Saved position (127.880249023,0,161.501007080), yaw37279, health2.2; ninth raw
+229741 bytes, SHA256
+`9e1b6f21a928ed066d7fd5919892d9c4bbf5aa93e0f4d3e484cbe852b801193f`.
+Normal Load of the explicitly highlighted ninth slot restored that exact
+rendered state stable300ms, with the corpse present. Fresh crouched movement
+reached (134.591629028,0,161.501007080), unchanged health; it was not resaved.
+Hover and review the ninth row before clicking: an initial bare click selected
+an older living slot, which failed exact-state validation and was paused.
+All99 ancestral save files remain unchanged.
+
+The cleared corner allowed a north approach without damage. Calibrated west
+movement entered floor.25 near (135.14352,149.57620); one settled crouch attempt
+stalled near x134.980 and ended x134.782, still health2.2. No x134 crossing,
+SteelKey pickup, door102 opening or healing follows. Native collision cause
+remains unknown; the fresh successor must isolate it or find a different
+authored approach before another attempt. Nearby street supplies were absent
+from the authentic saved state; global medical-item defaults are not possession.
+
+The coordinator verified464 references /372 unique raw hashes, complete new
+raw/gzip saves and full armed/collapse/reloaded-movement images. Exact source
+remains25ac5466d/WASM75ecda5701, with no code/build/commit. Runtime actual
+wait0/EOF and independent PID/profile/port closure passed; the box normally
+stopped before expiry. Outer transport143 is separate. See the run's
+`RESULT.md` and `RECOVERY.md` for exact pins and native input controls.
+
+## November 12 two further defeats and frontage save
+
+Run `20261112-outlaws-frontage-threat-key-route-0630` defeated the bank
+redshirt and a separate western lightshirt through native firing, hit reaction
+and continuous collapse. Preserve **all nine** `frontage-saves/` files and
+`frontage-save-pins.json`. The ninth file is230345 bytes, SHA256
+`68f93d1bedf3643736e60bbba58c6f919bfbb1929297fb4d18c6afe02926ec32`.
+The saved position is (83.264503479,0,185.097595215), yaw41029, health2.2.
+Normal Load restored that rendered state stable300ms with the fallen attacker;
+fresh crouched forward movement reached (83.068260193,0,177.684265137)
+at unchanged health. That movement was not resaved. All11 ancestral whole sets
+(99 files) remain unchanged, including the earlier4.6-health alternative.
+
+An unsaved eastward branch reached (137.371292,0,160.434662), where an
+out-of-view attacker reduced health2.2 to1.0. This shooter remains unidentified;
+the western lightshirt defeat does not establish that it was the earlier
+aperture attacker. No aperture crossing, SteelKey pickup, door102 opening or
+healing was proved. The fresh successor investigates that threat or supplies
+before another exposed approach.
+
+The coordinator checked737 recovered references /610 unique raw hashes,
+complete new raw/gzip saves, full aftermath and reloaded movement images.
+Runtime remains exact25ac5466d/WASM75ecda5701; no code/build/commit was needed.
+The box stopped normally before expiry, with runtime parent/watchdog wait0/EOF;
+outer transport143 is reported separately. Exact recovery is in the run's
+`RECOVERY.md`.
+
+## November 12 healthier combat successor
+
+Prefer the **whole nine** `combat-saves/` and `combat-save-pins.json` from
+`20261112-outlaws-earlier-gunman-health-successor-0558`. Earlier close-range
+interception defeated the tracked doorway gunman while preserving health4.6,
+instead of0.2. The hit and continuous collapse were reviewed. Native Save
+recorded (105.79972,.25,183.37161), yaw45471, health4.5999999046; ninth raw
+229536 bytes, SHA256
+`3b4dcbb2caab03ea677d9bbb73124de7a37bf1709a2c0fdcae96dc069a05bbfc`.
+Normal Load restored the rendered exact state stable300ms and fallen attacker.
+Fresh crouched backward movement reached (108.70386,.25,182.90546) at unchanged
+health; it was not resaved. Parents and the older low-health combat set remain
+unchanged fallbacks. This is damage avoided, not healing.
+
+An unsaved outside branch still encountered the bank shooter and a further
+close attacker. It ended alive near (136.331,0,150.447), health2.2, without
+crossing x134 into aperture73. No SteelKey pickup or door102 opening follows.
+Original IDOCBAG COUNT3/MAX15 are item defaults, not current possession proof.
+The next worker addresses surviving threats from the healthier save.
+
+The coordinator verified631 recovered references /541 unique raw hashes,
+all nine raw/gzip saves and full hit/collapse/reload/movement images. Source
+remains25ac5466d/WASM75ecda5701, with no production change or build. Runtime
+parent wait0/EOF and normal box stop passed; outer transport143 is separate.
+The run's `RESULT.md` and `RECOVERY.md` retain exact continuation and the helper
+C-timer cleanup correction, which was not rerun against the original.
+
+## November 12 gunman defeat and living combat save
+
+Run `20261112-outlaws-store-native-heal-shooter-0525` tracked the actual
+black-hatted, light-shirted attacker firing and moving through the store
+doorway. Native centered revolver shots produced blood/hit reaction and a
+continuous collapse sequence. The fallen body persisted through normal Load
+and fresh movement. This establishes an enemy consequence beyond a single
+prone image. Other enemies and permanent safety are not ruled out.
+
+Preserve **all nine** `combat-saves/` with `combat-save-pins.json` from that
+run. The ninth raw file is230314 bytes, SHA256
+`386585cd8141512575b061c4f662b8de334825a82f0d994127dc477207605a4c`.
+Native Save recorded (105.79972,.25,183.37161), yaw42300, health0.199999869.
+Normal Load restored the exact rendered state stable300ms, with the attacker
+fallen; fresh crouched backward movement reached (107.00921,.25,185.51430)
+at unchanged health. That movement was not resaved. First eight files and all
+parents remain unchanged.
+
+This is a **living low-health combat checkpoint**, distinct from earlier dead
+.2 branches. Do not take it along the old exposed aperture approach. Healing
+remains unproved: inventory attempts showed Crowbar, with no reviewed
+MedicalBag label or use. A new attempt starts from whole store5.4 to reproduce
+the defeat earlier or obtain native health before further route exposure.
+No aperture traversal, SteelKey pickup/use or door102 opening is claimed.
+
+The coordinator checked570 recovered references /472 unique raw hashes, all
+nine save gzip/raw hashes, and the full upright/hit/collapse/reloaded-movement
+images. Tested source remains25ac5466d/WASM75ecda5701; no production code,
+build or task commit changed it. Runtime parent wait0/EOF and normal box stop
+passed; outer transport143 is separate. Exact whole-set recovery is in the
+run's `RECOVERY.md`.
+
+## November 12 SteelKey route and living fallback
+
+Runs `20261112-outlaws-steel-key-telegraph-door-0418` and
+`20261112-outlaws-telegraph-counter-alternate-route-0458` identify original
+`GSTEEKEY` → `ISTEEKEY`, USE102, matching TELEGRAPHDOOR02/object102.
+The locked door visibly requires the steel key; pickup and opening remain
+unproved. Native Space opened the separate TELEGRAPHDOOR01.
+
+Original geometry offers a raised barred counter, the locked south door, or
+the low east aperture into the rear room. Counter jumping failed. A changed
+fresh crouch/settle approach reached (134.762,.25,149.806), consistent with the
+earlier blocked endpoint. The next resume produced explicit “You got shot to
+death!” before further movement. This proves neither aperture entry nor a new
+collision limit. A future attempt must address the shooter or verify native
+MedicalBag healing before another continuous crouched approach. Charges remain
+unknown; no kill or safe cover is inferred.
+
+Retain the **whole nine** `onward-saves/` from run0418 with
+`onward-save-pins.json`: saved store health5.4 at (105.800,.25,183.372),
+yaw43470, ninth raw SHA256
+`8f187147e1a189cdccef748f33a21875ae446f157651e4497144dc8150ea2c5d`.
+Run0458 actually restored all nine into a fresh empty matching VFS, verified
+all raw bytes, normal-loaded the rendered exact state stable300ms, then
+proved fresh movement alive at health4.6. Movement was not resaved. The
+whole `frontroom-saves/` at health3.8 also passed fresh restoration and living
+movement. Keep all parent sets; exclude both .2-health/dead branches.
+Run0458 `RECOVERY.md` contains the exact continuation recipe.
+
+Tested runtime remains Git `25ac5466d…` / WASM `75ecda5701…`; later shared
+renderer changes were excluded. No production change or build was made.
+The coordinator verified 430 recovered references / 344 unique raw hashes
+and the full death/living-store images. Actual runtime wait0/EOF and normal
+box stop passed; outer transport143 remains separate. A Stop All → relaunch
+null-memory `find_window` error occurred on this legacy host. A fresh host
+page worked; no current-main reproduction or generic cause is established.
+
 ## Selection and provenance
 
 Selected **Outlaws (LucasArts, 1997), updated original single-player demo**.

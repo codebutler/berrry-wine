@@ -46,7 +46,9 @@ const { bootRenderHarness } = require('./render-helper');
   assert(textureRows.every((row, i) => row.id === textureRows[0].id + i),
     'IDirect3DTexture8 API IDs are contiguous in vtable order');
 
-  const { exports: e } = await bootRenderHarness({ fonts: 'none', extraWat: `
+  // D3D8 has a device only with a ring executor (d3d9-retire S4).
+  const { exports: e } = await bootRenderHarness({ fonts: 'none',
+    beforeInstantiate: hostCtx => { hostCtx.d3d9GpsBackend = 'software'; hostCtx.createCanvas = (w, h) => require('../lib/canvas-compat').createCanvas(w, h); }, extraWat: `
     (func (export "d3d8_create") (result i32)
       (i32.store offset=16 (global.get $reg_base) (i32.const 0x074ff000))
       (call $handle_Direct3DCreate8 (i32.const 220) (i32.const 0) (i32.const 0)
@@ -268,8 +270,10 @@ const { bootRenderHarness } = require('./render-helper');
   // textures); A2B10G10R10 (31) is still not.
   checkCapability(e.d3d8_check_format, [0, 1, 22, 0, 3, 31], D3DERR_NOTAVAILABLE,
     0x074ff020, 'unsupported texture storage format is unavailable');
-  checkCapability(e.d3d8_check_format, [0, 1, 22, 1, 3, 22], D3DERR_NOTAVAILABLE,
-    0x074ff020, 'unmodeled render-target usage is unavailable');
+  checkCapability(e.d3d8_check_format, [0, 1, 22, 1, 3, 22], D3D_OK,
+    0x074ff020, 'X8R8G8B8 render-target texture is what CreateTexture makes');
+  checkCapability(e.d3d8_check_format, [0, 1, 22, 1, 3, 0x31545844], D3DERR_NOTAVAILABLE,
+    0x074ff020, 'compressed render-target texture is unavailable');
   checkCapability(e.d3d8_check_format, [0, 1, 22, 0, 1, 22], D3DERR_NOTAVAILABLE,
     0x074ff020, 'unimplemented surface resource path is unavailable');
   checkCapability(e.d3d8_check_format, [1, 1, 22, 0, 3, 22], D3DERR_INVALIDCALL,

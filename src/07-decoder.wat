@@ -2576,8 +2576,8 @@
     (i32.const 1))
 
   ;; A LOCK-prefixed read-modify-write, or XCHG with a memory operand, as
-  ;; handler 499 ($th_lock_rmw, 05-alu.wat): an atomic compare-and-swap. Only
-  ;; called when $LOCK_MODE says guest threads run concurrently. $op is the
+  ;; handler 499 ($th_lock_rmw, 05-alu.wat): an atomic compare-and-swap.
+  ;; Process peers can share system heap bytes in either thread mode. $op is the
   ;; opcode byte already consumed; returns 1 having consumed the instruction,
   ;; or 0 having consumed nothing more, which leaves the ordinary decode (and
   ;; its non-atomic handlers) in charge. Declines: register forms (a LOCK on
@@ -2974,6 +2974,7 @@
     (local $insn_start i32)  ;; d_pc before prefixes/opcode for interior matchers
     (local $mmxsub i32)        ;; MMX subop id, or -1 when this 0F op is not MMX
     (local $mmxpc i32)         ;; d_pc before an MMX ModRM, to rewind on a reject
+    (local $sse2 i32)          ;; $sse2_form descriptor, or -1
     (local $uop_pc i32)        ;; installed micro-op program at this head (07d)
 
     (call $decode_reserve_headroom)
@@ -3262,6 +3263,472 @@
           (br_if $supported (i32.eq (local.get $op) (i32.const 235)))
           (unreachable))))
 
+          ;; SSE2 XMM forms ($sse2_form in 06c-mmx.wat) in 32-bit code. This
+          ;; gate runs ahead of the MMX/SSE1 gates below, which reject an
+          ;; actual 66/F2/F3 on the same secondary opcodes. Forms the table
+          ;; does not name return -1 and keep falling through to those traps.
+          (if (i32.and (i32.eq (local.get $op) (i32.const 0x0F))
+                (i32.and (i32.eqz (global.get $code16))
+                         (i32.eqz (local.get $prefix_lock)))) (then
+            (local.set $sse2 (call $sse2_form
+              (if (result i32) (local.get $prefix_66)
+                (then (select (i32.const 1) (i32.const -1) (i32.eqz (local.get $prefix_rep))))
+                (else (select (i32.const 2) (i32.const 3) (i32.eq (local.get $prefix_rep) (i32.const 1)))))
+              (call $gl8 (global.get $d_pc))
+              (i32.and (i32.shr_u (call $gl8 (i32.add (global.get $d_pc) (i32.const 1)))
+                                  (i32.const 3)) (i32.const 7))))
+            (if (i32.and (i32.ne (local.get $sse2) (i32.const -1))
+                         (i32.ne (i32.or (local.get $prefix_66) (local.get $prefix_rep))
+                                 (i32.const 0))) (then
+              (drop (call $d_fetch8))
+              (call $decode_modrm)
+              (if (i32.eq (global.get $mr_mod) (i32.const 3)) (then
+                (if (i32.and (local.get $sse2) (i32.const 0x800)) (then
+                  (call $host_log_i32 (i32.const 0xCA5E5E20))
+                  (call $host_log_i32 (local.get $sse2))
+                  (unreachable)))
+                (local.set $imm (i32.const 0))
+                (if (i32.and (local.get $sse2) (i32.const 0x200))
+                  (then (local.set $imm (call $d_fetch8))))
+                (call $te_sse (i32.const 432)
+                  (i32.or (i32.shl (local.get $imm) (i32.const 16))
+                    (i32.or (i32.shl (i32.and (local.get $sse2) (i32.const 0xFF)) (i32.const 8))
+                      (if (result i32) (i32.and (local.get $sse2) (i32.const 0x1000))
+                        (then (i32.or (i32.shl (global.get $mr_val) (i32.const 4)) (global.get $mr_val)))
+                        (else (if (result i32) (i32.and (local.get $sse2) (i32.const 0x100))
+                          (then (i32.or (i32.shl (global.get $mr_val) (i32.const 4)) (global.get $mr_reg)))
+                          (else (i32.or (i32.shl (global.get $mr_reg) (i32.const 4)) (global.get $mr_val)))))))))
+                (br $decode)))
+              (if (i32.and (local.get $sse2) (i32.const 0x400)) (then
+                (call $host_log_i32 (i32.const 0xCA5E5E21))
+                (call $host_log_i32 (local.get $sse2))
+                (unreachable)))
+              (call $apply_seg_override)
+              (local.set $a (call $emit_sib_or_abs))
+              (local.set $imm (i32.const 0))
+              (if (i32.and (local.get $sse2) (i32.const 0x200))
+                (then (local.set $imm (call $d_fetch8))))
+              (if (i32.and (local.get $sse2) (i32.const 0x100))
+                (then
+                  ;; Memory MOVQ m64,xmm is the existing low-qword store (37).
+                  (call $te_sse (i32.const 434)
+                    (i32.or (i32.shl (select (i32.const 37) (i32.and (local.get $sse2) (i32.const 0xFF))
+                                       (i32.eq (i32.and (local.get $sse2) (i32.const 0xFF)) (i32.const 53)))
+                                     (i32.const 8))
+                            (i32.shl (global.get $mr_reg) (i32.const 4)))))
+                (else
+                  (call $te_sse (i32.const 433)
+                    (i32.or (i32.shl (local.get $imm) (i32.const 16))
+                      (i32.or (i32.shl (i32.and (local.get $sse2) (i32.const 0xFF)) (i32.const 8))
+                              (i32.shl (global.get $mr_reg) (i32.const 4)))))))
+              (call $te_raw (local.get $a))
+              (br $decode)))))
+
+          ;; Before the coarse address-size guard: only this NP0FC4 family
+          ;; admits the existing address16 absolute decoder here.
+          ;; PINSRW mm,r32/m16,imm8 (NP 0FC4), SSE1 only. prefix_66
+          ;; includes the code16 default-size inversion; compare with that
+          ;; default to reject an actual 66 prefix in either code mode.
+          (if (i32.eq (local.get $op) (i32.const 0x0F)) (then
+          (if (i32.and (i32.eq (call $gl8 (global.get $d_pc)) (i32.const 0xC4))
+            (i32.and (i32.eq (local.get $prefix_66)
+              (i32.and (i32.ne (global.get $code16) (i32.const 0))
+                       (i32.eqz (global.get $cs_big))))
+              (i32.and (i32.eqz (local.get $prefix_rep))
+                       (i32.eqz (local.get $prefix_lock))))) (then
+            (drop (call $d_fetch8)) ;; consume the checked secondary opcode
+            (call $decode_modrm)
+            (if (i32.eq (global.get $mr_mod) (i32.const 3)) (then
+              (local.set $imm (call $d_fetch8))
+              (call $te (i32.const 422)
+                (i32.or (i32.shl (i32.add (i32.const 160)
+                  (i32.and (local.get $imm) (i32.const 3))) (i32.const 8))
+                  (i32.or (i32.shl (global.get $mr_reg) (i32.const 4)) (global.get $mr_val)))))
+            (else
+              (call $apply_seg_override)
+              (local.set $imm (call $d_fetch8))
+              (local.set $a (call $emit_sib_or_abs))
+              (call $te (i32.const 423)
+                (i32.or (i32.shl (i32.add (i32.const 160)
+                  (i32.and (local.get $imm) (i32.const 3))) (i32.const 8))
+                  (i32.shl (global.get $mr_reg) (i32.const 4))))
+              (call $te_raw (local.get $a))))
+            (br $decode)))))
+
+      ;; SSE1 PEXTRW r32,mm,imm8 (NP 0FC5). Before the coarse address-size
+      ;; guard because its register-only form has no effective address.
+      ;; Compare prefix_66 with the code16 default inversion to reject an
+      ;; actual 66 in either mode. Reject memory before decoding any EA.
+      (if (i32.eq (local.get $op) (i32.const 0x0F)) (then
+        (if (i32.and (i32.eq (call $gl8 (global.get $d_pc)) (i32.const 0xC5))
+          (i32.and (i32.eq (local.get $prefix_66)
+            (i32.and (i32.ne (global.get $code16) (i32.const 0))
+                     (i32.eqz (global.get $cs_big))))
+            (i32.and (i32.eqz (local.get $prefix_rep))
+                     (i32.eqz (local.get $prefix_lock))))) (then
+          (drop (call $d_fetch8))
+          (if (i32.ne (i32.and (call $gl8 (global.get $d_pc)) (i32.const 0xC0)) (i32.const 0xC0))
+            (then (unreachable)))
+          (call $decode_modrm)
+          (local.set $imm (call $d_fetch8))
+          (call $te (i32.const 422)
+            (i32.or (i32.shl (i32.add (i32.const 164)
+              (i32.and (local.get $imm) (i32.const 3))) (i32.const 8))
+              (i32.or (i32.shl (global.get $mr_reg) (i32.const 4)) (global.get $mr_val))))
+          (br $decode)))))
+
+      ;; SSE1 PSHUFW mm,mm/m64,imm8 (NP 0F70). This new gate precedes the
+      ;; coarse 67 guard so the existing address16 decoder remains usable.
+      ;; Compare against the code16 default inversion to reject actual 66;
+      ;; F2/F3 and LOCK stay unsupported, including the SSE2 XMM variants.
+      (if (i32.eq (local.get $op) (i32.const 0x0F)) (then
+        (if (i32.and (i32.eq (call $gl8 (global.get $d_pc)) (i32.const 0x70))
+          (i32.and (i32.eq (local.get $prefix_66)
+            (i32.and (i32.ne (global.get $code16) (i32.const 0))
+                     (i32.eqz (global.get $cs_big))))
+            (i32.and (i32.eqz (local.get $prefix_rep))
+                     (i32.eqz (local.get $prefix_lock))))) (then
+          (drop (call $d_fetch8))
+          (call $decode_modrm)
+          (if (i32.eq (global.get $mr_mod) (i32.const 3)) (then
+            (local.set $imm (call $d_fetch8))
+            (call $te (i32.const 422)
+              (i32.or (i32.shl (i32.add (i32.const 256) (local.get $imm)) (i32.const 8))
+                (i32.or (i32.shl (global.get $mr_reg) (i32.const 4)) (global.get $mr_val)))))
+          (else
+            (call $apply_seg_override)
+            (local.set $imm (call $d_fetch8))
+            (local.set $a (call $emit_sib_or_abs))
+            (call $te (i32.const 423)
+              (i32.or (i32.shl (i32.add (i32.const 256) (local.get $imm)) (i32.const 8))
+                (i32.shl (global.get $mr_reg) (i32.const 4))))
+            (call $te_raw (local.get $a))))
+          (br $decode)))))
+
+      ;; SSE1 MASKMOVQ mmData,mmMask (NP 0FF7), register-only ModRM.
+      ;; Before the coarse 67 guard: address size chooses implicit DI/EDI.
+      ;; Refuse mandatory/LOCK prefixes before any EA or operand access; 66
+      ;; is the separate SSE2 XMM instruction and remains unsupported here.
+      (if (i32.eq (local.get $op) (i32.const 0x0F)) (then
+        (if (i32.eq (call $gl8 (global.get $d_pc)) (i32.const 0xF7)) (then
+          (if (i32.or (i32.ne (local.get $prefix_66)
+                (i32.and (i32.ne (global.get $code16) (i32.const 0))
+                         (i32.eqz (global.get $cs_big))))
+                (i32.or (i32.ne (local.get $prefix_rep) (i32.const 0))
+                        (i32.ne (local.get $prefix_lock) (i32.const 0))))
+            (then (unreachable)))
+          (drop (call $d_fetch8))
+          (if (i32.ne (i32.and (call $gl8 (global.get $d_pc)) (i32.const 0xC0)) (i32.const 0xC0))
+            (then (unreachable)))
+          (call $decode_modrm)
+          (call $te (i32.const 422)
+            (i32.or (i32.shl (i32.add (i32.const 512)
+                (i32.or (i32.shl (local.get $prefix_67) (i32.const 3))
+                        (local.get $prefix_seg))) (i32.const 8))
+              (i32.or (i32.shl (global.get $mr_reg) (i32.const 4)) (global.get $mr_val))))
+          (br $decode)))))
+
+      ;; SSE1 PSADBW mm,mm/m64 (NP 0FF6). Opt in before the coarse 67
+      ;; guard to reuse the existing code16/address16 and segment machinery.
+      ;; Actual 66 selects unsupported SSE2, never an MMX operand-size change.
+      (if (i32.eq (local.get $op) (i32.const 0x0F)) (then
+        (if (i32.eq (call $gl8 (global.get $d_pc)) (i32.const 0xF6)) (then
+          (if (i32.or (i32.ne (local.get $prefix_66)
+                (i32.and (i32.ne (global.get $code16) (i32.const 0))
+                         (i32.eqz (global.get $cs_big))))
+                (i32.or (i32.ne (local.get $prefix_rep) (i32.const 0))
+                        (i32.ne (local.get $prefix_lock) (i32.const 0))))
+            (then (unreachable)))
+          (drop (call $d_fetch8))
+          (call $decode_modrm)
+          (local.set $mmxsub (call $mmx_opcode_subop (i32.const 0xF6)))
+          (if (i32.eq (global.get $mr_mod) (i32.const 3)) (then
+            (call $te (i32.const 422)
+              (i32.or (i32.shl (local.get $mmxsub) (i32.const 8))
+                (i32.or (i32.shl (global.get $mr_reg) (i32.const 4)) (global.get $mr_val)))))
+          (else
+            (call $apply_seg_override)
+            (local.set $a (call $emit_sib_or_abs))
+            (call $te (i32.const 423)
+              (i32.or (i32.shl (local.get $mmxsub) (i32.const 8))
+                (i32.shl (global.get $mr_reg) (i32.const 4))))
+            (call $te_raw (local.get $a))))
+          (br $decode)))))
+
+      ;; SSE1 PMOVMSKB r32,mm (NP 0FD7). Register-only, so address size
+      ;; and segment overrides do not affect it. Compare the code16 default
+      ;; inversion to reject actual 66 (SSE2); reject memory before any EA.
+      (if (i32.eq (local.get $op) (i32.const 0x0F)) (then
+        (if (i32.eq (call $gl8 (global.get $d_pc)) (i32.const 0xD7)) (then
+          (if (i32.or (i32.ne (local.get $prefix_66)
+                (i32.and (i32.ne (global.get $code16) (i32.const 0))
+                         (i32.eqz (global.get $cs_big))))
+                (i32.or (i32.ne (local.get $prefix_rep) (i32.const 0))
+                        (i32.ne (local.get $prefix_lock) (i32.const 0))))
+            (then (unreachable)))
+          (drop (call $d_fetch8))
+          (if (i32.ne (i32.and (call $gl8 (global.get $d_pc)) (i32.const 0xC0)) (i32.const 0xC0))
+            (then (unreachable)))
+          (call $decode_modrm)
+          (call $te (i32.const 422)
+            (i32.or (i32.shl (i32.const 20) (i32.const 8))
+              (i32.or (i32.shl (global.get $mr_reg) (i32.const 4)) (global.get $mr_val))))
+          (br $decode)))))
+
+      ;; SSE1 MOVNTQ m64,mm (NP 0FE7). Admit the existing store handler
+      ;; before the coarse 67 guard, using the shared segment/EA machinery.
+      ;; Actual 66 selects SSE2; register destinations reject before any EA.
+      (if (i32.eq (local.get $op) (i32.const 0x0F)) (then
+        (if (i32.eq (call $gl8 (global.get $d_pc)) (i32.const 0xE7)) (then
+          (if (i32.or (i32.ne (local.get $prefix_66)
+                (i32.and (i32.ne (global.get $code16) (i32.const 0))
+                         (i32.eqz (global.get $cs_big))))
+                (i32.or (i32.ne (local.get $prefix_rep) (i32.const 0))
+                        (i32.ne (local.get $prefix_lock) (i32.const 0))))
+            (then (unreachable)))
+          (drop (call $d_fetch8))
+          (if (i32.eq (i32.and (call $gl8 (global.get $d_pc)) (i32.const 0xC0)) (i32.const 0xC0))
+            (then (unreachable)))
+          (call $decode_modrm)
+          (call $apply_seg_override)
+          (local.set $a (call $emit_sib_or_abs))
+          (call $te (i32.const 424)
+            (i32.shl (global.get $mr_reg) (i32.const 4)))
+          (call $te_raw (local.get $a))
+          (br $decode)))))
+
+      ;; SSE1 PMULHUW mm,mm/m64 (NP 0FE4). Opt in before the coarse 67
+      ;; guard, reusing the existing segmented/address16 EA decoder. Actual
+      ;; 66 selects unsupported SSE2 even with the code16 default inversion.
+      (if (i32.eq (local.get $op) (i32.const 0x0F)) (then
+        (if (i32.eq (call $gl8 (global.get $d_pc)) (i32.const 0xE4)) (then
+          (if (i32.or (i32.ne (local.get $prefix_66)
+                (i32.and (i32.ne (global.get $code16) (i32.const 0))
+                         (i32.eqz (global.get $cs_big))))
+                (i32.or (i32.ne (local.get $prefix_rep) (i32.const 0))
+                        (i32.ne (local.get $prefix_lock) (i32.const 0))))
+            (then (unreachable)))
+          (drop (call $d_fetch8))
+          (call $decode_modrm)
+          (if (i32.eq (global.get $mr_mod) (i32.const 3)) (then
+            (call $te (i32.const 422)
+              (i32.or (i32.shl (i32.const 18) (i32.const 8))
+                (i32.or (i32.shl (global.get $mr_reg) (i32.const 4)) (global.get $mr_val)))))
+          (else
+            (call $apply_seg_override)
+            (local.set $a (call $emit_sib_or_abs))
+            (call $te (i32.const 423)
+              (i32.or (i32.shl (i32.const 18) (i32.const 8))
+                (i32.shl (global.get $mr_reg) (i32.const 4))))
+            (call $te_raw (local.get $a))))
+          (br $decode)))))
+
+      ;; SSE1 PAVGB/PAVGW mm,mm/m64 (NP 0FE0/E3). Opt in before the
+      ;; coarse 67 guard using the existing MMX handlers and EA machinery.
+      ;; Actual 66 selects unsupported SSE2, including code16 inversion.
+      (if (i32.eq (local.get $op) (i32.const 0x0F)) (then
+        (if (i32.or
+              (i32.eq (call $gl8 (global.get $d_pc)) (i32.const 0xE0))
+              (i32.eq (call $gl8 (global.get $d_pc)) (i32.const 0xE3))) (then
+          (if (i32.or (i32.ne (local.get $prefix_66)
+                (i32.and (i32.ne (global.get $code16) (i32.const 0))
+                         (i32.eqz (global.get $cs_big))))
+                (i32.or (i32.ne (local.get $prefix_rep) (i32.const 0))
+                        (i32.ne (local.get $prefix_lock) (i32.const 0))))
+            (then (unreachable)))
+          (local.set $mmxsub (if (result i32)
+            (i32.eq (call $d_fetch8) (i32.const 0xE0))
+            (then (i32.const 80)) (else (i32.const 81))))
+          (call $decode_modrm)
+          (if (i32.eq (global.get $mr_mod) (i32.const 3)) (then
+            (call $te (i32.const 422)
+              (i32.or (i32.shl (local.get $mmxsub) (i32.const 8))
+                (i32.or (i32.shl (global.get $mr_reg) (i32.const 4)) (global.get $mr_val)))))
+          (else
+            (call $apply_seg_override)
+            (local.set $a (call $emit_sib_or_abs))
+            (call $te (i32.const 423)
+              (i32.or (i32.shl (local.get $mmxsub) (i32.const 8))
+                (i32.shl (global.get $mr_reg) (i32.const 4))))
+            (call $te_raw (local.get $a))))
+          (br $decode)))))
+
+      ;; SSE1 PMINUB/PMAXUB mm,mm/m64 (NP 0FDA/DE). Opt in before the
+      ;; coarse 67 guard, reusing the existing unsigned-byte handlers and EA
+      ;; machinery. Actual 66 selects SSE2, including code16 default inversion.
+      (if (i32.eq (local.get $op) (i32.const 0x0F)) (then
+        (if (i32.or
+              (i32.eq (call $gl8 (global.get $d_pc)) (i32.const 0xDA))
+              (i32.eq (call $gl8 (global.get $d_pc)) (i32.const 0xDE))) (then
+          (if (i32.or (i32.ne (local.get $prefix_66)
+                (i32.and (i32.ne (global.get $code16) (i32.const 0))
+                         (i32.eqz (global.get $cs_big))))
+                (i32.or (i32.ne (local.get $prefix_rep) (i32.const 0))
+                        (i32.ne (local.get $prefix_lock) (i32.const 0))))
+            (then (unreachable)))
+          (local.set $mmxsub (i32.add (i32.const 64)
+            (i32.sub (call $d_fetch8) (i32.const 0xDA))))
+          (call $decode_modrm)
+          (if (i32.eq (global.get $mr_mod) (i32.const 3)) (then
+            (call $te (i32.const 422)
+              (i32.or (i32.shl (local.get $mmxsub) (i32.const 8))
+                (i32.or (i32.shl (global.get $mr_reg) (i32.const 4)) (global.get $mr_val)))))
+          (else
+            (call $apply_seg_override)
+            (local.set $a (call $emit_sib_or_abs))
+            (call $te (i32.const 423)
+              (i32.or (i32.shl (local.get $mmxsub) (i32.const 8))
+                (i32.shl (global.get $mr_reg) (i32.const 4))))
+            (call $te_raw (local.get $a))))
+          (br $decode)))))
+
+      ;; SSE1 PMINSW/PMAXSW mm,mm/m64 (NP 0FEA/EE). Opt in before the
+      ;; coarse 67 guard using the existing MMX handlers and EA machinery.
+      ;; Actual 66 selects unsupported SSE2, including code16 inversion.
+      (if (i32.eq (local.get $op) (i32.const 0x0F)) (then
+        (if (i32.or
+              (i32.eq (call $gl8 (global.get $d_pc)) (i32.const 0xEA))
+              (i32.eq (call $gl8 (global.get $d_pc)) (i32.const 0xEE))) (then
+          (if (i32.or (i32.ne (local.get $prefix_66)
+                (i32.and (i32.ne (global.get $code16) (i32.const 0))
+                         (i32.eqz (global.get $cs_big))))
+                (i32.or (i32.ne (local.get $prefix_rep) (i32.const 0))
+                        (i32.ne (local.get $prefix_lock) (i32.const 0))))
+            (then (unreachable)))
+          (local.set $mmxsub (if (result i32)
+            (i32.eq (call $d_fetch8) (i32.const 0xEA))
+            (then (i32.const 73)) (else (i32.const 77))))
+          (call $decode_modrm)
+          (if (i32.eq (global.get $mr_mod) (i32.const 3)) (then
+            (call $te (i32.const 422)
+              (i32.or (i32.shl (local.get $mmxsub) (i32.const 8))
+                (i32.or (i32.shl (global.get $mr_reg) (i32.const 4)) (global.get $mr_val)))))
+          (else
+            (call $apply_seg_override)
+            (local.set $a (call $emit_sib_or_abs))
+            (call $te (i32.const 423)
+              (i32.or (i32.shl (local.get $mmxsub) (i32.const 8))
+                (i32.shl (global.get $mr_reg) (i32.const 4))))
+            (call $te_raw (local.get $a))))
+          (br $decode)))))
+
+      ;; MMX PMADDWD mm,mm/m64 (NP 0FF5). Opt in before the coarse 67
+      ;; guard using the existing handlers and segmented/address16 EA decoder.
+      ;; Actual 66 selects unsupported SSE2, including code16 inversion.
+      (if (i32.eq (local.get $op) (i32.const 0x0F)) (then
+        (if (i32.eq (call $gl8 (global.get $d_pc)) (i32.const 0xF5)) (then
+          (if (i32.or (i32.ne (local.get $prefix_66)
+                (i32.and (i32.ne (global.get $code16) (i32.const 0))
+                         (i32.eqz (global.get $cs_big))))
+                (i32.or (i32.ne (local.get $prefix_rep) (i32.const 0))
+                        (i32.ne (local.get $prefix_lock) (i32.const 0))))
+            (then (unreachable)))
+          (drop (call $d_fetch8))
+          (call $decode_modrm)
+          (if (i32.eq (global.get $mr_mod) (i32.const 3)) (then
+            (call $te (i32.const 422)
+              (i32.or (i32.shl (i32.const 16) (i32.const 8))
+                (i32.or (i32.shl (global.get $mr_reg) (i32.const 4)) (global.get $mr_val)))))
+          (else
+            (call $apply_seg_override)
+            (local.set $a (call $emit_sib_or_abs))
+            (call $te (i32.const 423)
+              (i32.or (i32.shl (i32.const 16) (i32.const 8))
+                (i32.shl (global.get $mr_reg) (i32.const 4))))
+            (call $te_raw (local.get $a))))
+          (br $decode)))))
+
+      ;; MMX PMULLW/PMULHW mm,mm/m64 (NP 0FD5/E5). Opt in before the
+      ;; coarse 67 guard using the existing signed-word handlers and EA
+      ;; machinery. Actual 66 selects SSE2, including code16 default inversion.
+      (if (i32.eq (local.get $op) (i32.const 0x0F)) (then
+        (if (i32.or
+              (i32.eq (call $gl8 (global.get $d_pc)) (i32.const 0xD5))
+              (i32.eq (call $gl8 (global.get $d_pc)) (i32.const 0xE5))) (then
+          (if (i32.or (i32.ne (local.get $prefix_66)
+                (i32.and (i32.ne (global.get $code16) (i32.const 0))
+                         (i32.eqz (global.get $cs_big))))
+                (i32.or (i32.ne (local.get $prefix_rep) (i32.const 0))
+                        (i32.ne (local.get $prefix_lock) (i32.const 0))))
+            (then (unreachable)))
+          (local.set $mmxsub (if (result i32)
+            (i32.eq (call $d_fetch8) (i32.const 0xD5))
+            (then (i32.const 19)) (else (i32.const 17))))
+          (call $decode_modrm)
+          (if (i32.eq (global.get $mr_mod) (i32.const 3)) (then
+            (call $te (i32.const 422)
+              (i32.or (i32.shl (local.get $mmxsub) (i32.const 8))
+                (i32.or (i32.shl (global.get $mr_reg) (i32.const 4)) (global.get $mr_val)))))
+          (else
+            (call $apply_seg_override)
+            (local.set $a (call $emit_sib_or_abs))
+            (call $te (i32.const 423)
+              (i32.or (i32.shl (local.get $mmxsub) (i32.const 8))
+                (i32.shl (global.get $mr_reg) (i32.const 4))))
+            (call $te_raw (local.get $a))))
+          (br $decode)))))
+
+      ;; MMX PAND/PANDN/POR/PXOR mm,mm/m64 (NP 0FDB/DF/EB/EF). Opt in
+      ;; before the coarse 67 guard using the existing Boolean handlers and
+      ;; EA machinery. Actual 66 selects SSE2, including code16 inversion.
+      (if (i32.eq (local.get $op) (i32.const 0x0F)) (then
+        (if (i32.or
+              (i32.or
+                (i32.eq (call $gl8 (global.get $d_pc)) (i32.const 0xDB))
+                (i32.eq (call $gl8 (global.get $d_pc)) (i32.const 0xDF)))
+              (i32.or
+                (i32.eq (call $gl8 (global.get $d_pc)) (i32.const 0xEB))
+                (i32.eq (call $gl8 (global.get $d_pc)) (i32.const 0xEF)))) (then
+          (if (i32.or (i32.ne (local.get $prefix_66)
+                (i32.and (i32.ne (global.get $code16) (i32.const 0))
+                         (i32.eqz (global.get $cs_big))))
+                (i32.or (i32.ne (local.get $prefix_rep) (i32.const 0))
+                        (i32.ne (local.get $prefix_lock) (i32.const 0))))
+            (then (unreachable)))
+          (local.set $mmxsub (call $mmx_opcode_subop (call $d_fetch8)))
+          (call $decode_modrm)
+          (if (i32.eq (global.get $mr_mod) (i32.const 3)) (then
+            (call $te (i32.const 422)
+              (i32.or (i32.shl (local.get $mmxsub) (i32.const 8))
+                (i32.or (i32.shl (global.get $mr_reg) (i32.const 4)) (global.get $mr_val)))))
+          (else
+            (call $apply_seg_override)
+            (local.set $a (call $emit_sib_or_abs))
+            (call $te (i32.const 423)
+              (i32.or (i32.shl (local.get $mmxsub) (i32.const 8))
+                (i32.shl (global.get $mr_reg) (i32.const 4))))
+            (call $te_raw (local.get $a))))
+          (br $decode)))))
+
+      ;; MMX PCMPEQB/PCMPEQW/PCMPEQD mm,mm/m64 (NP 0F74/75/76).
+      ;; Opt in before the coarse 67 guard using existing equality handlers
+      ;; and EA machinery. Actual 66 selects SSE2, including code16 inversion.
+      (if (i32.eq (local.get $op) (i32.const 0x0F)) (then
+        (if (i32.and
+              (i32.ge_u (call $gl8 (global.get $d_pc)) (i32.const 0x74))
+              (i32.le_u (call $gl8 (global.get $d_pc)) (i32.const 0x76))) (then
+          (if (i32.or (i32.ne (local.get $prefix_66)
+                (i32.and (i32.ne (global.get $code16) (i32.const 0))
+                         (i32.eqz (global.get $cs_big))))
+                (i32.or (i32.ne (local.get $prefix_rep) (i32.const 0))
+                        (i32.ne (local.get $prefix_lock) (i32.const 0))))
+            (then (unreachable)))
+          (local.set $mmxsub (i32.add (i32.const 56)
+            (i32.sub (call $d_fetch8) (i32.const 0x74))))
+          (call $decode_modrm)
+          (if (i32.eq (global.get $mr_mod) (i32.const 3)) (then
+            (call $te (i32.const 422)
+              (i32.or (i32.shl (local.get $mmxsub) (i32.const 8))
+                (i32.or (i32.shl (global.get $mr_reg) (i32.const 4)) (global.get $mr_val)))))
+          (else
+            (call $apply_seg_override)
+            (local.set $a (call $emit_sib_or_abs))
+            (call $te (i32.const 423)
+              (i32.or (i32.shl (local.get $mmxsub) (i32.const 8))
+                (i32.shl (global.get $mr_reg) (i32.const 4))))
+            (call $te_raw (local.get $a))))
+          (br $decode)))))
+
       ;; 0x67 (address-size override) changes how an instruction forms its
       ;; effective address, so every opcode has to opt in deliberately —
       ;; decoding 16-bit addressing as 32-bit ModRM/SIB silently corrupts EAs.
@@ -3287,11 +3754,11 @@
               (call $host_log_i32 (global.get $d_pc))
               (unreachable)))))
 
-      ;; Guest threads on Workers: a LOCK-prefixed read-modify-write, and XCHG
-      ;; with memory (locked by definition), must be indivisible across them.
-      ;; $LOCK_MODE is 0 under the cooperative scheduler, so this costs that
-      ;; path one load per instruction and changes nothing it emits.
-      (if (i32.load (global.get $LOCK_MODE))
+      ;; LOCK and memory XCHG must be indivisible across Worker threads and
+      ;; separate processes, even when guest threads run cooperatively.
+      (if (i32.or (i32.load (global.get $LOCK_MODE))
+            (i32.or (local.get $prefix_lock)
+              (i32.eq (i32.and (local.get $op) (i32.const 0xFE)) (i32.const 0x86))))
         (then
           (if (i32.or (local.get $prefix_lock)
                       (i32.or (i32.eq (local.get $op) (i32.const 0x86)) (i32.eq (local.get $op) (i32.const 0x87))))
@@ -4226,7 +4693,8 @@
               (local.set $done (i32.const 1))
               (br $decode)))
           (call $decode_modrm)
-          (local.set $imm (call $d_fetch8))
+          ;; Mask before encoding: 0xFF is the threaded handler's CL marker.
+          (local.set $imm (i32.and (call $d_fetch8) (i32.const 31)))
           (if (i32.eq (local.get $op) (i32.const 0xC0))
             (then ;; 8-bit shift
               (if (i32.eq (global.get $mr_mod) (i32.const 3))
@@ -4422,6 +4890,9 @@
           ;; bit 4 = addr16 (0x67 prefix): use CX instead of ECX as counter
           (if (local.get $prefix_67) (then (local.set $imm (i32.or (local.get $imm) (i32.const 0x10)))))
           (local.set $a (call $branch_target (local.get $disp)))
+          ;; Operand size truncates a taken IP; address size selects CX/ECX.
+          (if (i32.and (local.get $prefix_66) (i32.eqz (global.get $code16)))
+            (then (local.set $a (i32.and (local.get $a) (i32.const 0xFFFF)))))
           ;; A backward LOOP target may be an interior entry of the block being
           ;; emitted, so the post-block self-loop pass never sees it as a head.
           ;; Give the exact XLAT/STOSB suffix a chance to replace itself here.
@@ -4438,9 +4909,12 @@
       (if (i32.eq (local.get $op) (i32.const 0xE3))
         (then
           (local.set $disp (call $sign_ext8 (call $d_fetch8)))
+          (local.set $a (call $branch_target (local.get $disp)))
+          (if (i32.and (local.get $prefix_66) (i32.eqz (global.get $code16)))
+            (then (local.set $a (i32.and (local.get $a) (i32.const 0xFFFF)))))
           ;; bit 0 = addr16 (0x67 prefix → JCXZ tests CX instead of ECX)
           (call $te (i32.const 216) (if (result i32) (local.get $prefix_67) (then (i32.const 1)) (else (i32.const 0))))
-          (call $te_raw (call $branch_target (local.get $disp)))
+          (call $te_raw (local.get $a))
           (call $te_raw (global.get $d_pc))
           (local.set $done (i32.const 1)) (br $decode)))
 
@@ -5105,6 +5579,15 @@
                     (else (local.set $a (call $emit_sib_or_abs)) (call $te (i32.const 173) (global.get $mr_reg)) (call $te_raw (local.get $a))))))
               (br $decode)))
 
+          ;; 0x0F 0xC0: XADD r/m8, r8 (handler 278 byte-width marker).
+          (if (i32.eq (local.get $op) (i32.const 0xC0))
+            (then
+              (call $decode_modrm)
+              (if (i32.eq (global.get $mr_mod) (i32.const 3))
+                (then (call $te (i32.const 278) (i32.or (i32.const 0x180) (i32.or (i32.shl (global.get $mr_val) (i32.const 4)) (global.get $mr_reg)))))
+                (else (local.set $a (call $emit_sib_or_abs)) (call $te (i32.const 278) (i32.or (i32.const 0x100) (global.get $mr_reg))) (call $te_raw (local.get $a))))
+              (br $decode)))
+
           ;; 0x0F 0xC1: XADD r/m32, r32 (or r/m16, r16 with 66h)
           (if (i32.eq (local.get $op) (i32.const 0xC1))
             (then
@@ -5202,6 +5685,66 @@
               (br $decode)))
 
           ;; ---- SSE base ----
+          ;; Reached legacy SSE2 reshape forms. Match mandatory prefixes
+          ;; exactly: 66 6E/7E are MOVD XMM (unprefixed is still MMX), NP 5B
+          ;; is CVTDQ2PS, F2 10/11 MOVSD, NP 5A CVTPS2PD, F3 5A CVTSS2SD.
+          ;; Gear building also reaches F2 58/59/5C/5E scalar doubles,
+          ;; 66 5A CVTPD2PS and F3 E6 CVTDQ2PD. Mixed mandatory prefixes,
+          ;; LOCK and other conversion families remain unsupported below.
+          (local.set $mmxsub (i32.const -1))
+          (if (i32.and (i32.eqz (global.get $code16)) (i32.eqz (local.get $prefix_lock))) (then
+            (if (i32.and (local.get $prefix_66) (i32.eqz (local.get $prefix_rep))) (then
+              (if (i32.eq (local.get $op) (i32.const 0x6e)) (then (local.set $mmxsub (i32.const 34))))
+              (if (i32.eq (local.get $op) (i32.const 0x7e)) (then (local.set $mmxsub (i32.const 35))))
+              (if (i32.eq (local.get $op) (i32.const 0x5a)) (then (local.set $mmxsub (i32.const 44))))))
+            (if (i32.eqz (local.get $prefix_66)) (then
+              (if (i32.eqz (local.get $prefix_rep)) (then
+                (if (i32.eq (local.get $op) (i32.const 0x5b)) (then (local.set $mmxsub (i32.const 36))))
+                (if (i32.eq (local.get $op) (i32.const 0x5a)) (then (local.set $mmxsub (i32.const 38))))))
+              (if (i32.and (i32.eq (local.get $prefix_rep) (i32.const 2))
+                    (i32.or (i32.eq (local.get $op) (i32.const 0x10))
+                            (i32.eq (local.get $op) (i32.const 0x11))))
+                (then (local.set $mmxsub (i32.const 37))))
+              (if (i32.and (i32.eq (local.get $prefix_rep) (i32.const 1))
+                    (i32.eq (local.get $op) (i32.const 0x5a)))
+                (then (local.set $mmxsub (i32.const 39))))
+              (if (i32.eq (local.get $prefix_rep) (i32.const 2)) (then
+                (if (i32.eq (local.get $op) (i32.const 0x58)) (then (local.set $mmxsub (i32.const 40))))
+                (if (i32.eq (local.get $op) (i32.const 0x59)) (then (local.set $mmxsub (i32.const 41))))
+                (if (i32.eq (local.get $op) (i32.const 0x5c)) (then (local.set $mmxsub (i32.const 42))))
+                (if (i32.eq (local.get $op) (i32.const 0x5e)) (then (local.set $mmxsub (i32.const 43))))))
+              (if (i32.and (i32.eq (local.get $prefix_rep) (i32.const 1))
+                    (i32.eq (local.get $op) (i32.const 0xe6)))
+                (then (local.set $mmxsub (i32.const 45))))))))
+          (if (i32.ne (local.get $mmxsub) (i32.const -1)) (then
+            (call $decode_modrm)
+            (local.set $imm (i32.shl (local.get $mmxsub) (i32.const 8)))
+            (if (i32.and (i32.or (i32.eq (local.get $mmxsub) (i32.const 36))
+                                (i32.eq (local.get $mmxsub) (i32.const 44)))
+                  (i32.ne (global.get $mr_mod) (i32.const 3)))
+              (then (local.set $imm (i32.or (local.get $imm)
+                (i32.shl (i32.sub (local.get $insn_start) (local.get $start_eip)) (i32.const 16))))))
+            (if (i32.or (i32.eq (local.get $mmxsub) (i32.const 35))
+                  (i32.and (i32.eq (local.get $mmxsub) (i32.const 37))
+                           (i32.eq (local.get $op) (i32.const 0x11))))
+              (then
+                (if (i32.eq (global.get $mr_mod) (i32.const 3))
+                  (then (call $te_sse (i32.const 432)
+                    (i32.or (local.get $imm)
+                      (i32.or (i32.shl (global.get $mr_val) (i32.const 4)) (global.get $mr_reg)))))
+                  (else (call $emit_sse_mem (i32.const 434)
+                    (i32.or (local.get $imm)
+                      (i32.shl (global.get $mr_reg) (i32.const 4)))))))
+              (else
+                (if (i32.eq (global.get $mr_mod) (i32.const 3))
+                  (then (call $te_sse (i32.const 432)
+                    (i32.or (local.get $imm)
+                      (i32.or (i32.shl (global.get $mr_reg) (i32.const 4)) (global.get $mr_val)))))
+                  (else (call $emit_sse_mem (i32.const 433)
+                    (i32.or (local.get $imm)
+                      (i32.shl (global.get $mr_reg) (i32.const 4))))))))
+            (br $decode)))
+
           ;; MOVMSKPS r32,xmm extracts the four lane sign bits. It has only a
           ;; register source form.
           (if (i32.and
@@ -5217,12 +5760,14 @@
                       (i32.or (i32.shl (global.get $mr_reg) (i32.const 4))
                               (global.get $mr_val))))
                   (br $decode)))))
-          ;; CMPPS xmm,xmm/m128,imm8. All eight SSE1 predicates are handled by
-          ;; one subop; preserve the immediate in bits 16..23.
+          ;; CMPPS xmm,xmm/m128,imm8 and F3 CMPSS xmm,xmm/m32,imm8.
+          ;; Legacy SSE1 uses imm8[2:0]; bits 7:3 are reserved, not AVX predicates.
+          ;; Preserve the immediate in bits 16..23; reject 66/F2/LOCK forms.
           (if (i32.and
                 (i32.eq (local.get $op) (i32.const 0xC2))
                 (i32.and (i32.eqz (local.get $prefix_66))
-                         (i32.eqz (local.get $prefix_rep))))
+                  (i32.and (i32.eqz (local.get $prefix_lock))
+                    (i32.le_u (local.get $prefix_rep) (i32.const 1)))))
             (then
               (call $decode_modrm)
               (if (i32.eq (global.get $mr_mod) (i32.const 3))
@@ -5230,7 +5775,8 @@
                   (local.set $imm (call $d_fetch8))
                   (call $te_sse (i32.const 432)
                     (i32.or (i32.shl (local.get $imm) (i32.const 16))
-                      (i32.or (i32.const 0x1F00)
+                      (i32.or (select (i32.const 0x3000) (i32.const 0x1F00)
+                                (i32.eq (local.get $prefix_rep) (i32.const 1)))
                         (i32.or (i32.shl (global.get $mr_reg) (i32.const 4))
                                 (global.get $mr_val)))))
                   (br $decode))
@@ -5240,20 +5786,29 @@
                   (local.set $imm (call $d_fetch8))
                   (call $te_sse (i32.const 433)
                     (i32.or (i32.shl (local.get $imm) (i32.const 16))
-                      (i32.or (i32.const 0x1F00)
+                      (i32.or (select (i32.const 0x3000) (i32.const 0x1F00)
+                                (i32.eq (local.get $prefix_rep) (i32.const 1)))
                               (i32.shl (global.get $mr_reg) (i32.const 4)))))
                   (call $te_raw (local.get $a))
                   (br $decode)))))
           ;; MOVLPS xmm,m64 / MOVLPS m64,xmm replace or store only the low
-          ;; half. Register encodings of 0F12 are MOVHLPS and are deliberately
-          ;; left unsupported until separately implemented.
+          ;; half. Register 0F12 is MOVHLPS xmm,xmm; register 0F13 is invalid.
           (if (i32.and
                 (i32.and (i32.eqz (local.get $prefix_66))
-                         (i32.eqz (local.get $prefix_rep)))
+                  (i32.and (i32.eqz (local.get $prefix_rep))
+                           (i32.eqz (local.get $prefix_lock))))
                 (i32.or (i32.eq (local.get $op) (i32.const 0x12))
                         (i32.eq (local.get $op) (i32.const 0x13))))
             (then
               (call $decode_modrm)
+              (if (i32.and (i32.eq (global.get $mr_mod) (i32.const 3))
+                           (i32.eq (local.get $op) (i32.const 0x12)))
+                (then
+                  (call $te_sse (i32.const 432)
+                    (i32.or (i32.const 0x3200)
+                      (i32.or (i32.shl (global.get $mr_reg) (i32.const 4))
+                              (global.get $mr_val))))
+                  (br $decode)))
               (if (i32.ne (global.get $mr_mod) (i32.const 3))
                 (then
                   (call $apply_seg_override)
@@ -5265,6 +5820,23 @@
                             (i32.shl (global.get $mr_reg) (i32.const 4))))
                   (call $te_raw (local.get $a))
                   (br $decode)))))
+          ;; CVTPS2PI mm,xmm/m64 (NP 0F2D). Keep scalar F3 and other
+          ;; mandatory-prefix families separate; LOCK is invalid here.
+          (if (i32.and (i32.eq (local.get $op) (i32.const 0x2d))
+            (i32.and (i32.eqz (local.get $prefix_66))
+              (i32.and (i32.eqz (local.get $prefix_rep))
+                       (i32.eqz (local.get $prefix_lock))))) (then
+            (call $decode_modrm)
+            (if (i32.eq (global.get $mr_mod) (i32.const 3)) (then
+              (call $te_sse (i32.const 432) (i32.or (i32.const 0x3300)
+                (i32.or (i32.shl (global.get $mr_reg) (i32.const 4)) (global.get $mr_val)))))
+            (else
+              (call $apply_seg_override)
+              (local.set $a (call $emit_sib_or_abs))
+              (call $te_sse (i32.const 433) (i32.or (i32.const 0x3300)
+                (i32.shl (global.get $mr_reg) (i32.const 4))))
+              (call $te_raw (local.get $a))))
+            (br $decode)))
           ;; CVTSS2SI r32,xmm/m32 (default MXCSR nearest-even rounding).
           (if (i32.and (i32.eq (local.get $op) (i32.const 0x2d))
             (i32.and (i32.eqz (local.get $prefix_66))
@@ -5277,6 +5849,26 @@
               (call $apply_seg_override)
               (local.set $a (call $emit_sib_or_abs))
               (call $te_sse (i32.const 433) (i32.or (i32.const 0x1200)
+                (i32.shl (global.get $mr_reg) (i32.const 4))))
+              (call $te_raw (local.get $a))))
+            (br $decode)))
+          ;; CVTPI2PS xmm,mm/m64 (NP 0F2A) is a separate SSE1 family.
+          ;; prefix_66 already encodes the default operand size here. Undo
+          ;; the code16 inversion only in this gate to test the actual prefix.
+          (if (i32.and (i32.eq (local.get $op) (i32.const 0x2a))
+            (i32.and (i32.eq (local.get $prefix_66)
+              (i32.and (i32.ne (global.get $code16) (i32.const 0))
+                       (i32.eqz (global.get $cs_big))))
+              (i32.and (i32.eqz (local.get $prefix_rep))
+                       (i32.eqz (local.get $prefix_lock))))) (then
+            (call $decode_modrm)
+            (if (i32.eq (global.get $mr_mod) (i32.const 3)) (then
+              (call $te_sse (i32.const 432) (i32.or (i32.const 0x3400)
+                (i32.or (i32.shl (global.get $mr_reg) (i32.const 4)) (global.get $mr_val)))))
+            (else
+              (call $apply_seg_override)
+              (local.set $a (call $emit_sib_or_abs))
+              (call $te_sse (i32.const 433) (i32.or (i32.const 0x3400)
                 (i32.shl (global.get $mr_reg) (i32.const 4))))
               (call $te_raw (local.get $a))))
             (br $decode)))
@@ -5331,6 +5923,24 @@
                 (i32.or (i32.const 0x2100) (i32.shl (global.get $mr_reg) (i32.const 4)))))
             (br $decode)))
 
+          ;; Legacy UNPCKHPS has no mandatory prefix. Keep SSE2/AVX forms and
+          ;; LOCK unsupported; memory EAs retain the ordinary segment handling.
+          (if (i32.and (i32.eq (local.get $op) (i32.const 0x15))
+                (i32.and (i32.eqz (local.get $prefix_66))
+                  (i32.and (i32.eqz (local.get $prefix_rep)) (i32.eqz (local.get $prefix_lock)))))
+            (then
+              (call $decode_modrm)
+              (if (i32.eq (global.get $mr_mod) (i32.const 3))
+                (then (call $te_sse (i32.const 432)
+                  (i32.or (i32.const 0x3100)
+                    (i32.or (i32.shl (global.get $mr_reg) (i32.const 4)) (global.get $mr_val)))))
+                (else
+                  (call $apply_seg_override)
+                  (call $emit_sse_mem (i32.const 433)
+                    (i32.or (i32.shl (i32.sub (local.get $insn_start) (local.get $start_eip)) (i32.const 16))
+                      (i32.or (i32.const 0x3100) (i32.shl (global.get $mr_reg) (i32.const 4)))))))
+              (br $decode)))
+
           ;; SDL2's Win32 video bootstrap is built with baseline SSE and uses
           ;; these exact bitwise/move forms before it has created a window.
           ;; F3 0F10/11 are scalar MOVSS; 0F14 is UNPCKLPS; 0F16/17 are the
@@ -5362,7 +5972,11 @@
                                       (i32.eq (local.get $op) (i32.const 0x59))
                                       (i32.or
                                         (i32.eq (local.get $op) (i32.const 0x5c))
-                                        (i32.eq (local.get $op) (i32.const 0x5e))))))))))))))
+                                        (i32.or
+                                          (i32.eq (local.get $op) (i32.const 0x5e))
+                                          (i32.and (i32.eqz (local.get $prefix_lock))
+                                            (i32.or (i32.eq (local.get $op) (i32.const 0x5d))
+                                                    (i32.eq (local.get $op) (i32.const 0x5f)))))))))))))))))
                 (i32.or
                   (i32.or
                     (i32.or
@@ -5415,6 +6029,10 @@
                     (then (local.set $imm (i32.const 13))))
                   (if (i32.eq (local.get $op) (i32.const 0x5c))
                     (then (local.set $imm (i32.const 14))))
+                  (if (i32.eq (local.get $op) (i32.const 0x5d))
+                    (then (local.set $imm (i32.const 46))))
+                  (if (i32.eq (local.get $op) (i32.const 0x5f))
+                    (then (local.set $imm (i32.const 47))))
                   (if (i32.eq (local.get $op) (i32.const 0x51))
                     (then (local.set $imm (i32.const 27))))
                   (if (i32.eq (local.get $op) (i32.const 0x52))

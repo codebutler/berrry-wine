@@ -14,6 +14,15 @@ const { bootRenderHarness } = require('./render-helper');
   const { exports: e, memory } = await bootRenderHarness({ fonts: 'none', extraWat: fragment + `
     (func (export "shader_test_alloc") (param $n i32) (result i32)
       (call $g2w (call $heap_alloc (local.get $n))))
+    (func (export "shader_test_address") (param $x i32) (param $n i32) (param $mode i32) (result i32)
+      (call $d3d_shader_vm_address (local.get $x) (local.get $n) (local.get $mode)))
+    (func (export "shader_test_sample4") (param $desc i32) (param $u f32) (param $v f32) (param $out i32)
+      (v128.store (local.get $out) (call $d3d_shader_vm_sample4 (local.get $desc) (local.get $u) (local.get $v))))
+    (func (export "shader_test_sample_scalar") (param $desc i32) (param $u f32) (param $v f32) (param $out i32)
+      (f32.store (local.get $out) (call $d3d_shader_vm_sample (local.get $desc) (local.get $u) (local.get $v) (i32.const 0)))
+      (f32.store offset=4 (local.get $out) (call $d3d_shader_vm_sample (local.get $desc) (local.get $u) (local.get $v) (i32.const 1)))
+      (f32.store offset=8 (local.get $out) (call $d3d_shader_vm_sample (local.get $desc) (local.get $u) (local.get $v) (i32.const 2)))
+      (f32.store offset=12 (local.get $out) (call $d3d_shader_vm_sample (local.get $desc) (local.get $u) (local.get $v) (i32.const 3))))
     (func (export "shader_test_quad_lod") (param $ctx i32) (param $u0 f32) (param $u1 f32) (param $u2 f32) (param $u3 f32)
       (param $v0 f32) (param $v1 f32) (param $v2 f32) (param $v3 f32) (param $lane i32) (result f32)
       (call $d3d_shader_vm_lane (call $d3d_shader_vm_quad_lod
@@ -65,6 +74,51 @@ const { bootRenderHarness } = require('./render-helper');
   const b = [[2,3,4,5],[3,4,5,6],[4,5,6,7],[5,6,7,8]];
   const c = [[0.25,0.5,0.75,1],[1,2,3,4],[2,3,4,5],[3,4,5,6]];
   let cases = 0;
+  // Integer footprint oracle is independent of the sampler's scalar/vector
+  // twins, which share address(). Include every interior texel of both POT
+  // and NPOT dimensions, plus negative and outside taps and integer limits.
+  for (const n of [1,2,3,7,16,31,256,1023,2047,2048]) {
+    const taps = [...Array(n).keys(), -2147483648, -3*n-1, -n, -1, n, n+1, 3*n+1, 2147483647];
+    for (const mode of [1,2,3,4]) for (const x of taps) {
+      const repeat = ((x % n) + n) % n, mirror = ((x % (2*n)) + 2*n) % (2*n);
+      const expected = mode === 1 ? repeat : mode === 2 ? (mirror < n ? mirror : 2*n-1-mirror) :
+        mode === 3 ? Math.max(0,Math.min(n-1,x)) : (x < 0 || x >= n ? -1 : x);
+      assert.strictEqual(e.shader_test_address(x,n,mode), expected, `address ${x}/${n} mode${mode}`);
+    }
+    cases++;
+  }
+  // Check point and bilinear vector footprints against the scalar sampler,
+  // especially when a neighbor wraps, mirrors,
+  // clamps or becomes border. NPOT, singleton axes and padded rows expose
+  // accidentally deriving a neighbor from an already resolved coordinate.
+  {
+    const desc=e.shader_test_alloc(36),out=e.shader_test_alloc(32);
+    for (const [width,height] of [[1,1],[3,7],[7,3]]) {
+      const pitch=width*4+8,pixels=e.shader_test_alloc(pitch*height);
+      const bytes=new Uint8Array(mem.buffer,pixels,pitch*height);
+      bytes.forEach((_,i)=>{bytes[i]=(i*73+19)&255;});
+      for (const format of [0,21,22,62,63]) for (const filter of [1,2])
+      for (const modeU of [1,2,3,4]) for (const modeV of [1,2,3,4]) {
+        u32.set([pixels,width,height,pitch,format,modeU,modeV,filter,0x9347b12d],desc/4);
+        const metadata=Array.from(u32.slice(desc/4,desc/4+9)),before=Array.from(bytes);
+        const uv=[[0,-0],[-0,0],[1,1],[-1,-1],[2,2],[-.25,1.25],
+          [.5/width,.5/height],[1-.5/width,1-.5/height],
+          [1-2**-24,2**-24],[NaN,.5],[.5,Infinity],[-Infinity,.5]];
+        for (const [u,v] of uv) {
+          e.shader_test_sample4(desc,u,v,out);
+          e.shader_test_sample_scalar(desc,u,v,out+16);
+          assert.deepStrictEqual(Array.from(u32.slice(out/4,out/4+4)),
+            Array.from(u32.slice(out/4+4,out/4+8)),
+            `exact footprint ${width}x${height} format${format} filter${filter} modes${modeU}/${modeV} uv${u}/${v}`);
+        }
+        assert.deepStrictEqual(Array.from(u32.slice(desc/4,desc/4+9)),metadata,'sampling preserves descriptor');
+        assert.deepStrictEqual(Array.from(bytes),before,'sampling preserves padded pixels');
+        cases++;
+      }
+      e.d3d_shader_vm_free(pixels);
+    }
+    e.d3d_shader_vm_free(out);e.d3d_shader_vm_free(desc);
+  }
   // LOG and LOGP use a finite negative sentinel for both signs of zero.
   // Keep log2's internal -Infinity policy separate (texture LOD relies on it).
   for (const opcode of [15, 79]) for (let scalar = 0; scalar < 4; scalar++)
@@ -362,6 +416,36 @@ const { bootRenderHarness } = require('./render-helper');
     actual.forEach((v,i)=>assert.ok(Math.abs(v-expected[i])<2e-6,`${label} component ${i}: ${v} != ${expected[i]}`));
   }
   const texTokens=[0xffff0101,66,dstToken(3),1,dstToken(0),srcToken(3),65535];
+  // A cached TEX component must retain partial writes, helper lanes and the
+  // projected invalid-lane mask. Re-executing the same packet after a yield
+  // must use the new coordinates and texture bytes, not the previous cache.
+  for (const projection of [0,4]) for (const mask of [1,2,5,10,15]) for (const lanes of [1,5,15]) {
+    // Partial TEX writes are a VM packet capability;
+    // the PS1.1 token validator correctly requires a full destination mask.
+    const normalized=ir([ins(66,opnd(3,0,mask)),ins(1,d(0),opnd(3,0))]);
+    u32[(normalized+8)/4]=1;u32[(normalized+12)/4]=0xffff0101;
+    const program=e.d3d_shader_vm_compile(normalized);
+    e.d3d_shader_vm_free(normalized);assert.ok(program,'masked TEX VM program');
+    const ctx=e.d3d_shader_vm_context(program,lanes),pixels=texture(ctx,{filter:2,addressU:4,addressV:2});
+    assert.strictEqual(e.d3d_shader_vm_bind_projection(ctx,0,projection),1);
+    for(let rep=0;rep<3;rep++) {
+      const u=rep===2?[NaN,Infinity,-0,1]:[.25+rep*.25,.75,-.25,1.25];
+      const v=[.25,.75,-0,1],q=projection?[1,0,Infinity,-0]:[1,1,1,1];
+      const before=[u,v,[0,-0,1,-1],q].map(row=>row.map(Math.fround));
+      register(ctx,0,before,3);u32[(ctx+24)/4]=lanes;u32[(ctx+8)/4]=0;
+      new Uint8Array(mem.buffer,pixels,24)[0]=rep*71;
+      const expected=before.map((row,c)=>row.map((old,lane)=>{
+        if(!(mask&(1<<c))||!(lanes&(1<<lane)))return old;
+        if(projection && lane!==0)return 0;
+        return e.d3d_shader_vm_sample_lod(ctx,0,u[lane],v[lane],0,c);
+      })).flat();
+      assert.strictEqual(e.d3d_shader_vm_run(ctx,1),1,'TEX retires before budget yield');
+      register(ctx,0,null,3).forEach((value,i)=>assert.ok(Object.is(value,expected[i]),
+        `TEX cache projection${projection} mask${mask} lanes${lanes} rep${rep} word${i}`));
+      assert.strictEqual(e.d3d_shader_vm_run(ctx,1),0,'resume MOV after TEX');
+    }
+    e.d3d_shader_vm_free(pixels);e.d3d_shader_vm_free(ctx);e.d3d_shader_vm_free(program);cases++;
+  }
   // Independently colored mip levels: choosing/blending levels has an exact
   // answer, unrelated to texture-coordinate arithmetic or the shader compiler.
   function mipFixture(ctx,{mode=2,min=1,mag=1,bias=0,max=0,first=0,format=0}={}) {
@@ -379,6 +463,29 @@ const { bootRenderHarness } = require('./render-helper');
     return {desc,table,pixels,free(){for(const p of [...pixels,desc,table])e.d3d_shader_vm_free(p);}};
   }
   const sampleLOD=(ctx,lod,u=.5,v=.5)=>[0,1,2,3].map(c=>e.d3d_shader_vm_sample_lod(ctx,0,u,v,lod,c));
+  // A legal PS1.4 dependent projection can produce huge but finite UVs
+  // from constants inside [-1,1]. All four lanes have identical coordinates:
+  // dx=dy=0, so the independently colored mip0 must be red. Scaling the
+  // endpoints before subtraction overflowed to Inf-Inf and sampled NaNs.
+  for (const canonical of [false,true]) for (const lanes of [1,5,15])
+  for (const sign of [-1,1]) for (const filter of [1,2]) for (const axis of [0,1]) {
+    const normalized=ir([ins(1,d(1),opnd(2,0)),ins(66,d(0),s(1,0xe4,9))],1);
+    u32[(normalized+8)/4]=1;u32[(normalized+12)/4]=0xffff0104;
+    const core=canonical?e.d3d_shader_ir_canonicalize(normalized):0;
+    if(canonical)assert.ok(core,'dependent projection canonicalizes');
+    const program=e.d3d_shader_vm_compile(core||normalized);
+    assert.ok(program,'dependent projection compiles');
+    const ctx=e.d3d_shader_vm_context(program,lanes),m=mipFixture(ctx,{min:filter,mag:filter});
+    const uv=axis?[.25,sign]:[sign,.25];
+    register(ctx,0,[...uv.map(v=>Array(4).fill(v)),Array(4).fill(1e-38),Array(4).fill(1)],2);
+    u32[(ctx+24)/4]=15;
+    assert.strictEqual(e.d3d_shader_vm_run(ctx,1),1,'projection source survives budget yield');
+    assert.strictEqual(e.d3d_shader_vm_run(ctx,256),0);
+    near(register(ctx,0),rgbaLanes(Array(4).fill(colors[0])),
+      `constant projected finite UV canonical${canonical} lanes${lanes} sign${sign} filter${filter} axis${axis}`);
+    assert.strictEqual(e.d3d_shader_vm_live_mask(ctx),lanes,'helpers do not add coverage');
+    m.free();for(const p of [ctx,program,core,normalized])if(p)e.d3d_shader_vm_free(p);cases++;
+  }
   function cubeFixture(ctx,stage=0) {
     const desc=e.shader_test_alloc(64),table=e.shader_test_alloc(6*3*16),pixels=[];
     for(let face=0;face<6;face++)for(let level=0;level<3;level++) {

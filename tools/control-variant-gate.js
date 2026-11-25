@@ -69,6 +69,7 @@ const SOURCE_FILES = WAT_FILES.map((file) => `src/${file}`);
 // sites and compares their literal arguments to the parsed layout size.
 const alloc = (func, count = 1) => ({ func, target: '$state', count });
 const VARIANTS = {
+  OpenFileFocusState: { allocators: [{func:'$opendlg_focus_begin',target:'$s',count:1}] },
   ButtonState:        { allocators: [alloc('$button_wndproc')] },
   StaticState:        { allocators: [alloc('$static_wndproc'), alloc('$syslink_wndproc')] },
   ProgressState:      { allocators: [alloc('$progress_wndproc', 2)] },
@@ -103,6 +104,11 @@ const add = (variant, names, why) => {
   }
 };
 
+add('ListBoxState', ['$listbox_wndproc'],
+  'class 4 WM_CREATE allocates ListBoxState; font messages and painting use that same window state');
+
+add('OpenFileFocusState', ['$opendlg_focus_begin','$opendlg_focus_end'],
+  'class 12 create_open_dialog owns the shared focus lease; WM_DESTROY detaches it before notifications');
 // Accessor layers. Each function's NAME is the field name, so the mapping is
 // self-evidencing: $btn_flags is ButtonState.flags and cannot be anything else.
 add('ButtonState', [
@@ -120,6 +126,7 @@ add('StaticState', [
 add('ProgressState', [
   '$prog_min', '$prog_set_min', '$prog_max', '$prog_set_max',
   '$prog_pos', '$prog_set_pos', '$prog_step', '$prog_set_step',
+  '$prog_bar_color', '$prog_set_bar_color', '$prog_bk_color', '$prog_set_bk_color',
 ], 'accessor layer; $prog_state_init writes the comctl32 defaults 0/100/0/10 through these');
 
 add('TrackBarState', [
@@ -136,6 +143,7 @@ add('ListBoxState', [
   '$lb_drag_anchor_top', '$lb_set_drag_anchor_top', '$lb_data_ptr', '$lb_set_data_ptr',
   '$lb_data_cap', '$lb_set_data_cap', '$lb_sel_ptr', '$lb_set_sel_ptr',
   '$lb_sel_cap', '$lb_set_sel_cap', '$lb_item_h', '$lb_set_item_h',
+  '$lb_horizontal_extent', '$lb_set_horizontal_extent', '$lb_scroll_x', '$lb_set_scroll_x',
 ], 'accessor layer');
 
 add('ComboBoxState', [
@@ -145,6 +153,8 @@ add('ComboBoxState', [
   '$cb_popup_hwnd', '$cb_set_popup_hwnd', '$cb_edit_hwnd', '$cb_set_edit_hwnd',
   '$cb_is_dropped', '$cb_set_is_dropped', '$cb_variant', '$cb_set_variant',
   '$cb_suppress_edit_notify', '$cb_set_suppress_edit_notify',
+  '$cb_dropped_width', '$cb_set_dropped_width',
+  '$cb_font', '$cb_set_font',
 ], 'accessor layer');
 
 add('ListViewState', [
@@ -169,6 +179,7 @@ add('ListViewState', [
 add('EditState', [
   '$edit_copy_range', '$edit_delete_range', '$edit_doc_width', '$edit_ensure_cap',
   '$edit_hscroll_to', '$edit_insert_bytes', '$edit_insert_char', '$edit_layout_build',
+  '$edit_layout_build_page', '$edit_layout_matches',
   '$edit_layout_xy_to_offset', '$edit_line_from_char', '$edit_line_index',
   '$edit_line_len', '$edit_line_start', '$edit_line_text_len', '$edit_reset_caret_timer',
   '$edit_rich_text_ex',
@@ -250,6 +261,11 @@ add('EditState', [
   'export:get_edit_text', 'export:get_edit_cursor', 'export:get_edit_sel_start',
   'export:get_edit_flags', 'export:get_edit_text_len', '$test_edit_visual_line_count',
 ], '13-exports test/renderer readers receive an EDIT hwnd and follow its state_ptr');
+add('EditState', ['$native_user_text_ptr', 'export:native_user_text_length'],
+  '13-exports public USER text readers access EditState only inside the ctrl_class == 2 branch; ' +
+  'BUTTON/STATIC branches call their existing typed accessor layers instead');
+add('EditState', ['export:native_edit_viewport'],
+  'public viewport validates ctrl_class 2 and an exact live 40-byte EditState allocation before accessing fields');
 add('ButtonState', ['$dialog_first_default_button'],
   '10-helpers filters children to ctrl_class 1 before following state_ptr');
 add('ColorGridState', ['export:colorgrid_get_sel'],

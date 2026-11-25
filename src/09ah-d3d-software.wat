@@ -825,6 +825,38 @@
     (then (f32.mul (local.get $value) (local.get $riw)))
     (else (f32.div (local.get $value) (local.get $iw)))))
 
+;; Four quad lanes already occupy one VM SIMD vector per varying. Interpolate
+;; directly into that layout, retaining the scalar multiply/add order and the
+;; direct-division fallback for nonfinite reciprocals (including helper lanes).
+(func $d3d_software_quad_varyings
+  (param $vm i32) (param $a i32) (param $b i32) (param $c i32) (param $vmask i32)
+  (param $u v128) (param $v v128) (param $w v128) (param $iw v128) (param $riw v128)
+  (local $j i32) (local $offset i32) (local $bank i32) (local $value v128) (local $finite v128)
+  (local.set $finite (f32x4.le (f32x4.abs (local.get $riw)) (f32x4.splat (f32.const 3.4028234663852886e38))))
+  (loop $varyings
+    (local.set $offset (select
+      (i32.add (i32.const 16) (i32.shl (local.get $j) (i32.const 2)))
+      (i32.add (i32.const 144) (i32.shl (i32.sub (local.get $j) (i32.const 28)) (i32.const 2)))
+      (i32.lt_u (local.get $j) (i32.const 28))))
+    (local.set $bank (if (result i32) (i32.lt_u (local.get $j) (i32.const 4))
+      (then (i32.add (i32.const 8224) (i32.shl (local.get $j) (i32.const 4))))
+      (else (if (result i32) (i32.lt_u (local.get $j) (i32.const 28))
+        (then (i32.add (i32.const 24608) (i32.shl (i32.sub (local.get $j) (i32.const 4)) (i32.const 4))))
+        (else (i32.add (i32.const 8288) (i32.shl (i32.sub (local.get $j) (i32.const 28)) (i32.const 4))))))))
+    (local.set $value (v128.const i32x4 0 0 0 0))
+    (if (i32.and (i32.shr_u (local.get $vmask) (local.get $j)) (i32.const 1)) (then
+      (local.set $value (f32x4.add (f32x4.add
+        (f32x4.mul (local.get $u) (v128.load32_splat (i32.add (local.get $a) (local.get $offset))))
+        (f32x4.mul (local.get $v) (v128.load32_splat (i32.add (local.get $b) (local.get $offset)))))
+        (f32x4.mul (local.get $w) (v128.load32_splat (i32.add (local.get $c) (local.get $offset))))))
+      (local.set $value (if (result v128) (i32.eq (i32x4.bitmask (local.get $finite)) (i32.const 15))
+        (then (f32x4.mul (local.get $value) (local.get $riw)))
+        (else (v128.bitselect (f32x4.mul (local.get $value) (local.get $riw))
+          (f32x4.div (local.get $value) (local.get $iw)) (local.get $finite)))))))
+    (v128.store (i32.add (local.get $vm) (local.get $bank)) (local.get $value))
+    (local.set $j (i32.add (local.get $j) (i32.const 1)))
+    (br_if $varyings (i32.lt_u (local.get $j) (i32.const 32)))))
+
 (func $d3d_software_depth_pass (param $fn i32) (param $z f32) (param $old f32) (result i32)
   (block $always (block $ge (block $ne (block $gt (block $le (block $eq (block $lt (block $never
     (br_table $never $never $lt $eq $le $gt $ne $ge $always $never (local.get $fn)))
@@ -1158,7 +1190,9 @@
   (local $bank i32) (local $offset i32) (local $e0 f32) (local $e1 f32) (local $e2 f32)
   (local $u f32) (local $v f32) (local $w f32) (local $iw f32) (local $riw f32) (local $z f32)
   (local $output i32) (local $wire i32) (local $point i32) (local $sprite i32) (local $dx f32) (local $dy f32) (local $half f32) (local $value f32)
-  (local $vmask i32) (local $glide i32) (local $glide_q f32)
+  (local $vmask i32) (local $vmask_valid i32) (local $glide i32) (local $glide_q f32)
+  (local $top0 i32) (local $top1 i32) (local $top2 i32)
+  (local $qu v128) (local $qv v128) (local $qw v128) (local $qiw v128) (local $qriw v128)
   (if (i32.eqz (call $d3d_shader_vm_range (local.get $ctx) (i32.const 256))) (then (return (i32.const -1))))
   (if (i32.ne (i32.load (local.get $ctx)) (i32.const 0x44535031)) (then (return (i32.const -1))))
   (if (i32.le_s (i32.load offset=140 (local.get $ctx)) (i32.const 0)) (then (return (i32.load offset=140 (local.get $ctx)))))
@@ -1172,6 +1206,7 @@
     (if (i32.le_s (local.get $budget) (i32.const 0)) (then (return (i32.const 1))))
     (local.set $budget (i32.sub (local.get $budget) (i32.const 1)))
     (if (i32.eqz (i32.load offset=192 (local.get $ctx))) (then
+      (local.set $vmask_valid (i32.const 0))
       (if (i32.eqz (call $d3d_software_prepare (local.get $ctx))) (then
         (i32.store offset=252 (local.get $ctx) (i32.and (i32.load offset=252 (local.get $ctx)) (i32.const 127)))
         (i32.store offset=128 (local.get $ctx) (i32.add (i32.load offset=128 (local.get $ctx)) (i32.const 3)))
@@ -1186,13 +1221,6 @@
     (if (local.get $point) (then
       (if (i32.load offset=200 (local.get $ctx)) (then
         (local.set $sprite (i32.and (i32.load offset=4 (i32.load offset=200 (local.get $ctx))) (i32.const 1)))))))
-    ;; Clear only the temp registers this program can name, not all 128. The
-    ;; bank is 8192 bytes and a ps_1_1 shader may reach two registers of it, so
-    ;; the constant was clearing 2KB per pixel -- about 630MB per 640x480 draw,
-    ;; and a measurable fraction of an untextured pixel. The span is computed
-    ;; once when the VM context is created and can never exceed the bank.
-    (memory.fill (i32.add (local.get $vm) (i32.const 32)) (i32.const 0)
-      (call $d3d_shader_vm_temp_bytes (local.get $vm)))
     ;; The varying loop below is a FIXED 28 iterations and the specular loop a
     ;; fixed 4, run for all four lanes of every quad whether the lane is inside
     ;; the triangle or not -- and a pixel shader that reads one varying pays for
@@ -1200,9 +1228,11 @@
     ;; compiled program in src/09ag-d3d-shader-vm.wat records no input mask), so
     ;; bound it by the data instead: a varying that is +0 at all three vertices
     ;; interpolates to zero at every pixel of this triangle, whatever the
-    ;; weights. Scan the three vertices once per quad -- 32 integer loads,
-    ;; against the interpolate-and-scale it saves four times over -- and store a
-    ;; literal zero for those instead of calling $d3d_software_interp.
+    ;; weights. Scan the three immutable vertex snapshots once per prepared
+    ;; geometry within this step call, rather than repeating 96 loads per quad.
+    ;; Preparation invalidates the local cache, including for outline edges;
+    ;; a resumed step starts invalid so no state is retained across calls.
+    ;; Store a literal zero for those instead of calling $d3d_software_interp.
     ;;
     ;; The store stays unconditional. Skipping it would leave the previous
     ;; triangle's value in the register bank, which is the trap here: this VM
@@ -1216,6 +1246,14 @@
     ;; could interpolate to -0 on an outside helper lane and now reads +0. That
     ;; is visible only to a shader that divides by such a varying and cares
     ;; which infinity it gets.
+    (if (i32.eqz (local.get $vmask_valid)) (then
+    ;; Top-left ownership depends only on the prepared vertex snapshots, not
+    ;; on the sample. Cache the exact predicate alongside the varying mask.
+    ;; Preparation (including outline edges) and every resumed call invalidate
+    ;; both; no cache survives a step or reads mutable caller vertices.
+    (local.set $top0 (call $d3d_software_inside (local.get $b) (local.get $c) (f32.const 0)))
+    (local.set $top1 (call $d3d_software_inside (local.get $c) (local.get $a) (f32.const 0)))
+    (local.set $top2 (call $d3d_software_inside (local.get $a) (local.get $b) (f32.const 0)))
     (local.set $vmask (i32.const 0)) (local.set $j (i32.const 0))
     (loop $scan
       (local.set $offset (i32.add (i32.const 16) (i32.shl (local.get $j) (i32.const 2))))
@@ -1234,6 +1272,7 @@
           (i32.eqz (i32.load (i32.add (local.get $c) (local.get $offset))))))
         (then (local.set $vmask (i32.or (local.get $vmask) (i32.shl (i32.const 1) (i32.add (local.get $j) (i32.const 28)))))))
       (local.set $j (i32.add (local.get $j) (i32.const 1))) (br_if $scan_specular (i32.lt_u (local.get $j) (i32.const 4))))
+    (local.set $vmask_valid (i32.const 1))))
     (local.set $lane (i32.const 0)) (local.set $bits (i32.const 0))
     (loop $lanes
       (local.set $x (i32.add (i32.load offset=132 (local.get $ctx)) (i32.and (local.get $lane) (i32.const 1))))
@@ -1259,14 +1298,23 @@
         (local.set $z (call $d3d_software_quantize_depth
           (i32.shr_u (i32.load offset=204 (local.get $ctx)) (i32.const 16))
           (call $d3d_software_interp (local.get $a) (local.get $b) (local.get $c) (i32.const 8) (local.get $u) (local.get $v) (local.get $w))))
-        ;; Glide keeps global oow in the third texture-coordinate lane. The
-        ;; fourth lane is TMU-oow for PS1.4 projected sampling.
+        ;; The W depth/fog fragment reads screen-linear rhw from the output
+        ;; vertex byte offset its descriptor names (word 6): 12, the position
+        ;; w lane, when varyings are perspective-correct, or a texture lane the
+        ;; GPU stream executor filled when they interpolate screen-linear.
         (if (local.get $glide) (then
           (local.set $glide_q (call $d3d_software_interp (local.get $a) (local.get $b) (local.get $c)
-            (i32.const 40) (local.get $u) (local.get $v) (local.get $w)))
+            (i32.load offset=24 (local.get $glide)) (local.get $u) (local.get $v) (local.get $w)))
           (if (i32.eq (i32.load offset=12 (local.get $glide)) (i32.const 2)) (then
             (local.set $z (f32.div (f32.min (f32.const 65535) (f32.max (f32.const 0)
-              (f32.add (call $d3d_software_glide_w (local.get $glide_q)) (f32.load offset=16 (local.get $glide))))) (f32.const 65535)))))))
+              (f32.add (call $d3d_software_glide_w (local.get $glide_q)) (f32.load offset=16 (local.get $glide))))) (f32.const 65535)))))
+          ;; depthMode 3, the D3D W-buffer: w / w_far, w = 1 / q, stored like Z.
+          (if (i32.eq (i32.load offset=12 (local.get $glide)) (i32.const 3)) (then
+            (local.set $z (call $d3d_software_quantize_depth
+              (i32.shr_u (i32.load offset=204 (local.get $ctx)) (i32.const 16))
+              (if (result f32) (f32.gt (local.get $glide_q) (f32.const 0))
+                (then (f32.div (f32.const 1) (f32.mul (local.get $glide_q) (f32.load offset=28 (local.get $glide)))))
+                (else (f32.const 1)))))))))
         (f32.store (i32.add (i32.add (local.get $ctx) (i32.const 208)) (i32.shl (local.get $lane) (i32.const 2))) (local.get $z))
         (local.set $iw (call $d3d_software_interp (local.get $a) (local.get $b) (local.get $c) (i32.const 12) (local.get $u) (local.get $v) (local.get $w)))
         ;; Every varying is perspective-corrected by the SAME interpolated 1/W,
@@ -1282,14 +1330,28 @@
         ;; $d3d_software_perspective so finite tiny-RHW ratios survive.
         (local.set $riw (f32.div (f32.const 1) (local.get $iw)))
         (f32.store (i32.add (i32.add (local.get $ctx) (i32.const 264)) (i32.shl (local.get $lane) (i32.const 2)))
-          (if (result f32) (local.get $glide)
+          ;; A fogless W-buffer descriptor (depthMode 3) leaves the vertex fog.
+          (if (result f32) (i32.and (i32.ne (local.get $glide) (i32.const 0))
+                (i32.or (i32.ne (i32.load offset=20 (local.get $glide)) (i32.const 0))
+                  (i32.ne (i32.load offset=12 (local.get $glide)) (i32.const 3))))
             (then (call $d3d_software_glide_fog (local.get $glide) (local.get $glide_q)
               (call $d3d_software_interp (local.get $a) (local.get $b) (local.get $c) (i32.const 8) (local.get $u) (local.get $v) (local.get $w))
               (call $d3d_software_interp (local.get $a) (local.get $b) (local.get $c) (i32.const 28) (local.get $u) (local.get $v) (local.get $w))))
-            (else (if (result f32) (i32.load offset=280 (local.get $ctx))
+            (else (if (result f32) (i32.and (i32.eqz (local.get $glide)) (i32.ne (i32.load offset=280 (local.get $ctx)) (i32.const 0)))
             (then (call $d3d_software_table_fog_factor (i32.load offset=280 (local.get $ctx))
               (call $d3d_software_interp (local.get $a) (local.get $b) (local.get $c) (i32.const 8) (local.get $u) (local.get $v) (local.get $w)) (local.get $iw)))
             (else (call $d3d_software_perspective (call $d3d_software_interp (local.get $a) (local.get $b) (local.get $c) (i32.const 128) (local.get $u) (local.get $v) (local.get $w)) (local.get $iw) (local.get $riw)))))))
+        (local.set $qu (i8x16.shuffle 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+          (local.get $qu) (f32x4.splat (local.get $u))))
+        (local.set $qv (i8x16.shuffle 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+          (local.get $qv) (f32x4.splat (local.get $v))))
+        (local.set $qw (i8x16.shuffle 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+          (local.get $qw) (f32x4.splat (local.get $w))))
+        (local.set $qiw (i8x16.shuffle 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+          (local.get $qiw) (f32x4.splat (local.get $iw))))
+        (local.set $qriw (i8x16.shuffle 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+          (local.get $qriw) (f32x4.splat (local.get $riw))))
+        (if (local.get $sprite) (then
         (local.set $j (i32.const 0))
         (loop $varyings
           (local.set $bank (select (i32.const 8224)
@@ -1324,6 +1386,7 @@
                 (i32.add (i32.const 144) (i32.shl (local.get $j) (i32.const 2))) (local.get $u) (local.get $v) (local.get $w)) (local.get $iw) (local.get $riw)))
               (else (f32.const 0))))
           (local.set $j (i32.add (local.get $j) (i32.const 1))) (br_if $specular (i32.lt_u (local.get $j) (i32.const 4))))
+        ))
       (block $outside
         (br_if $outside (i32.or (i32.lt_u (local.get $x) (i32.load offset=76 (local.get $ctx)))
           (i32.or (i32.lt_u (local.get $y) (i32.load offset=80 (local.get $ctx)))
@@ -1338,12 +1401,24 @@
         (else (if (local.get $wire) (then
           (br_if $outside (i32.eqz (call $d3d_software_line_inside (local.get $a) (local.get $b) (local.get $x) (local.get $y)
             (i32.and (i32.load offset=252 (local.get $ctx)) (i32.const 64)))))) (else
-        (br_if $outside (i32.eqz (i32.and (call $d3d_software_inside (local.get $b) (local.get $c) (local.get $e0))
-          (i32.and (call $d3d_software_inside (local.get $c) (local.get $a) (local.get $e1))
-            (call $d3d_software_inside (local.get $a) (local.get $b) (local.get $e2))))))))))
+        (br_if $outside (i32.eqz (i32.and
+          (i32.or (f32.gt (local.get $e0) (f32.const 0)) (i32.and (f32.eq (local.get $e0) (f32.const 0)) (local.get $top0)))
+          (i32.and
+            (i32.or (f32.gt (local.get $e1) (f32.const 0)) (i32.and (f32.eq (local.get $e1) (f32.const 0)) (local.get $top1)))
+            (i32.or (f32.gt (local.get $e2) (f32.const 0)) (i32.and (f32.eq (local.get $e2) (f32.const 0)) (local.get $top2)))))))))))
         (local.set $bits (i32.or (local.get $bits) (i32.shl (i32.const 1) (local.get $lane)))))
       (local.set $lane (i32.add (local.get $lane) (i32.const 1))) (br_if $lanes (i32.lt_u (local.get $lane) (i32.const 4))))
     (if (local.get $bits) (then
+    ;; An empty coverage mask cannot execute a shader or write a fragment.
+    ;; Defer the temp reset and SIMD varying bank setup until coverage is
+    ;; known. A covered quad still initializes ALL four lanes, including
+    ;; derivative helpers, and each VM entry still starts with clean temps.
+    ;; Temp and varying banks are disjoint, including the sprite scalar path.
+    (memory.fill (i32.add (local.get $vm) (i32.const 32)) (i32.const 0)
+      (call $d3d_shader_vm_temp_bytes (local.get $vm)))
+    (if (i32.eqz (local.get $sprite)) (then
+      (call $d3d_software_quad_varyings (local.get $vm) (local.get $a) (local.get $b) (local.get $c) (local.get $vmask)
+        (local.get $qu) (local.get $qv) (local.get $qw) (local.get $qiw) (local.get $qriw))))
       (i32.store offset=8 (local.get $vm) (i32.const 0)) (i32.store offset=12 (local.get $vm) (i32.const 1))
       (i32.store offset=16 (local.get $vm) (local.get $bits))
       ;; Derivative helper lanes execute but coverage/depth remain output-only.
@@ -1379,13 +1454,21 @@
           (local.set $output (call $d3d_software_output (local.get $ctx)
             (i32.add (i32.add (local.get $vm) (i32.const 32)) (i32.shl (local.get $lane) (i32.const 2)))
             (i32.load (local.get $dst))))
+          ;; The common full mask needs no per-channel state dispatch. Keep
+          ;; the original byte-store order (R,G,B,A), including shared memory
+          ;; access widths; partial masks still use the general path below.
+          (if (i32.eq (i32.and (i32.load offset=108 (local.get $ctx)) (i32.const 15)) (i32.const 15)) (then
+            (i32.store8 offset=2 (local.get $dst) (i32.shr_u (local.get $output) (i32.const 16)))
+            (i32.store8 offset=1 (local.get $dst) (i32.shr_u (local.get $output) (i32.const 8)))
+            (i32.store8 (local.get $dst) (local.get $output))
+            (i32.store8 offset=3 (local.get $dst) (i32.shr_u (local.get $output) (i32.const 24)))) (else
           (local.set $j (i32.const 0))
           (loop $channels
             (if (i32.and (i32.load offset=108 (local.get $ctx)) (i32.shl (i32.const 1) (local.get $j))) (then
               (local.set $offset (select (i32.sub (i32.const 2) (local.get $j)) (i32.const 3) (i32.lt_u (local.get $j) (i32.const 3))))
               (i32.store8 (i32.add (local.get $dst) (local.get $offset))
                 (i32.shr_u (local.get $output) (i32.shl (local.get $offset) (i32.const 3))))))
-            (local.set $j (i32.add (local.get $j) (i32.const 1))) (br_if $channels (i32.lt_u (local.get $j) (i32.const 4))))
+            (local.set $j (i32.add (local.get $j) (i32.const 1))) (br_if $channels (i32.lt_u (local.get $j) (i32.const 4))))))
           (if (i32.and (i32.load offset=224 (local.get $ctx)) (i32.const 0x80000000))
             (then (i32.store8 offset=3 (local.get $dst) (i32.const 255))))
           (if (i32.and (i32.load offset=100 (local.get $ctx)) (i32.const 2)) (then
@@ -1506,7 +1589,12 @@
   (if (i32.eqz (call $d3d_shader_vm_range (local.get $desc) (i32.const 36))) (then (return (i32.const 0))))
   (if (i32.ne (i32.load (local.get $desc)) (i32.const 1)) (then (return (i32.const 0))))
   (local.set $flags (i32.load offset=4 (local.get $desc)))
-  (if (i32.gt_u (local.get $flags) (i32.const 3)) (then (return (i32.const 0))))
+  ;; flags bits4..8: GPS logic op 1..16 (1 + GL logic op - GL_CLEAR), only
+  ;; with blending off; applied to the packed output in $d3d_software_output.
+  (if (i32.or (i32.and (local.get $flags) (i32.const 0xfffffe0c))
+    (i32.or (i32.gt_u (i32.shr_u (local.get $flags) (i32.const 4)) (i32.const 16))
+      (i32.and (i32.ne (i32.shr_u (local.get $flags) (i32.const 4)) (i32.const 0))
+        (i32.ne (i32.and (local.get $flags) (i32.const 1)) (i32.const 0))))) (then (return (i32.const 0))))
   (local.set $rgb (call $d3d_software_blend_pack (i32.load offset=8 (local.get $desc)) (i32.load offset=12 (local.get $desc)) (i32.load offset=16 (local.get $desc))))
   (local.set $alpha (call $d3d_software_blend_pack (i32.load offset=20 (local.get $desc)) (i32.load offset=24 (local.get $desc)) (i32.load offset=28 (local.get $desc))))
   (if (i32.or (i32.eq (local.get $rgb) (i32.const -1)) (i32.eq (local.get $alpha) (i32.const -1))) (then (return (i32.const 0))))
@@ -1547,8 +1635,9 @@
   (if (i32.eq (local.get $op) (i32.const 3)) (then (return (f32x4.sub (local.get $b) (local.get $a)))))
   (f32x4.add (local.get $a) (local.get $b)))
 ;; Glide uses an opt-in owned 96-byte descriptor in the existing table-fog
-;; allocation: version1, mode4, ARGBcolor, depthMode0/1/2, bias:f32,
-;; fogMode0/1(alpha)/2(table)/3(Z), two reserved zeroes, table[64].
+;; allocation: version1, mode4, ARGBcolor, depthMode0/1/2/3, bias:f32,
+;; fogMode0/1(alpha)/2(table)/3(Z), q-lane offset, w_far:f32 (depthMode 3,
+;; the D3D W-buffer; else zero), table[64].
 ;; This is internal shader lowering, never a guest D3D capability.
 (func $d3d_software_glide_w (export "d3d_software_glide_w") (param $q f32) (result f32)
   (local $e i32)
@@ -1589,14 +1678,26 @@
       (i32.or (i32.load offset=128 (local.get $ctx)) (i32.load offset=192 (local.get $ctx))))) (then (return (i32.const 0))))
   (if (i32.or (i32.ne (i32.load (local.get $desc)) (i32.const 1))
     (i32.or (i32.ne (i32.load offset=4 (local.get $desc)) (i32.const 4))
-      (i32.or (i32.gt_u (i32.load offset=12 (local.get $desc)) (i32.const 2))
-        (i32.or (i32.gt_u (i32.load offset=20 (local.get $desc)) (i32.const 3))
-          (i32.or (i32.load offset=24 (local.get $desc)) (i32.load offset=28 (local.get $desc))))))) (then (return (i32.const 0))))
+      (i32.or (i32.gt_u (i32.load offset=12 (local.get $desc)) (i32.const 3))
+        (i32.gt_u (i32.load offset=20 (local.get $desc)) (i32.const 3))))) (then (return (i32.const 0))))
+  ;; Word 7: zero, or depthMode 3's (D3D W-buffer) finite positive f32 w_far.
+  (if (i32.eq (i32.load offset=12 (local.get $desc)) (i32.const 3))
+    (then (if (i32.eqz (i32.and (f32.gt (f32.load offset=28 (local.get $desc)) (f32.const 0))
+        (f32.lt (f32.load offset=28 (local.get $desc)) (f32.const inf)))) (then (return (i32.const 0)))))
+    (else (if (i32.load offset=28 (local.get $desc)) (then (return (i32.const 0))))))
+  ;; q lane: 12 (position w) or the x lane of output texture 0..5 (32 + 16n).
+  (local.set $copy (i32.load offset=24 (local.get $desc)))
+  (if (i32.eqz (i32.or (i32.eq (local.get $copy) (i32.const 12))
+      (i32.and (i32.and (i32.ge_u (local.get $copy) (i32.const 32)) (i32.le_u (local.get $copy) (i32.const 112)))
+        (i32.eqz (i32.and (local.get $copy) (i32.const 15)))))) (then (return (i32.const 0))))
   (if (i32.eqz (f32.le (f32.abs (f32.load offset=16 (local.get $desc))) (f32.const 65535))) (then (return (i32.const 0))))
   (local.set $copy (call $heap_alloc (i32.const 96))) (if (i32.eqz (local.get $copy)) (then (return (i32.const 0))))
   (local.set $copy (call $g2w (local.get $copy))) (memory.copy (local.get $copy) (local.get $desc) (i32.const 96))
   (call $d3d_shader_vm_free (i32.load offset=280 (local.get $ctx)))
   (i32.store offset=280 (local.get $ctx) (local.get $copy))
+  ;; A W-buffer descriptor without fog keeps the vertex fog bound before it.
+  (if (i32.and (i32.eq (i32.load offset=12 (local.get $copy)) (i32.const 3)) (i32.eqz (i32.load offset=20 (local.get $copy))))
+    (then (return (i32.const 1))))
   (i32.store offset=256 (local.get $ctx) (i32.ne (i32.load offset=20 (local.get $copy)) (i32.const 0)))
   (i32.store offset=260 (local.get $ctx) (i32.load offset=8 (local.get $copy))) (i32.const 1))
 
@@ -1658,7 +1759,7 @@
   (i32.const 1))
 
 (func $d3d_software_output (param $ctx i32) (param $src i32) (param $dest i32) (result i32)
-  (local $s v128) (local $d v128) (local $k v128) (local $v v128) (local $packed i32)
+  (local $s v128) (local $d v128) (local $k v128) (local $v v128) (local $packed i32) (local $n i32)
   (local.set $s (f32x4.replace_lane 0 (local.get $s) (f32.load offset=0 (local.get $src))))
   (local.set $s (f32x4.replace_lane 1 (local.get $s) (f32.load offset=16 (local.get $src))))
   (local.set $s (f32x4.replace_lane 2 (local.get $s) (f32.load offset=32 (local.get $src))))
@@ -1679,10 +1780,17 @@
     (if (i32.and (i32.load offset=224 (local.get $ctx)) (i32.const 2)) (then
       (local.set $v (f32x4.replace_lane 3 (local.get $v) (f32x4.extract_lane 3
         (call $d3d_software_blend_eval (i32.load offset=232 (local.get $ctx)) (local.get $s) (local.get $d) (local.get $k)))))))))
-  (local.set $packed (i32.or (local.get $packed) (i32.shl (call $d3d_software_channel (f32x4.extract_lane 0 (local.get $v))) (i32.const 16))))
-  (local.set $packed (i32.or (local.get $packed) (i32.shl (call $d3d_software_channel (f32x4.extract_lane 1 (local.get $v))) (i32.const 8))))
-  (local.set $packed (i32.or (local.get $packed) (i32.shl (call $d3d_software_channel (f32x4.extract_lane 2 (local.get $v))) (i32.const 0))))
-  (local.set $packed (i32.or (local.get $packed) (i32.shl (call $d3d_software_channel (f32x4.extract_lane 3 (local.get $v))) (i32.const 24))))
+  ;; Same per-channel f32 clamp, multiply, add and truncation as channel().
+  ;; Strict SIMD min/max propagate NaNs; saturating conversion maps them to
+  ;; zero, matching channel's early return. Finite results are in [0,255.5],
+  ;; so signed saturation changes neither rounding nor the packed integer.
+  (local.set $v (i32x4.trunc_sat_f32x4_s (f32x4.add
+    (f32x4.mul (f32x4.min (f32x4.max (local.get $v) (v128.const f32x4 0 0 0 0))
+      (v128.const f32x4 1 1 1 1)) (v128.const f32x4 255 255 255 255))
+    (v128.const f32x4 0.5 0.5 0.5 0.5))))
+  (local.set $packed (i32.or (i32.shl (i32x4.extract_lane 0 (local.get $v)) (i32.const 16))
+    (i32.or (i32.shl (i32x4.extract_lane 1 (local.get $v)) (i32.const 8))
+      (i32.or (i32x4.extract_lane 2 (local.get $v)) (i32.shl (i32x4.extract_lane 3 (local.get $v)) (i32.const 24))))))
   ;; Expand the packed precision immediately, so the next blend reads the
   ;; quantized destination. Channel masks are applied by the caller afterward.
   (if (i32.and (i32.load offset=224 (local.get $ctx)) (i32.const 0x80000000)) (then
@@ -1690,4 +1798,15 @@
       (i32.or (i32.and (local.get $packed) (i32.const 0x00f8fcf8))
         (i32.or (i32.and (i32.shr_u (local.get $packed) (i32.const 5)) (i32.const 0x00070007))
           (i32.and (i32.shr_u (local.get $packed) (i32.const 6)) (i32.const 0x00000300))))))))
+  ;; Logic op (blend off): n = op - 1 is the GL truth table, bit (1-s)*2+(1-d).
+  (local.set $n (i32.and (i32.shr_u (i32.load offset=224 (local.get $ctx)) (i32.const 4)) (i32.const 31)))
+  (if (local.get $n) (then
+    (local.set $n (i32.sub (local.get $n) (i32.const 1)))
+    (local.set $packed (i32.or
+      (i32.or
+        (select (i32.and (local.get $packed) (local.get $dest)) (i32.const 0) (i32.and (local.get $n) (i32.const 1)))
+        (select (i32.and (local.get $packed) (i32.xor (local.get $dest) (i32.const -1))) (i32.const 0) (i32.and (local.get $n) (i32.const 2))))
+      (i32.or
+        (select (i32.and (i32.xor (local.get $packed) (i32.const -1)) (local.get $dest)) (i32.const 0) (i32.and (local.get $n) (i32.const 4)))
+        (select (i32.xor (i32.or (local.get $packed) (local.get $dest)) (i32.const -1)) (i32.const 0) (i32.and (local.get $n) (i32.const 8))))))))
   (local.get $packed))

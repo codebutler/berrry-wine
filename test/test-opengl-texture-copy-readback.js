@@ -1,8 +1,9 @@
 'use strict';
+const {ownedAnswer,ownedRenderer}=require('./helpers/gl-owned-host');
 const assert=require('assert'),fs=require('fs'),path=require('path');
 const root=path.resolve(__dirname,'..'),req=p=>require(path.join(root,p));
 const {bootRenderHarness}=req('test/render-helper');
-const {OpenGLHostBridge,CALL_INDEX:GL}=req('lib/gl-compat');
+const {CALL_INDEX:GL}=req('lib/gl-command-stream');
 const Stream=req('lib/gl-command-stream');
 const table=req('src/api_table.json');
 const extraWat=`
@@ -49,8 +50,8 @@ const extraWat=`
    (i32.load (global.get $reg_base)))`;
 
 (async()=>{
- let memory,bridge,encoder=null,manager=null,render=null,producer=null;
- const queued=process.argv.includes('--worker'),mutation=process.env.GL_TEXTURE_COPY_MUTATION,baseline=process.env.GL_TEXTURE_COPY_BASELINE;
+ let memory,encoder=null,manager=null,render=null,producer=null;
+ const queued=(()=>{if(process.argv.some(a=>a==='--worker'||a==='--worker-fallback'))throw new Error('the --worker arm replayed through lib/gl-render-worker.js, retired in gl-retire S3 (WAT owns WGL)');return false;})(),mutation=process.env.GL_TEXTURE_COPY_MUTATION,baseline=process.env.GL_TEXTURE_COPY_BASELINE;
  let prebuiltModule;
  if(mutation||baseline){let changed=false;
   const bytes=req('test/compile-src').compileSrcWasm((file,source)=>{
@@ -79,9 +80,7 @@ const extraWat=`
  const h=await bootRenderHarness({...(prebuiltModule?{prebuiltModule}:{extraWat}),fonts:'none',width:8,height:8,
   extraHostOverrides:{gpu_gl_call(op,at,bytes){
    if(op===Stream.WAT_STREAM_FLUSH_OPCODE){
-     if(!render)return bridge.replay(Stream.memoryBatch(memory,at,bytes));
-     const reply=render.execute({memoryOffset:at,bytes,owner:0,windows:Object.values(renderer.windows),softwareFront:e.gl_sw_front()});
-     producer.configure(reply.producerConfig);return reply.value;
+     return ownedAnswer(memory,at,bytes);
    }
    // No queued software executor: real synchronous WAT raster path.
    if(op>=0x20000&&op<=0x20006)return encoder ? encoder.call(op,at,bytes) : 0;
@@ -89,27 +88,10 @@ const extraWat=`
   }}});
  memory=h.memory;const e=h.exports,dv=new DataView(memory.buffer),wa=p=>e.guest_to_wasm(p)>>>0;
  e.init_thread(1,0x400000,0,0,0,0,0);e.heap_init(0x800000);
- const renderer={windows:{42:{hwnd:42,w:8,h:8,clientRect:{w:8,h:8}}},repaint(){}};
- bridge=new OpenGLHostBridge({backend:'software',getMemory:()=>memory.buffer,exports:e,renderer});
+ const renderer=ownedRenderer(()=>e,{42:{hwnd:42,w:8,h:8,clientRect:{w:8,h:8}}});
+ 
  try {
- if(queued){
-   const {Manager}=req('lib/render-worker'),{Encoder}=req('lib/d3d-command-stream');
-   const {Worker}=require('worker_threads');
-   producer=new (req('lib/gl-software-producer').Producer)(()=>e);
-   const consumer=new WebAssembly.Instance(h.module,{host:h.host});
-   consumer.exports.d3dim_worker_init(e.get_image_base()>>>0);
-   assert.strictEqual(consumer.exports.gl_sw_front(),0,'consumer has independent mutable globals');
-   render=req('lib/gl-render-worker').create({instance:consumer,memory,backend:'software',sendFrame(){}});
-   manager=new Manager({module:h.module,memory,sigs:req('lib/host-import-sigs.generated.json').sigs,
-     imageBase:e.get_image_base()>>>0,workerFactory:()=>new Worker(path.join(root,'lib/d3d-render-worker.js')),
-     reclaimHeap:head=>e.d3d_render_adopt_free_list(head)});
-   await manager.ready;
-   const port=manager.createEndpoint({api:'legacy',backend:'software'});await port.ready;
-   encoder=new Encoder({module:h.module,memory,sigs:req('lib/host-import-sigs.generated.json').sigs,
-     getImageBase:()=>e.get_image_base()>>>0,guestToWasm:wa,workerFactory:()=>port,explicitFence:true,strictReady:true});
-   assert(encoder.ready());
- }
- e.probe_init();const regs=e.probe_regs(),stack=e.guest_alloc(256)>>>0,stackWa=wa(stack);
+  e.probe_init();const regs=e.probe_regs(),stack=e.guest_alloc(256)>>>0,stackWa=wa(stack);
  function str(s){const p=e.guest_alloc(s.length+1)>>>0;new Uint8Array(memory.buffer,wa(p),s.length+1).set(Buffer.from(s+'\0'));return p;}
  const module=e.probe_module(str('opengl32.dll'))>>>0;assert(module);
  const user32=e.probe_module(str('user32.dll'))>>>0;assert(user32);
@@ -165,6 +147,24 @@ get(T2,2,[11,22,33,44,55,66,77,88],'independent level2');
 call('glBindTexture',[T1,72]);write(input,[12,23,34,45,56,67,78,89]);
 call('glTexImage1D',[T1,1,RGBA,2,0,RGBA,U8,input]);
 get(T1,1,[12,23,34,45,56,67,78,89],'current uploaded1D');
+// Unsigned-byte 2D uploads canonicalize as RGBA8: BGR/BGRA swizzle, RGB
+// alpha fill and unpack row length/skips/alignment must match the float path.
+call('glBindTexture',[T2,73]);write(input,[1,2,3,4,5,6,7,8]);
+call('glTexImage2D',[T2,0,RGBA,2,1,0,0x80e1,U8,input]);
+get(T2,0,[3,2,1,4,7,6,5,8],'BGRA unsigned-byte upload');
+write(input,[9,10,11,12]);
+call('glTexSubImage2D',[T2,0,1,0,1,1,0x80e1,U8,input]);
+get(T2,0,[3,2,1,4,11,10,9,12],'BGRA unsigned-byte subimage');
+write(input,[1,2,3,4,5,6]);
+call('glTexImage2D',[T2,0,RGBA,2,1,0,0x80e0,U8,input]);
+get(T2,0,[3,2,1,255,6,5,4,255],'BGR unsigned-byte upload');
+write(input,Array.from({length:48},(_,i)=>i));
+call('glPixelStorei',[0xcf5,4]);call('glPixelStorei',[0xcf2,4]);
+call('glPixelStorei',[0xcf3,1]);call('glPixelStorei',[0xcf4,1]);
+// Row pitch ceil(4*3/4)*4 = 12, first texel at 1*12 + 1*3 = 15.
+call('glTexImage2D',[T2,0,RGBA,2,2,0,0x1907,U8,input]);
+call('glPixelStorei',[0xcf2,0]);call('glPixelStorei',[0xcf3,0]);call('glPixelStorei',[0xcf4,0]);call('glPixelStorei',[0xcf5,1]);
+get(T2,0,[15,16,17,255,18,19,20,255,27,28,29,255,30,31,32,255],'RGB unsigned-byte unpack row length/skips/alignment');
 // GL1.1 table6.1: unlike sampler expansion, G/B of L/LA/I are zero.
 for(const [internal,data,want] of [
  [0x1909,[64,23,34,128],[64,0,0,255]],
@@ -434,8 +434,7 @@ assert.strictEqual(e.gl_wat_stream_used(),beforeUsed,'get fault does not emit re
 // Empty undefined image writes nothing and does not require a valid pointer.
 call('glBindTexture',[0xde0,141]);call('glGetTexImage',[0xde0,0,0x1908,0x1401,0xffffffff]);error(0,'empty texture getter');
 
- if(queued){encoder.fence();assert(encoder.snapshot().glQueued>0,'real queue used');}
- error(0,'final error');const result={passed:true,route:queued?'queued':'direct',exports:names,checks,observations};
+  error(0,'final error');const result={passed:true,route:queued?'queued':'direct',exports:names,checks,observations};
  if(process.env.GL_TEXTURE_COPY_EVIDENCE)fs.writeFileSync(process.env.GL_TEXTURE_COPY_EVIDENCE,JSON.stringify(result,null,2));console.log(JSON.stringify(result));
- }finally{if(encoder)encoder.stop();if(manager)await manager.stop();if(render)render.destroy();}
+ }finally{if(encoder)encoder.stop();if(manager)await manager.stop();}
 })().catch(e=>{console.error(e.stack||e);process.exitCode=1;});

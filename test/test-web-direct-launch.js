@@ -191,9 +191,14 @@ async function directStageKnownSize(browser, base) {
     r.startsWith('/icons/') || r === '/lib/app-icon-manifest.json');
   // Allowed beyond SOL_FILES: the page's own PWA icon (manifest.webmanifest),
   // the shared Windows system DLLs the program's import graph names
-  // (sol -> msvcrt.dll), and the local-only shared system data file.
-  const stray = appRequests.filter(r => !SOL_FILES.has(r) && r !== '/icons/icon-192.png' &&
-    !r.startsWith('/binaries/dlls/') && r !== '/test/binaries/tlbs/stdole2.tlb');
+  // (sol -> msvcrt.dll), and the local-only shared system data files, read
+  // from the boot list itself so a new one (stdole32.tlb) is not a stray.
+  const systemData = new Set(require('../lib/process-boot').SYSTEM_DATA_FILES
+    .filter(f => f.localOnly).map(f => '/' + f.url));
+  // The page's own icons: the PWA icon and index.html's rel=icon favicon.
+  const pageIcons = new Set(['/icons/icon-192.png', '/icons/favicon-32.png']);
+  const stray = appRequests.filter(r => !SOL_FILES.has(r) && !pageIcons.has(r) &&
+    !r.startsWith('/binaries/dlls/') && !systemData.has(r));
   receipt.stages.directKnownSize = { requests: reqs, stray, states: p.states, midModel,
     desktopFramesSeen: p.desktopSeen, taskbarFramesSeen: p.taskbarSeen };
   check('direct link: never paints the desktop icons or the taskbar before the program',
@@ -668,6 +673,9 @@ async function manifestCancelStage(browser, base) {
     await page.waitForSelector('#wine-launch-window [data-action="retry"]', { visible: true, timeout: STAGE_MS });
     await page.click('#wine-launch-window [data-action="retry"]');
     await request;
+    // Same repaint rule: "Retrying..." with its Cancel button reaches the DOM
+    // on the next animation frame after the model changes.
+    await page.waitForSelector('#wine-launch-window [data-action="cancel"]', { visible: true, timeout: 10000 });
     await page.click('#wine-launch-window [data-action="cancel"]');
     await sleep(2000);
     const cancelled = await page.evaluate(() => ({

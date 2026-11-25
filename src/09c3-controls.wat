@@ -112,7 +112,7 @@
     (field image_ord     i32)      ;; +12  RT_ICON/RT_BITMAP resource ordinal, or 0
     (field font          i32))     ;; +16  HFONT from WM_SETFONT; ends at +20
 
-  ;; Progress bar (ctrl_class 17). 16 bytes — $progress_wndproc heap_alloc 16,
+  ;; Progress bar (ctrl_class 17). 24 bytes — $progress_wndproc heap_alloc 24,
   ;; twice (WM_CREATE and the lazy path for a template control that gets PBM_*
   ;; first). $prog_state_init writes 0/100/0/10, the comctl32 defaults.
   ;; NOTE the trap this layout exists to close: min/max/pos land on the SAME
@@ -123,7 +123,9 @@
     (field min   i32)              ;; +0
     (field max   i32)              ;; +4
     (field pos   i32)              ;; +8   clamped into [min,max] by $prog_clamp
-    (field step  i32))             ;; +12  PBM_STEPIT increment; ends at +16
+    (field step  i32)              ;; +12  PBM_STEPIT increment
+    (field bar_color i32)          ;; +16  COLORREF or CLR_DEFAULT (0xFF000000)
+    (field bk_color  i32))         ;; +20  COLORREF or CLR_DEFAULT; ends at +24
 
   ;; TrackBar (ctrl_class 19). 24 bytes — $trackbar_wndproc heap_alloc 24.
   (layout TrackBarState
@@ -134,7 +136,7 @@
     (field page       i32)         ;; +16  TBM_SETPAGESIZE
     (field thumb_len  i32))        ;; +20  TBM_SETTHUMBLENGTH; ends at +24
 
-  ;; ListBox (ctrl_class 4). 52 bytes — $listbox_wndproc heap_alloc 52.
+  ;; ListBox (ctrl_class 4). 64 bytes — allocated with size-of ListBoxState.
   ;; Three of the four buffers are a pointer and a capacity that must be read
   ;; together, and items_used belongs to the first of them; +4/+8, +32/+36 and
   ;; +40/+44 look alike as bare offsets and the one that is NOT a capacity
@@ -157,9 +159,12 @@
     (field data_cap        i32)    ;; +36  capacity in u32 SLOTS
     (field sel_buf_ptr     i32)    ;; +40  guest ptr to u8[] multi-selection flags
     (field sel_cap         i32)    ;; +44  capacity in BYTES
-    (field item_h          i32))   ;; +48  owner-draw row height, 0 = default; ends at +52
+    (field item_h          i32)    ;; +48  owner-draw row height, 0 = default
+    (field horizontal_extent i32) ;; +52  configured pixel width, independent of items
+    (field scroll_x        i32)    ;; +56  content offset, distinct from SetScrollPos
+    (field font            i32))   ;; +60  WM_SETFONT handle, 0 = default GUI font
 
-  ;; ComboBox (ctrl_class 5). 40 bytes — $combobox_wndproc heap_alloc 40.
+  ;; ComboBox (ctrl_class 5). 48 bytes — $combobox_wndproc heap_alloc 48.
   ;; The notification id is NOT here: see ButtonState above — one copy, in
   ;; CONTROL_TABLE+4, read with $ctrl_table_get_id($hwnd).
   (layout ComboBoxState
@@ -172,7 +177,9 @@
     (field edit_hwnd            i32) ;; +24  CBS_DROPDOWN inner edit; 0 for SIMPLE/DROPDOWNLIST
     (field is_dropped           i32) ;; +28  0/1 — CB_GETDROPPEDSTATE
     (field variant              i32) ;; +32  1=SIMPLE 2=DROPDOWN 3=DROPDOWNLIST
-    (field suppress_edit_notify i32)) ;; +36 combo-originated edit WM_SETTEXT nesting; ends at +40
+    (field suppress_edit_notify i32) ;; +36 combo-originated edit WM_SETTEXT nesting
+    (field dropped_width        i32)  ;; +40 requested minimum; independent of horizontal extent
+    (field font                 i32)) ;; +44 caller HFONT; 0 selects the default GUI font
 
   ;; ListView (ctrl_class 18). 76 bytes — $listview_wndproc heap_alloc 76.
   ;; item_count/item_cap and col_count/col_cap are two count+capacity pairs at
@@ -269,9 +276,11 @@
   ;; WND_RECORDS.state_ptr but through $tab_native_state_get, which keeps its
   ;; own 32-slot (hwnd, state) table in $TAB_NATIVE_STATE_TABLE. It is declared
   ;; here anyway because it is the same KIND of record and shares the same
-  ;; hazard: 128 bytes = two counters and eight 15-byte fixed label records, so
+  ;; hazard: the 128-byte prefix is two counters and eight 15-byte labels, so
   ;; the array is not i32-strided and only count@0 and selected@4 are words.
   ;; Naming them is what stops a reader taking `offset=8` for a third counter.
+  ;; Public native tabs extend the allocation to 160 bytes, with eight opaque
+  ;; i32 item values at +128. This layout describes the unchanged mirror prefix.
   (layout TabNativeState
     (field count     i32)          ;; +0   tabs inserted, hard-capped at 8
     (field selected  i32)          ;; +4   TCM_SETCURSEL
@@ -462,12 +471,24 @@
     (load.field.memarg ProgressState step (local.get $sw)))
   (func $prog_set_step (param $sw ptr<ProgressState>) (param $v i32)
     (store.field.memarg ProgressState step (local.get $sw) (local.get $v)))
+  (func $prog_bar_color (param $sw ptr<ProgressState>) (result i32)
+    (load.field.memarg ProgressState bar_color (local.get $sw)))
+  (func $prog_set_bar_color (param $sw ptr<ProgressState>) (param $v i32)
+    (store.field.memarg ProgressState bar_color (local.get $sw) (local.get $v)))
+  (func $prog_bk_color (param $sw ptr<ProgressState>) (result i32)
+    (load.field.memarg ProgressState bk_color (local.get $sw)))
+  (func $prog_set_bk_color (param $sw ptr<ProgressState>) (param $v i32)
+    (store.field.memarg ProgressState bk_color (local.get $sw) (local.get $v)))
   ;; Fresh bar: 0..100, pos 0, step 10 — the comctl32 defaults.
   (func $prog_state_init (param $sw i32)
     (call $prog_set_min (local.get $sw) (i32.const 0))
     (call $prog_set_max (local.get $sw) (i32.const 100))
     (call $prog_set_pos (local.get $sw) (i32.const 0))
-    (call $prog_set_step (local.get $sw) (i32.const 10)))
+    (call $prog_set_step (local.get $sw) (i32.const 10))
+    ;; Retain the sentinel, not an inferred Windows default RGB value: setters
+    ;; return CLR_DEFAULT until explicitly customized (Microsoft CommCtrl.h).
+    (call $prog_set_bar_color (local.get $sw) (i32.const 0xFF000000))
+    (call $prog_set_bk_color (local.get $sw) (i32.const 0xFF000000)))
   ;; Clamp a candidate position into the bar's range.
   (func $prog_clamp (param $sw i32) (param $pos i32) (result i32)
     (if (i32.lt_s (local.get $pos) (call $prog_min (local.get $sw)))
@@ -591,27 +612,99 @@
   (func $lb_set_sel_cap (param $sw ptr<ListBoxState>) (param $v i32)
     (store.field.memarg ListBoxState sel_cap (local.get $sw) (local.get $v)))
 
-  ;; USER hides a listbox's WS_VSCROLL strip while every item fits, unless
-  ;; LBS_DISABLENOSCROLL explicitly asks for a disabled strip. Paint and
-  ;; hit-test share this decision so a hidden strip cannot steal clicks.
-  (func $listbox_vscroll_visible (param $hwnd i32) (param $sw i32) (result i32)
-    (local $style i32) (local $sz i32) (local $h i32) (local $visible i32)
+  ;; Explicit LB_SETHORIZONTALEXTENT state is not inferred from row text.
+  (func $lb_horizontal_extent (param $sw ptr<ListBoxState>) (result i32)
+    (load.field.memarg ListBoxState horizontal_extent (local.get $sw)))
+  (func $lb_set_horizontal_extent (param $sw ptr<ListBoxState>) (param $v i32)
+    (store.field.memarg ListBoxState horizontal_extent (local.get $sw) (local.get $v)))
+  (func $lb_scroll_x (param $sw ptr<ListBoxState>) (result i32)
+    (load.field.memarg ListBoxState scroll_x (local.get $sw)))
+  (func $lb_set_scroll_x (param $sw ptr<ListBoxState>) (param $v i32)
+    (store.field.memarg ListBoxState scroll_x (local.get $sw) (local.get $v)))
+  (func $listbox_hscroll_supported (param $hwnd i32) (result i32)
+    (i32.and
+      (i32.ne (i32.and (call $wnd_get_style (local.get $hwnd)) (i32.const 0x00100000)) (i32.const 0))
+      (i32.eqz (i32.and (call $wnd_get_style (local.get $hwnd)) (i32.const 0x0200)))))
+
+  ;; Bit 0 = horizontal, bit 1 = vertical. Start with neither overflow bar,
+  ;; then grow to the fixed point: either strip can make the other necessary.
+  ;; LBS_DISABLENOSCROLL keeps the requested strips even without overflow.
+  (func $listbox_scrollbar_mask (param $hwnd i32) (param $sw i32) (result i32)
+    (local $style i32) (local $w i32) (local $h i32) (local $mask i32)
+    (local $i i32) (local $rows i32) (local $width i32)
     (local.set $style (call $wnd_get_style (local.get $hwnd)))
-    (if (i32.eqz (i32.and (local.get $style) (i32.const 0x00200000)))
-      (then (return (i32.const 0))))
-    (if (i32.and (local.get $style) (i32.const 0x00001000)) ;; LBS_DISABLENOSCROLL
-      (then (return (i32.const 1))))
-    (local.set $sz (call $ctrl_get_wh_packed (local.get $hwnd)))
-    (local.set $h (i32.shr_u (local.get $sz) (i32.const 16)))
-    (if (i32.le_s (local.get $h) (i32.const 4))
-      (then (return (i32.const 1))))
-    (local.set $visible
-      (i32.div_u (i32.sub (local.get $h) (i32.const 4)) (call $lb_row_height (local.get $sw))))
-    (i32.gt_s (call $lb_count (local.get $sw)) (local.get $visible)))
+    (local.set $w (i32.and (call $ctrl_get_wh_packed (local.get $hwnd)) (i32.const 0xFFFF)))
+    (local.set $h (call $ctrl_get_h (local.get $hwnd)))
+    (if (i32.and (local.get $style) (i32.const 0x1000))
+      (then
+        (if (call $listbox_hscroll_supported (local.get $hwnd))
+          (then (local.set $mask (i32.const 1))))
+        (if (i32.and (local.get $style) (i32.const 0x00200000))
+          (then (local.set $mask (i32.or (local.get $mask) (i32.const 2)))))))
+    (loop $grow
+      (local.set $rows (i32.sub (local.get $h) (i32.const 4)))
+      (if (i32.and (local.get $mask) (i32.const 1))
+        (then (local.set $rows (i32.sub (local.get $rows) (i32.const 16)))))
+      (if (i32.lt_s (local.get $rows) (i32.const 0)) (then (local.set $rows (i32.const 0))))
+      (local.set $rows (i32.div_u (local.get $rows) (call $lb_row_height (local.get $sw))))
+      (if (i32.and
+            (i32.ne (i32.and (local.get $style) (i32.const 0x00200000)) (i32.const 0))
+            (i32.gt_s (call $lb_count (local.get $sw)) (local.get $rows)))
+        (then (local.set $mask (i32.or (local.get $mask) (i32.const 2)))))
+      (local.set $width (i32.sub (local.get $w) (i32.const 4)))
+      (if (i32.and (local.get $mask) (i32.const 2))
+        (then (local.set $width (i32.sub (local.get $width) (i32.const 16)))))
+      (if (i32.and (i32.ne (call $listbox_hscroll_supported (local.get $hwnd)) (i32.const 0))
+            (i32.gt_s (call $lb_horizontal_extent (local.get $sw)) (local.get $width)))
+        (then (local.set $mask (i32.or (local.get $mask) (i32.const 1)))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $grow (i32.lt_u (local.get $i) (i32.const 3))))
+    (local.get $mask))
+  (func $listbox_hscroll_visible (param $hwnd i32) (param $sw i32) (result i32)
+    (i32.and (call $listbox_scrollbar_mask (local.get $hwnd) (local.get $sw)) (i32.const 1)))
+  (func $listbox_vscroll_visible (param $hwnd i32) (param $sw i32) (result i32)
+    (i32.ne (i32.and (call $listbox_scrollbar_mask (local.get $hwnd) (local.get $sw)) (i32.const 2)) (i32.const 0)))
+  (func $listbox_content_h (param $hwnd i32) (param $sw i32) (result i32)
+    (i32.sub (call $ctrl_get_h (local.get $hwnd))
+      (select (i32.const 16) (i32.const 0) (call $listbox_hscroll_visible (local.get $hwnd) (local.get $sw)))))
+  (func $listbox_content_w (param $hwnd i32) (param $sw i32) (result i32)
+    (i32.sub (i32.and (call $ctrl_get_wh_packed (local.get $hwnd)) (i32.const 0xFFFF))
+      (select (i32.const 16) (i32.const 0) (call $listbox_vscroll_visible (local.get $hwnd) (local.get $sw)))))
+  (func $listbox_hscroll_page (param $hwnd i32) (param $sw i32) (result i32)
+    (local $w i32)
+    (local.set $w (i32.sub (call $listbox_content_w (local.get $hwnd) (local.get $sw)) (i32.const 4)))
+    (select (local.get $w) (i32.const 1) (i32.gt_s (local.get $w) (i32.const 0))))
+  (func $listbox_hscroll_max (param $hwnd i32) (param $sw i32) (result i32)
+    (local $max i32)
+    (local.set $max (i32.sub (call $lb_horizontal_extent (local.get $sw))
+      (call $listbox_hscroll_page (local.get $hwnd) (local.get $sw))))
+    (select (local.get $max) (i32.const 0) (i32.gt_s (local.get $max) (i32.const 0))))
+  ;; Like the vertical common-control projection, SetScrollPos itself only
+  ;; changes the public thumb. The content offset changes on actual scrolling.
+  (func $listbox_hscroll_to (param $hwnd i32) (param $sw i32) (param $x i32)
+    (local $max i32) (local $slot i32) (local $base i32) (local $aux i32)
+    (if (i32.eqz (call $listbox_hscroll_supported (local.get $hwnd))) (then (return)))
+    (local.set $max (call $listbox_hscroll_max (local.get $hwnd) (local.get $sw)))
+    (if (i32.lt_s (local.get $x) (i32.const 0)) (then (local.set $x (i32.const 0))))
+    (if (i32.gt_s (local.get $x) (local.get $max)) (then (local.set $x (local.get $max))))
+    (if (i32.ne (local.get $x) (call $lb_scroll_x (local.get $sw)))
+      (then (call $lb_set_scroll_x (local.get $sw) (local.get $x))
+        (call $invalidate_hwnd (local.get $hwnd))))
+    (local.set $slot (call $wnd_table_find (local.get $hwnd)))
+    (if (i32.lt_s (local.get $slot) (i32.const 0)) (then (return)))
+    (local.set $base (call $scroll_bar_addr (local.get $slot) (i32.const 0)))
+    (local.set $aux (call $scroll_aux_bar_addr (local.get $slot) (i32.const 0)))
+    (i32.store (local.get $base) (local.get $x))
+    (i32.store offset=4 (local.get $base) (i32.const 0))
+    (i32.store offset=8 (local.get $base)
+      (select (i32.sub (call $lb_horizontal_extent (local.get $sw)) (i32.const 1)) (i32.const 0)
+        (i32.gt_s (call $lb_horizontal_extent (local.get $sw)) (i32.const 0))))
+    (i32.store (local.get $aux) (call $listbox_hscroll_page (local.get $hwnd) (local.get $sw)))
+    (i32.store offset=4 (local.get $aux) (local.get $x)))
 
   (func $listbox_visible_rows (param $hwnd i32) (param $sw i32) (result i32)
     (local $h i32) (local $visible i32)
-    (local.set $h (call $ctrl_get_h (local.get $hwnd)))
+    (local.set $h (call $listbox_content_h (local.get $hwnd) (local.get $sw)))
     (if (i32.le_s (local.get $h) (i32.const 4)) (then (return (i32.const 1))))
     (local.set $visible
       (i32.div_u (i32.sub (local.get $h) (i32.const 4)) (call $lb_row_height (local.get $sw))))
@@ -634,7 +727,7 @@
         (call $invalidate_hwnd (local.get $hwnd))))
     (local.get $top))
 
-  ;; ---- ComboBoxState accessors (44 bytes) ----
+  ;; ---- ComboBoxState accessors (48 bytes) ----
   ;;
   ;; A combobox is three windows: itself, an inner listbox, and (for
   ;; CBS_DROPDOWN) an inner edit, plus a popup shell that hosts the listbox
@@ -682,6 +775,14 @@
     (load.field.memarg ComboBoxState suppress_edit_notify (local.get $sw)))
   (func $cb_set_suppress_edit_notify (param $sw ptr<ComboBoxState>) (param $v i32)
     (store.field.memarg ComboBoxState suppress_edit_notify (local.get $sw) (local.get $v)))
+  (func $cb_dropped_width (param $sw ptr<ComboBoxState>) (result i32)
+    (load.field.memarg ComboBoxState dropped_width (local.get $sw)))
+  (func $cb_set_dropped_width (param $sw ptr<ComboBoxState>) (param $v i32)
+    (store.field.memarg ComboBoxState dropped_width (local.get $sw) (local.get $v)))
+  (func $cb_font (param $sw ptr<ComboBoxState>) (result i32)
+    (load.field.memarg ComboBoxState font (local.get $sw)))
+  (func $cb_set_font (param $sw ptr<ComboBoxState>) (param $v i32)
+    (store.field.memarg ComboBoxState font (local.get $sw) (local.get $v)))
   ;; CB_SETEXTENDEDUI has no field of its own: it rides the unused top bit of
   ;; the stored style word, which is why a plain read of +8 is not the window
   ;; style an app would recognise. Both halves of that trick live here.
@@ -1044,12 +1145,20 @@
       (local.get $slot) (local.get $marked)))
 
   (func $tab_native_is (param $hwnd i32) (result i32)
+    ;; Public WAT tabs own their messages at the native procedure, including
+    ;; mouse veto and subclass chaining. The legacy hybrid pre-dispatch mirror
+    ;; remains for DLL tabs and the internal WinHelp strip only.
+    (if (i32.and
+          (i32.eq (call $ctrl_table_get_class (local.get $hwnd)) (i32.const 27))
+          (i32.ne (local.get $hwnd) (global.get $help_topics_tab_hwnd)))
+      (then (return (i32.const 0))))
     (call $native_control_is_marked (global.get $NATIVE_TAB_BITS) (local.get $hwnd)))
 
   ;; COMCTL32 owns the ordinary per-window state pointer. Keep our paint mirror
   ;; separate so observing TCM_* messages cannot corrupt its WM_CREATE state.
   (func $tab_native_state_get (param $hwnd i32) (param $create i32) (result i32)
     (local $i i32) (local $addr i32) (local $empty i32) (local $state i32)
+    (local $extended i32)
     (block $done (loop $scan
       (br_if $done (i32.ge_u (local.get $i) (i32.const 32)))
       (local.set $addr (i32.add (global.get $TAB_NATIVE_STATE_TABLE)
@@ -1066,6 +1175,19 @@
     (local.set $state (call $heap_alloc (i32.const 128)))
     (if (i32.eqz (local.get $state)) (then (return (i32.const 0))))
     (call $zero_memory (call $g2w (local.get $state)) (i32.const 128))
+    ;; Only public CLASS27 owns the tail. DLL/hybrid and WinHelp mirrors keep
+    ;; their 128-byte allocation. Publish no table entry until extension succeeds;
+    ;; realloc failure retains the original block, which we explicitly free.
+    ;; The table owns the final pointer; NCDESTROY/reset free that whole block.
+    (if (i32.and
+          (i32.eq (call $ctrl_table_get_class (local.get $hwnd)) (i32.const 27))
+          (i32.ne (local.get $hwnd) (global.get $help_topics_tab_hwnd)))
+      (then
+        (local.set $extended (call $heap_realloc (local.get $state) (i32.const 160) (i32.const 0)))
+        (if (i32.eqz (local.get $extended))
+          (then (call $heap_free (local.get $state)) (return (i32.const 0))))
+        (local.set $state (local.get $extended))
+        (call $zero_memory (i32.add (call $g2w (local.get $state)) (i32.const 128)) (i32.const 32))))
     (i32.store (local.get $empty) (local.get $hwnd))
     (i32.store offset=4 (local.get $empty) (local.get $state))
     (local.get $state))
@@ -1094,16 +1216,18 @@
       (local.set $i (i32.add (local.get $i) (i32.const 1)))
       (br $scan))))
 
-  ;; Tab mirror state is 128 inline bytes: count@0, selected@4, followed by
-  ;; eight 15-byte records {len:u8, text[14]}. No secondary allocations are
-  ;; needed. It lives in TAB_NATIVE_STATE_TABLE, not COMCTL32's window state.
+  ;; Tab mirror prefix is 128 inline bytes: count@0, selected@4, followed by
+  ;; eight 15-byte records {len:u8, text[14]}. Public native tabs also own a
+  ;; 32-byte tail, handled only by their wndproc. No secondary allocation lives
+  ;; beyond creation. The table is separate from COMCTL32's window state.
+  ;; Hybrid callers guard this with tab_native_is. The public native procedure
+  ;; calls it only after validating a mutation (and, for mouse input, veto).
   (func $tab_native_note_message
     (param $hwnd i32) (param $msg i32) (param $wParam i32) (param $lParam i32)
     (local $state i32) (local $sw ptr<TabNativeState>) (local $item_w i32)
     (local $count i32) (local $index i32) (local $i i32) (local $j i32)
     (local $src i32) (local $dst i32) (local $text_g i32) (local $text_w i32)
     (local $len i32) (local $x i32) (local $left i32) (local $right i32)
-    (if (i32.eqz (call $tab_native_is (local.get $hwnd))) (then (return)))
     ;; Do not allocate while forwarding WM_CREATE or unrelated private traffic.
     ;; TCM_INSERTITEMW (0x133E) matters as much as the A form: a Unicode app
     ;; adds its tabs through it and only through it, so mirroring just the A
@@ -1215,6 +1339,470 @@
           (local.set $i (i32.add (local.get $i) (i32.const 1)))
           (br $hit)))))
     )
+
+  ;; Validate the native short ASCII subset before a combined mutation writes
+  ;; either field. A callback, NULL, long or non-ASCII text is unsupported here.
+  (func $tab_control_text_length (param $text i32) (param $wide i32) (result i32)
+    (local $len i32) (local $ch i32)
+    (if (i32.or (i32.eqz (local.get $text)) (i32.eq (local.get $text) (i32.const -1)))
+      (then (return (i32.const -1))))
+    (loop $validate
+      (local.set $ch (if (result i32) (local.get $wide)
+        (then (call $gl16 (i32.add (local.get $text) (i32.shl (local.get $len) (i32.const 1)))))
+        (else (call $gl8 (i32.add (local.get $text) (local.get $len))))))
+      (if (i32.eqz (local.get $ch)) (then (return (local.get $len))))
+      (if (i32.or (i32.ge_u (local.get $len) (i32.const 14))
+                  (i32.gt_u (local.get $ch) (i32.const 127)))
+        (then (return (i32.const -1))))
+      (local.set $len (i32.add (local.get $len) (i32.const 1)))
+      (br $validate))
+    (i32.const -1))
+
+  ;; Public class-27 procedure over the existing eight-label mirror. Hybrid
+  ;; DLL controls keep their installed procedure and never enter this fallback.
+  ;; Notification storage belongs to this synchronous invocation, so nested
+  ;; parent sends cannot overwrite an outer NMHDR or its selection snapshot.
+  (func $tab_control_notify (param $hwnd i32) (param $code i32) (result i32)
+    (local $note i32) (local $result i32)
+    (local.set $note (call $heap_alloc (i32.const 12)))
+    (if (i32.eqz (local.get $note)) (then (return (i32.const 1))))
+    (call $gs32 (local.get $note) (local.get $hwnd))
+    (call $gs32 (i32.add (local.get $note) (i32.const 4))
+      (call $ctrl_table_get_id (local.get $hwnd)))
+    (call $gs32 (i32.add (local.get $note) (i32.const 8)) (local.get $code))
+    (local.set $result (call $wnd_send_message
+      (call $wnd_get_parent (local.get $hwnd)) (i32.const 0x004E)
+      (call $ctrl_table_get_id (local.get $hwnd)) (local.get $note)))
+    (if (i32.eqz (global.get $wnd_send_completed))
+      (then (local.set $result (i32.const 1))))
+    (call $heap_free (local.get $note))
+    (local.get $result))
+
+  ;; Normal native tab selection with the keyboard path's synchronous veto
+  ;; and lifetime checks. A callback may replace the HWND, state, or selection;
+  ;; in that case its newer state wins. Never dereference the old mirror after
+  ;; a generation/state mismatch, or touch it after the final notification.
+  (func $tab_control_select (param $hwnd i32) (param $index i32) (result i32)
+    (local $state i32) (local $sw i32) (local $count i32) (local $old i32)
+    (local $generation i64)
+    (local.set $state (call $tab_native_state_get (local.get $hwnd) (i32.const 0)))
+    (if (i32.eqz (local.get $state)) (then (return (i32.const 0))))
+    (local.set $sw (call $g2w (local.get $state)))
+    (local.set $count (i32.load (local.get $sw)))
+    (local.set $old (i32.load offset=4 (local.get $sw)))
+    (if (i32.or (i32.ge_u (local.get $index) (local.get $count))
+                (i32.eq (local.get $index) (local.get $old)))
+      (then (return (i32.const 0))))
+    (local.set $generation (call $wnd_lookup_generation (local.get $hwnd)))
+    (if (call $tab_control_notify (local.get $hwnd) (i32.const -552))
+      (then (return (i32.const 0))))
+    (if (i32.or
+          (i64.ne (call $wnd_lookup_generation (local.get $hwnd)) (local.get $generation))
+          (i32.ne (call $tab_native_state_get (local.get $hwnd) (i32.const 0)) (local.get $state)))
+      (then (return (i32.const 0))))
+    (if (i32.or (i32.ne (i32.load offset=4 (local.get $sw)) (local.get $old))
+                (i32.ne (i32.load (local.get $sw)) (local.get $count)))
+      (then (return (i32.const 0))))
+    (i32.store offset=4 (local.get $sw) (local.get $index))
+    (call $paint_flag_set_inv (local.get $hwnd))
+    (drop (call $tab_control_notify (local.get $hwnd) (i32.const -551)))
+    (i32.const 0))
+
+  (func $tab_control_wndproc
+    (param $hwnd i32) (param $msg i32) (param $wParam i32) (param $lParam i32) (result i32)
+    (local $state i32) (local $sw i32) (local $count i32) (local $old i32)
+    (local $index i32) (local $rec i32) (local $item i32) (local $text i32)
+    (local $i i32) (local $len i32) (local $wide i32) (local $mask i32) (local $data i32)
+    (local $x i32) (local $y i32) (local $left i32) (local $right i32)
+    (local $hit_dc i32) (local $hit_width i32) (local $hit_height i32) (local $hit_top i32)
+    (local $generation i64)
+    (if (i32.eq (local.get $msg) (i32.const 0x000F))
+      (then (return (call $tab_native_paint (local.get $hwnd)))))
+    (if (i32.eq (local.get $msg) (i32.const 0x0082))
+      (then (call $tab_native_state_release (local.get $hwnd)) (return (i32.const 0))))
+    ;; TCM_SETCURFOCUS: Microsoft specifies normal-tab selection and both
+    ;; selection notifications, unlike silent TCM_SETCURSEL. Item focus uses
+    ;; the normal-tab selection index; no separate keyboard-focus HWND write.
+    ;; Bound this to the supported ordinary painter. Button mode needs a
+    ;; distinct item-focus state and must not be implemented as selection.
+    ;; No return value is specified. Invalid indices are safely ignored here;
+    ;; this does not claim undocumented Windows negative/deselection behavior.
+    (if (i32.eq (local.get $msg) (i32.const 0x1330))
+      (then
+        (if (i32.ne (i32.and (call $wnd_get_style (local.get $hwnd))
+              (i32.const 0x2782)) (i32.const 0))
+          (then (return (i32.const 0))))
+        (return (call $tab_control_select (local.get $hwnd) (local.get $wParam)))))
+    ;; TCM_ADJUSTRECT: FALSE window -> display, nonzero TRUE inverse.
+    ;; Four signed LONGs in tab client space; Microsoft specifies no return.
+    ;; Geometry is deliberately the ordinary horizontal native painter's:
+    ;; 20px row, page frame at y=19, two-pixel raised edges. Its interior is
+    ;; [left+2, top+21, right-2, bottom-2], not guessed Windows metrics.
+    ;; Do not consult sibling page positions: callers use this to place pages.
+    ;; Bottom/vertical/buttons/multiline/fixed-width/owner-draw stay unsupported.
+    (if (i32.eq (local.get $msg) (i32.const 0x1328))
+      (then
+        (if (i32.or (i32.eqz (local.get $lParam))
+                    (i32.ne (i32.and (call $wnd_get_style (local.get $hwnd))
+                      (i32.const 0x2782)) (i32.const 0)))
+          (then (return (i32.const 0))))
+        (local.set $i (select (i32.const -1) (i32.const 1) (local.get $wParam)))
+        (call $gs32 (local.get $lParam)
+          (i32.add (call $gl32 (local.get $lParam))
+            (i32.mul (local.get $i) (i32.const 2))))
+        (call $gs32 (i32.add (local.get $lParam) (i32.const 4))
+          (i32.add (call $gl32 (i32.add (local.get $lParam) (i32.const 4)))
+            (i32.mul (local.get $i) (i32.const 21))))
+        (call $gs32 (i32.add (local.get $lParam) (i32.const 8))
+          (i32.sub (call $gl32 (i32.add (local.get $lParam) (i32.const 8)))
+            (i32.mul (local.get $i) (i32.const 2))))
+        (call $gs32 (i32.add (local.get $lParam) (i32.const 12))
+          (i32.sub (call $gl32 (i32.add (local.get $lParam) (i32.const 12)))
+            (i32.mul (local.get $i) (i32.const 2))))
+        (return (i32.const 0))))
+    ;; TCM_HITTEST: TCHITTESTINFO has signed LONG client x/y and UINT flags.
+    ;; Use the existing mouse cells, including the blank unselected top inset.
+    ;; Bound geometry to the ordinary horizontal painter, as GETITEMRECT does.
+    ;; Microsoft specifies composite ONITEM (6) for padding, LABEL (4) for
+    ;; text; ONITEM is also ICON|LABEL. No icon rectangle is supported here.
+    (if (i32.eq (local.get $msg) (i32.const 0x130D))
+      (then
+        (if (i32.eqz (local.get $lParam)) (then (return (i32.const -1))))
+        (call $gs32 (i32.add (local.get $lParam) (i32.const 8)) (i32.const 1)) ;; NOWHERE
+        (if (i32.ne (i32.and (call $wnd_get_style (local.get $hwnd))
+              (i32.const 0x2782)) (i32.const 0))
+          (then (return (i32.const -1))))
+        (local.set $x (call $gl32 (local.get $lParam)))
+        (local.set $y (call $gl32 (i32.add (local.get $lParam) (i32.const 4))))
+        (local.set $wide (call $ctrl_get_wh_packed (local.get $hwnd)))
+        (if (i32.or
+              (i32.or (i32.lt_s (local.get $x) (i32.const 0))
+                (i32.ge_u (local.get $x) (i32.and (local.get $wide) (i32.const 0xFFFF))))
+              (i32.or (i32.ge_u (local.get $y) (i32.const 20))
+                (i32.ge_u (local.get $y) (i32.shr_u (local.get $wide) (i32.const 16)))))
+          (then (return (i32.const -1))))
+        (local.set $state (call $tab_native_state_get (local.get $hwnd) (i32.const 0)))
+        (if (i32.eqz (local.get $state)) (then (return (i32.const -1))))
+        (local.set $sw (call $g2w (local.get $state)))
+        (local.set $count (i32.load (local.get $sw)))
+        (block $hit_done (loop $hit_test
+          (br_if $hit_done (i32.ge_u (local.get $i) (local.get $count)))
+          (local.set $rec (i32.add (i32.add (local.get $sw) (i32.const 8))
+            (i32.mul (local.get $i) (i32.const 15))))
+          (local.set $len (i32.load8_u (local.get $rec)))
+          (local.set $right (i32.add (local.get $left)
+            (i32.add (i32.mul (local.get $len) (i32.const 5)) (i32.const 16))))
+          (if (i32.lt_s (local.get $x) (local.get $right))
+            (then
+              (local.set $index (i32.const 6)) ;; ONITEM, including empty labels
+              (local.set $hit_top (select (i32.const 3) (i32.const 5)
+                (i32.eq (local.get $i) (i32.load offset=4 (local.get $sw)))))
+              ;; Measure the painter's stock font on a private DC. Do not
+              ;; disturb the window DC's selected objects or draw any pixels.
+              ;; Text can exceed the legacy len*5 cell: the hit remains owned
+              ;; by its mouse cell, rather than inventing overlap precedence.
+              (if (i32.and (i32.ne (local.get $len) (i32.const 0))
+                    (i32.and (i32.ge_s (local.get $x) (i32.add (local.get $left) (i32.const 8)))
+                      (i32.ge_s (local.get $y) (local.get $hit_top))))
+                (then
+                  (local.set $hit_dc (call $gdi_native_create_compat_dc (i32.const 0)))
+                  (if (local.get $hit_dc)
+                    (then
+                      (drop (call $gdi_native_select_object (local.get $hit_dc) (i32.const 0x30021)))
+                      (local.set $hit_width (call $host_measure_text (local.get $hit_dc)
+                        (i32.add (local.get $rec) (i32.const 1)) (local.get $len) (i32.const 0)))
+                      (local.set $hit_height (i32.and
+                        (call $host_get_text_metrics (local.get $hit_dc)) (i32.const 0xFFFF)))
+                      (drop (call $gdi_native_delete_dc (local.get $hit_dc)))
+                      (if (i32.and
+                            (i32.lt_s (local.get $x) (i32.add (i32.add (local.get $left) (i32.const 8)) (local.get $hit_width)))
+                            (i32.lt_s (local.get $y) (i32.add (local.get $hit_top) (local.get $hit_height))))
+                        (then (local.set $index (i32.const 4))))))))
+              (call $gs32 (i32.add (local.get $lParam) (i32.const 8)) (local.get $index))
+              (return (local.get $i))))
+          (local.set $left (local.get $right))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br $hit_test)))
+        (return (i32.const -1))))
+    ;; TCM_GETITEMRECT: zero-based index, tab-client RECT, TRUE/FALSE.
+    ;; Bound this to ordinary horizontal native tabs. These are the existing
+    ;; painter's label widths and top inset, not Windows default metrics.
+    ;; Mouse hit cells also include the blank two-pixel unselected top inset.
+    (if (i32.eq (local.get $msg) (i32.const 0x130A))
+      (then
+        ;; Bottom/vertical/buttons/multiline/fixed-width/owner-drawn geometry
+        ;; is not represented by this native painter. Never fabricate a RECT.
+        (if (i32.or (i32.eqz (local.get $lParam))
+                    (i32.ne (i32.and (call $wnd_get_style (local.get $hwnd))
+                      (i32.const 0x2782)) (i32.const 0)))
+          (then (return (i32.const 0))))
+        (local.set $state (call $tab_native_state_get (local.get $hwnd) (i32.const 0)))
+        (if (i32.eqz (local.get $state)) (then (return (i32.const 0))))
+        (local.set $sw (call $g2w (local.get $state)))
+        (if (i32.ge_u (local.get $wParam) (i32.load (local.get $sw)))
+          (then (return (i32.const 0))))
+        (local.set $i (i32.const 0))
+        (local.set $left (i32.const 0))
+        (loop $rect
+          (local.set $rec (i32.add (i32.add (local.get $sw) (i32.const 8))
+            (i32.mul (local.get $i) (i32.const 15))))
+          (local.set $right (i32.add (local.get $left)
+            (i32.add (i32.mul (i32.load8_u (local.get $rec)) (i32.const 5)) (i32.const 16))))
+          (if (i32.eq (local.get $i) (local.get $wParam))
+            (then
+              (call $gs32 (local.get $lParam) (local.get $left))
+              (call $gs32 (i32.add (local.get $lParam) (i32.const 4))
+                (select (i32.const 0) (i32.const 2)
+                  (i32.eq (local.get $i) (i32.load offset=4 (local.get $sw)))))
+              (call $gs32 (i32.add (local.get $lParam) (i32.const 8)) (local.get $right))
+              (call $gs32 (i32.add (local.get $lParam) (i32.const 12)) (i32.const 20))
+              (return (i32.const 1))))
+          (local.set $left (local.get $right))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br $rect))))
+    ;; Microsoft tab-controls: WANTARROWS | WANTCHARS, and direction-key
+    ;; selection. This bounded fallback covers ordinary horizontal tabs only.
+    ;; Home/End selection is not specified by that contract. Internal WinHelp
+    ;; and installed DLL/registered procedures retain their separate routes.
+    (if (i32.eqz (i32.and (call $wnd_get_style (local.get $hwnd)) (i32.const 0x0380)))
+      (then
+        (if (i32.eq (local.get $msg) (i32.const 0x0087))
+          (then (return (i32.const 0x0081))))
+        (if (i32.eq (local.get $msg) (i32.const 0x132F))
+          (then (return (call $tab_native_cursel (local.get $hwnd)))))
+        (if (i32.and (i32.eq (local.get $msg) (i32.const 0x0100))
+              (i32.or (i32.eq (local.get $wParam) (i32.const 0x25))
+                      (i32.eq (local.get $wParam) (i32.const 0x27))))
+          (then
+            (if (i32.or
+                  (call $ctrl_style_disabled (call $wnd_get_style (local.get $hwnd)))
+                  (i32.ne (i32.and (i32.or
+                    (call $host_get_key_down_state (i32.const 0x10))
+                    (i32.or (call $host_get_key_down_state (i32.const 0x11))
+                            (call $host_get_key_down_state (i32.const 0x12))))
+                    (i32.const 0x8000)) (i32.const 0)))
+              (then (return (i32.const 0))))
+            (local.set $state (call $tab_native_state_get (local.get $hwnd) (i32.const 0)))
+            (if (i32.eqz (local.get $state)) (then (return (i32.const 0))))
+            (local.set $sw (call $g2w (local.get $state)))
+            (local.set $count (i32.load (local.get $sw)))
+            (local.set $old (i32.load offset=4 (local.get $sw)))
+            (if (i32.ge_u (local.get $old) (local.get $count)) (then (return (i32.const 0))))
+            (local.set $index (i32.add (local.get $old)
+              (select (i32.const -1) (i32.const 1)
+                (i32.eq (local.get $wParam) (i32.const 0x25)))))
+            (if (i32.ge_u (local.get $index) (local.get $count)) (then (return (i32.const 0))))
+            (return (call $tab_control_select (local.get $hwnd) (local.get $index)))))))
+    ;; In particular, WinHelp publishes its tab HWND after WM_CREATE returns.
+    ;; Do not allocate or change selection on creation/private messages.
+    (if (i32.and
+          (i32.or (i32.lt_u (local.get $msg) (i32.const 0x1304))
+                  (i32.gt_u (local.get $msg) (i32.const 0x133E)))
+          (i32.ne (local.get $msg) (i32.const 0x0201)))
+      (then (return (i32.const 0))))
+    (local.set $state (call $tab_native_state_get (local.get $hwnd) (i32.const 0)))
+    (if (i32.eqz (local.get $state))
+      (then
+        (local.set $state (call $tab_native_state_get (local.get $hwnd) (i32.const 1)))
+        (if (i32.eqz (local.get $state)) (then (return (i32.const -1))))
+        (i32.store offset=4 (call $g2w (local.get $state)) (i32.const -1))))
+    (local.set $sw (call $g2w (local.get $state)))
+    (local.set $count (i32.load (local.get $sw)))
+    (local.set $old (i32.load offset=4 (local.get $sw)))
+    (if (i32.eq (local.get $msg) (i32.const 0x1304))
+      (then (return (local.get $count))))
+    (if (i32.eq (local.get $msg) (i32.const 0x130B))
+      (then (return (local.get $old))))
+    (if (i32.or (i32.eq (local.get $msg) (i32.const 0x1307))
+                (i32.eq (local.get $msg) (i32.const 0x133E)))
+      (then
+        (if (i32.or (i32.eqz (local.get $lParam)) (i32.ge_u (local.get $count) (i32.const 8)))
+          (then (return (i32.const -1))))
+        (local.set $item (call $g2w (local.get $lParam)))
+        (local.set $mask (i32.load (local.get $item)))
+        ;; Preserve legacy text-only insertion/truncation. Combined native
+        ;; text+param insertions validate both fields before shifting anything.
+        (if (i32.eq (i32.and (local.get $mask) (i32.const 9)) (i32.const 9))
+          (then
+            (if (i32.lt_s (call $tab_control_text_length
+                  (i32.load offset=12 (local.get $item))
+                  (i32.eq (local.get $msg) (i32.const 0x133E))) (i32.const 0))
+              (then (return (i32.const -1))))))
+        (local.set $index (select (local.get $wParam) (local.get $count)
+          (i32.lt_u (local.get $wParam) (local.get $count))))
+        (local.set $data (i32.add (i32.add (local.get $sw) (i32.const 128))
+          (i32.shl (local.get $index) (i32.const 2))))
+        (memory.copy (i32.add (local.get $data) (i32.const 4)) (local.get $data)
+          (i32.shl (i32.sub (local.get $count) (local.get $index)) (i32.const 2)))
+        (i32.store (local.get $data) (i32.const 0))
+        (if (i32.and (local.get $mask) (i32.const 8))
+          (then (i32.store (local.get $data) (i32.load offset=24 (local.get $item)))))
+        (call $tab_native_note_message (local.get $hwnd) (local.get $msg)
+          (local.get $index) (local.get $lParam))
+        (if (i32.eqz (local.get $count))
+          (then (i32.store offset=4 (local.get $sw) (i32.const 0)))
+          (else
+            (if (i32.ge_s (local.get $old) (local.get $index))
+              (then (i32.store offset=4 (local.get $sw) (i32.add (local.get $old) (i32.const 1)))))))
+        (return (local.get $index))))
+    ;; TCM_DELETEITEM: remove the indexed inline label, keeping remaining order.
+    ;; Microsoft specifies no automatic selection after deletion. This bounded
+    ;; native path supports applications that explicitly reselect their page;
+    ;; leave selection to their following TCM_SETCURSEL, without notifications.
+    (if (i32.eq (local.get $msg) (i32.const 0x1308))
+      (then
+        (if (i32.ge_u (local.get $wParam) (local.get $count))
+          (then (return (i32.const 0))))
+        (local.set $rec (i32.add (i32.add (local.get $sw) (i32.const 8))
+          (i32.mul (local.get $wParam) (i32.const 15))))
+        (local.set $count (i32.sub (local.get $count) (i32.const 1)))
+        (memory.copy (local.get $rec) (i32.add (local.get $rec) (i32.const 15))
+          (i32.mul (i32.sub (local.get $count) (local.get $wParam)) (i32.const 15)))
+        (call $zero_memory (i32.add (i32.add (local.get $sw) (i32.const 8))
+          (i32.mul (local.get $count) (i32.const 15))) (i32.const 15))
+        (local.set $data (i32.add (i32.add (local.get $sw) (i32.const 128))
+          (i32.shl (local.get $wParam) (i32.const 2))))
+        (memory.copy (local.get $data) (i32.add (local.get $data) (i32.const 4))
+          (i32.shl (i32.sub (local.get $count) (local.get $wParam)) (i32.const 2)))
+        (i32.store (i32.add (i32.add (local.get $sw) (i32.const 128))
+          (i32.shl (local.get $count) (i32.const 2))) (i32.const 0))
+        (i32.store (local.get $sw) (local.get $count))
+        (call $paint_flag_set_inv (local.get $hwnd))
+        (return (i32.const 1))))
+    ;; TCM_SETITEMA/W: TEXT and PARAM select independent fields; an opaque
+    ;; 32-bit value is copied, never translated/dereferenced. cchTextMax is ignored.
+    ;; Only the native short ASCII label subset fits this inline mirror.
+    ;; Validate before touching any record; no callback/non-ASCII inference.
+    (if (i32.or (i32.eq (local.get $msg) (i32.const 0x1306))
+                (i32.eq (local.get $msg) (i32.const 0x133D)))
+      (then
+        (if (i32.or (i32.eqz (local.get $lParam))
+                    (i32.ge_u (local.get $wParam) (local.get $count)))
+          (then (return (i32.const 0))))
+        (local.set $item (call $g2w (local.get $lParam)))
+        (local.set $mask (i32.load (local.get $item)))
+        (if (i32.and (local.get $mask) (i32.const 1))
+          (then
+            (local.set $text (i32.load offset=12 (local.get $item)))
+            (local.set $wide (i32.eq (local.get $msg) (i32.const 0x133D)))
+            (local.set $len (call $tab_control_text_length (local.get $text) (local.get $wide)))
+            (if (i32.lt_s (local.get $len) (i32.const 0)) (then (return (i32.const 0))))
+            (local.set $rec (i32.add (i32.add (local.get $sw) (i32.const 8))
+              (i32.mul (local.get $wParam) (i32.const 15))))
+            (call $zero_memory (local.get $rec) (i32.const 15))
+            (i32.store8 (local.get $rec) (local.get $len))
+            (local.set $i (i32.const 0))
+            (block $text_copied (loop $copy_text
+              (br_if $text_copied (i32.ge_u (local.get $i) (local.get $len)))
+              (i32.store8 (i32.add (i32.add (local.get $rec) (i32.const 1)) (local.get $i))
+                (if (result i32) (local.get $wide)
+                  (then (call $gl16 (i32.add (local.get $text) (i32.shl (local.get $i) (i32.const 1)))))
+                  (else (call $gl8 (i32.add (local.get $text) (local.get $i))))))
+              (local.set $i (i32.add (local.get $i) (i32.const 1)))
+              (br $copy_text)))
+            (call $paint_flag_set_inv (local.get $hwnd))))
+        (if (i32.and (local.get $mask) (i32.const 8))
+          (then (i32.store
+            (i32.add (i32.add (local.get $sw) (i32.const 128))
+              (i32.shl (local.get $wParam) (i32.const 2)))
+            (i32.load offset=24 (local.get $item)))))
+        (return (i32.const 1))))
+    ;; A/W queries write only masked fields. Text uses the caller's capacity,
+    ;; including the terminator; PARAM never inspects an unmasked text pointer.
+    (if (i32.or (i32.eq (local.get $msg) (i32.const 0x1305))
+                (i32.eq (local.get $msg) (i32.const 0x133C)))
+      (then
+        (if (i32.or (i32.eqz (local.get $lParam)) (i32.ge_u (local.get $wParam) (local.get $count)))
+          (then (return (i32.const 0))))
+        (local.set $item (call $g2w (local.get $lParam)))
+        (if (i32.and (i32.load (local.get $item)) (i32.const 1))
+          (then
+            (local.set $text (i32.load offset=12 (local.get $item)))
+            (local.set $len (i32.load offset=16 (local.get $item)))
+            (if (i32.and (i32.ne (local.get $text) (i32.const 0))
+                         (i32.gt_s (local.get $len) (i32.const 0)))
+              (then
+                (local.set $wide (i32.eq (local.get $msg) (i32.const 0x133C)))
+                (local.set $rec (i32.add (i32.add (local.get $sw) (i32.const 8))
+                  (i32.mul (local.get $wParam) (i32.const 15))))
+                (local.set $len (i32.sub (local.get $len) (i32.const 1)))
+                (if (i32.gt_u (local.get $len) (i32.load8_u (local.get $rec)))
+                  (then (local.set $len (i32.load8_u (local.get $rec)))))
+                (local.set $text (call $g2w (local.get $text)))
+                (block $copied (loop $copy
+                  (br_if $copied (i32.ge_u (local.get $i) (local.get $len)))
+                  (if (local.get $wide)
+                    (then (i32.store16 (i32.add (local.get $text) (i32.shl (local.get $i) (i32.const 1)))
+                      (i32.load8_u (i32.add (i32.add (local.get $rec) (i32.const 1)) (local.get $i)))))
+                    (else (i32.store8 (i32.add (local.get $text) (local.get $i))
+                      (i32.load8_u (i32.add (i32.add (local.get $rec) (i32.const 1)) (local.get $i))))))
+                  (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                  (br $copy)))
+                (if (local.get $wide)
+                  (then (i32.store16 (i32.add (local.get $text) (i32.shl (local.get $len) (i32.const 1))) (i32.const 0)))
+                  (else (i32.store8 (i32.add (local.get $text) (local.get $len)) (i32.const 0))))))))
+        (if (i32.and (i32.load (local.get $item)) (i32.const 8))
+          (then (i32.store offset=24 (local.get $item)
+            (i32.load (i32.add (i32.add (local.get $sw) (i32.const 128))
+              (i32.shl (local.get $wParam) (i32.const 2)))))))
+        (return (i32.const 1))))
+    (if (i32.eq (local.get $msg) (i32.const 0x130C))
+      (then
+        (if (i32.ge_u (local.get $wParam) (local.get $count))
+          (then
+            (if (i32.eq (local.get $wParam) (i32.const -1))
+              (then (i32.store offset=4 (local.get $sw) (i32.const -1))
+                    (call $paint_flag_set_inv (local.get $hwnd))
+                    ;; Deselecting succeeds: return the previous selection,
+                    ;; just as selecting an existing item does. Other invalid
+                    ;; indices still fail without changing the selection.
+                    (return (local.get $old))))
+            (return (i32.const -1))))
+        (call $tab_native_note_message (local.get $hwnd) (local.get $msg) (local.get $wParam) (local.get $lParam))
+        (return (local.get $old))))
+    (if (i32.eq (local.get $msg) (i32.const 0x1309))
+      (then
+        (call $zero_memory (i32.add (local.get $sw) (i32.const 128)) (i32.const 32))
+        (call $tab_native_note_message (local.get $hwnd) (local.get $msg) (local.get $wParam) (local.get $lParam))
+        (i32.store offset=4 (local.get $sw) (i32.const -1))
+        (return (i32.const 1))))
+    (if (i32.eq (local.get $msg) (i32.const 0x0201))
+      (then
+        (if (call $ctrl_style_disabled (call $wnd_get_style (local.get $hwnd)))
+          (then (return (i32.const 0))))
+        (local.set $x (i32.extend16_s (local.get $lParam)))
+        (local.set $y (i32.shr_s (local.get $lParam) (i32.const 16)))
+        (if (i32.or (i32.lt_s (local.get $y) (i32.const 0)) (i32.ge_s (local.get $y) (i32.const 20)))
+          (then (return (i32.const 0))))
+        (local.set $i (i32.const 0))
+        (block $done (loop $hit
+          (br_if $done (i32.ge_u (local.get $i) (local.get $count)))
+          (local.set $rec (i32.add (i32.add (local.get $sw) (i32.const 8))
+            (i32.mul (local.get $i) (i32.const 15))))
+          (local.set $right (i32.add (local.get $left)
+            (i32.add (i32.mul (i32.load8_u (local.get $rec)) (i32.const 5)) (i32.const 16))))
+          (if (i32.and (i32.ge_s (local.get $x) (local.get $left)) (i32.lt_s (local.get $x) (local.get $right)))
+            (then
+              (if (i32.eq (local.get $i) (local.get $old)) (then (return (i32.const 0))))
+              (local.set $generation (call $wnd_lookup_generation (local.get $hwnd)))
+              (if (call $tab_control_notify (local.get $hwnd) (i32.const -552)) (then (return (i32.const 0))))
+              ;; A parent can destroy the control or replace its items/selection
+              ;; in the veto callback. Never commit an obsolete candidate.
+              (if (i32.or
+                    (i64.ne (call $wnd_lookup_generation (local.get $hwnd)) (local.get $generation))
+                    (i32.ne (call $tab_native_state_get (local.get $hwnd) (i32.const 0)) (local.get $state)))
+                (then (return (i32.const 0))))
+              (if (i32.or (i32.ne (i32.load offset=4 (local.get $sw)) (local.get $old))
+                          (i32.ne (i32.load (local.get $sw)) (local.get $count)))
+                (then (return (i32.const 0))))
+              (i32.store offset=4 (local.get $sw) (local.get $i))
+              (call $paint_flag_set_inv (local.get $hwnd))
+              (drop (call $tab_control_notify (local.get $hwnd) (i32.const -551)))
+              (return (i32.const 0))))
+          (local.set $left (local.get $right))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br $hit)))))
+    (i32.const 0))
 
   ;; A property sheet's page dialog is a sibling of its tab control, inset
   ;; below the tab row. The tab owns the exposed band above that sibling, but
@@ -2587,8 +3175,33 @@
       (then (call $defwndproc_do_ncpaint (local.get $hwnd)) (return (i32.const 0))))
     (if (i32.eq (local.get $msg) (i32.const 0x0014))   ;; WM_ERASEBKGND
       (then (return (call $host_erase_background (local.get $hwnd) (i32.const 16)))))
+    ;; Native MessageBox chrome uses USER's ordinary non-client tracking.
+    ;; Translate its released HTCLOSE click through SC_CLOSE/WM_CLOSE here,
+    ;; as the other WAT-native dialog procedures do.
+    (if (i32.and
+          (i32.eq (local.get $msg) (i32.const 0x00A1))
+          (i32.eq (local.get $wParam) (i32.const 20)))
+      (then
+        (drop (call $wnd_send_message
+          (local.get $hwnd) (i32.const 0x0112) (i32.const 0xF060) (i32.const 0)))
+        (return (i32.const 0))))
+    (if (i32.and
+          (i32.eq (local.get $msg) (i32.const 0x0112))
+          (i32.eq (i32.and (local.get $wParam) (i32.const 0xFFF0)) (i32.const 0xF060)))
+      (then
+        (drop (call $wnd_send_message
+          (local.get $hwnd) (i32.const 0x0010) (i32.const 0) (i32.const 0)))
+        (return (i32.const 0))))
     (if (i32.eq (local.get $msg) (i32.const 0x0010))   ;; WM_CLOSE
-      (then (call $modal_done (i32.const 2)) (return (i32.const 0))))  ;; IDCANCEL
+      (then
+        ;; Cancel when available; the sole OK button supplies IDOK instead.
+        ;; Yes/No and Abort/Retry/Ignore have no cancellation result.
+        (if (call $ctrl_find_by_id (local.get $hwnd) (i32.const 2))
+          (then (call $modal_done (i32.const 2)))
+          (else
+            (if (call $ctrl_find_by_id (local.get $hwnd) (i32.const 1))
+              (then (call $modal_done (i32.const 1))))))
+        (return (i32.const 0))))
     (if (i32.ne (local.get $msg) (i32.const 0x0111)) (then (return (i32.const 0))))
     (local.set $cmd (i32.and (local.get $wParam) (i32.const 0xFFFF)))
     ;; Any of IDOK..IDCONTINUE: report the id verbatim. Unknown cmds drop.

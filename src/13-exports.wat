@@ -1,3 +1,119 @@
+  ;; Bounded, process-shared, constructor-derived observation. No instruction
+  ;; stepping, guest stores, yields, or new import. Negative log_eip tags
+  ;; -16..-23 belong to this protocol only while explicitly configured.
+  ;; One allocation per scope. Numeric-pointer reuse is loss, never a new lease.
+  (global $selective_watch_on (mut i32) (i32.const 0))
+  (global $selective_watch_used (mut i32) (i32.const 0))
+  (global $selective_watch_running (mut i32) (i32.const 0))
+  (global $selective_watch_ctor (mut i32) (i32.const 0))
+  (global $selective_watch_zero (mut i32) (i32.const 0))
+  (global $selective_watch_dtor (mut i32) (i32.const 0))
+  (global $selective_watch_free (mut i32) (i32.const 0))
+  (global $selective_watch_source (mut i32) (i32.const 0))
+  (global $selective_watch_primary (mut i32) (i32.const 0))
+  (global $selective_watch_ref (mut i32) (i32.const 0))
+  (global $selective_watch_wa (mut i32) (i32.const 0))
+  (global $selective_watch_len (mut i32) (i32.const 0))
+  (global $SELECTIVE_WATCH i32 (region.addr $SELECTIVE_WATCH 0))
+  (global $SELECTIVE_WATCH_SIZE i32 (i32.const 128))
+  (func (export "selective_watch_base") (result i32) (global.get $SELECTIVE_WATCH))
+  (func (export "selective_watch_field") (param $field i32) (result i32)
+    (if (i32.eq (local.get $field) (i32.const 0)) (then (return (global.get $selective_watch_on))))
+    (if (i32.eq (local.get $field) (i32.const 1)) (then (return (global.get $selective_watch_source))))
+    (if (i32.eq (local.get $field) (i32.const 2)) (then (return (global.get $selective_watch_primary))))
+    (if (i32.eq (local.get $field) (i32.const 3)) (then (return (global.get $selective_watch_ref))))
+    (if (i32.eq (local.get $field) (i32.const 4)) (then (return (global.get $selective_watch_wa))))
+    (if (i32.eq (local.get $field) (i32.const 5)) (then (return (global.get $selective_watch_len))))
+    (i32.const -1))
+  (func $selective_watch_emit (param $tag i32)
+    (if (i32.ge_u (i32.atomic.rmw.add offset=24 (global.get $SELECTIVE_WATCH) (i32.const 1)) (i32.const 64))
+      (then
+        (i32.atomic.store offset=20 (global.get $SELECTIVE_WATCH) (i32.const 1))
+        (call $host_log_eip (i32.const -22)))
+      (else (call $host_log_eip (local.get $tag)))))
+  (func $selective_watch_check (param $wa i32) (param $len i32) (param $source i32)
+    (local $p i32) (local $pw i32) (local $primary i32) (local $refs i32)
+    (local.set $p (i32.atomic.load (global.get $SELECTIVE_WATCH)))
+    (if (i32.eqz (local.get $p)) (then (return)))
+    ;; Accept only a single directly mapped, contiguous object. A mapping loss
+    ;; emits UNKNOWN instead of reading the unmapped sentinel as a valid zero.
+    (local.set $pw (call $g2w_affine_span (local.get $p) (i32.const 16)))
+    (if (i32.eq (local.get $pw) (i32.const 0xF0)) (then
+      (i32.atomic.store offset=20 (global.get $SELECTIVE_WATCH) (i32.const 2))
+      (call $selective_watch_emit (i32.const -22)) (return)))
+    (if (local.get $source) (then
+      ;; write_one's extent is the containing page, not [wa,wa+4096).
+      (if (i32.eq (local.get $source) (i32.const 1))
+        (then
+          (if (i32.ne (i32.shr_u (local.get $wa) (i32.const 12))
+                      (i32.shr_u (local.get $pw) (i32.const 12))) (then (return))))
+        (else (if (i32.eq (local.get $source) (i32.const 2)) (then
+          (if (i32.eqz (call $native_store_overlap (local.get $wa) (local.get $len)
+                (local.get $pw) (i32.add (local.get $pw) (i32.const 16)))) (then (return)))))))))
+    (local.set $primary (i32.load (local.get $pw)))
+    (local.set $refs (i32.load offset=12 (local.get $pw)))
+    (global.set $selective_watch_source (local.get $source))
+    (global.set $selective_watch_primary (local.get $primary))
+    (global.set $selective_watch_ref (local.get $refs))
+    (global.set $selective_watch_wa (local.get $wa))
+    (global.set $selective_watch_len (local.get $len))
+    (if (i32.eqz (i32.atomic.load offset=8 (global.get $SELECTIVE_WATCH))) (then
+      (if (i32.and (i32.eq (local.get $primary) (i32.atomic.load offset=4 (global.get $SELECTIVE_WATCH)))
+                    (i32.ne (local.get $refs) (i32.const 0))) (then
+        (if (i32.eqz (i32.atomic.rmw.cmpxchg offset=8 (global.get $SELECTIVE_WATCH) (i32.const 0) (i32.const 1)))
+          (then (call $selective_watch_emit (i32.const -23))))))
+      (return)))
+    (if (i32.ne (local.get $primary) (i32.atomic.load offset=4 (global.get $SELECTIVE_WATCH))) (then
+      (if (i32.eqz (i32.and (i32.atomic.rmw.or offset=12 (global.get $SELECTIVE_WATCH) (i32.const 1)) (i32.const 1)))
+        (then (call $selective_watch_emit (i32.const -17))))))
+    (if (i32.eqz (local.get $refs)) (then
+      (if (i32.eqz (i32.and (i32.atomic.rmw.or offset=12 (global.get $SELECTIVE_WATCH) (i32.const 2)) (i32.const 2)))
+        (then (call $selective_watch_emit (i32.const -18)))))))
+  (func $selective_watch_block
+    (local $p i32) (local $arg i32)
+    (global.set $selective_watch_running (i32.const 1))
+    (if (i32.atomic.load offset=20 (global.get $SELECTIVE_WATCH))
+      (then (call $selective_watch_emit (i32.const -22)) (return)))
+    (if (i32.eq (global.get $eip) (global.get $selective_watch_ctor)) (then
+      (local.set $p (i32.load offset=4 (global.get $reg_base)))
+      (if (i32.or (i32.eqz (local.get $p))
+            (i32.ne (i32.atomic.rmw.cmpxchg (global.get $SELECTIVE_WATCH) (i32.const 0) (local.get $p)) (i32.const 0)))
+        (then
+          (i32.atomic.store offset=20 (global.get $SELECTIVE_WATCH) (i32.const 3))
+          (call $selective_watch_emit (i32.const -22)))
+        (else (call $selective_watch_emit (i32.const -16))))))
+    (call $selective_watch_check (i32.const 0) (i32.const 0) (i32.const 0))
+    (local.set $p (i32.atomic.load (global.get $SELECTIVE_WATCH)))
+    (if (i32.eqz (local.get $p)) (then (return)))
+    (if (i32.and (i32.eq (global.get $eip) (global.get $selective_watch_zero))
+                 (i32.eq (i32.load offset=28 (global.get $reg_base)) (local.get $p)))
+      (then (call $selective_watch_emit (i32.const -19))))
+    (if (i32.and (i32.eq (global.get $eip) (global.get $selective_watch_dtor))
+                 (i32.eq (i32.load offset=4 (global.get $reg_base)) (local.get $p)))
+      (then (call $selective_watch_emit (i32.const -20))))
+    (if (i32.eq (global.get $eip) (global.get $selective_watch_free)) (then
+      (local.set $arg (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4))))
+      (if (i32.eq (local.get $arg) (local.get $p))
+        (then (call $selective_watch_emit (i32.const -21)))))))
+  (func (export "set_selective_watch") (param $ctor i32) (param $zero i32)
+      (param $dtor i32) (param $free i32) (param $vtable i32)
+    ;; Shared terminal state is never reset; fresh memory owns a fresh scope.
+    (if (local.get $ctor) (then
+      (if (global.get $selective_watch_used) (then (unreachable)))
+      (if (i32.or (i32.eqz (local.get $vtable))
+            (i32.and (i32.ne (i32.atomic.rmw.cmpxchg offset=4 (global.get $SELECTIVE_WATCH)
+                               (i32.const 0) (local.get $vtable)) (i32.const 0))
+                     (i32.ne (i32.atomic.load offset=4 (global.get $SELECTIVE_WATCH)) (local.get $vtable))))
+        (then (unreachable)))
+      (global.set $selective_watch_used (i32.const 1))))
+    (global.set $selective_watch_on (i32.ne (local.get $ctor) (i32.const 0)))
+    (global.set $selective_watch_ctor (local.get $ctor))
+    (global.set $selective_watch_zero (local.get $zero))
+    (global.set $selective_watch_dtor (local.get $dtor))
+    (global.set $selective_watch_free (local.get $free))
+    (call $dbg_recompute)
+    (call $clear_cache))
+
   ;; Opt-in NULL boundary diagnostics. Existing log_eip import only; no arena.
   ;; Negative tags -1..-6 belong to this protocol only while explicitly armed.
   (global $null_diag_on (mut i32) (i32.const 0))
@@ -332,8 +448,8 @@
     (i32.const 1))
 
   ;; JS COM frames retain this exact i64 child token, never a depth surrogate.
-  ;; A failed/aborted call deliberately leaves its child live: only explicit
-  ;; process/thread retirement may discard it, not a JS exception handler.
+  ;; Both return and exceptional unwind validate the exact live child before
+  ;; restoring its suspended caller. Stale owners cannot restore a frame.
   (func $com_callback_enter (export "com_callback_enter") (result i64)
     (call $sync_depth_enter)
     (call $invocation_current))
@@ -343,6 +459,22 @@
   (func $com_callback_leave (export "com_callback_leave") (param $expected i64)
     (call $com_callback_check (local.get $expected))
     (call $sync_depth_leave))
+  (func (export "com_callback_get_flags") (param $expected i64) (param $index i32) (result i32)
+    (call $com_callback_check (local.get $expected))
+    (if (i32.eqz (local.get $index)) (then (return (global.get $flag_op))))
+    (if (i32.eq (local.get $index) (i32.const 1)) (then (return (global.get $flag_a))))
+    (if (i32.eq (local.get $index) (i32.const 2)) (then (return (global.get $flag_b))))
+    (if (i32.eq (local.get $index) (i32.const 3)) (then (return (global.get $flag_res))))
+    (if (i32.eq (local.get $index) (i32.const 4)) (then (return (global.get $saved_cf))))
+    (if (i32.eq (local.get $index) (i32.const 5)) (then (return (global.get $flag_sign_shift))))
+    (unreachable))
+  (func (export "com_callback_set_flags") (param $expected i64)
+      (param $op i32) (param $a i32) (param $b i32) (param $res i32)
+      (param $cf i32) (param $sign i32)
+    (call $com_callback_check (local.get $expected))
+    (global.set $flag_op (local.get $op)) (global.set $flag_a (local.get $a))
+    (global.set $flag_b (local.get $b)) (global.set $flag_res (local.get $res))
+    (global.set $saved_cf (local.get $cf)) (global.set $flag_sign_shift (local.get $sign)))
   ;; Sequential JS callbacks must re-enter with the suspended stream's IP:
   ;; sync_depth_enter uses it to pin spill code. Guest EIP is not this cursor.
   (func $com_callback_get_ip (export "com_callback_get_ip") (result i32)
@@ -444,6 +576,8 @@
       (then (call $win16_task_boot)))
     ;; Animate controls playing on comctl32's "thread" (09c3-wndprocs6).
     (call $anim_service)
+    ;; DirectMusic segments playing on the performance (09a7m-directmusic).
+    (call $dmusic_service)
     ;; Resuming from an alertable SleepEx with an APC queued: run it first.
     (call $apc_resume_alert_sleep)
     ;; FlushInstructionCache broadcasts through shared memory because decoded
@@ -733,6 +867,7 @@
                 (i32.or (i32.eqz (global.get $trace_eip_hi))
                         (i32.le_u (global.get $eip) (global.get $trace_eip_hi))))
             (then (call $host_log_eip (global.get $eip))))))
+      (if (global.get $selective_watch_on) (then (call $selective_watch_block)))
       (if (global.get $handler_hist_enabled)
         (then (call $hot_block_hist_record (global.get $eip))))
       ))
@@ -2142,6 +2277,8 @@
     (local $pe_off i32)
     (if (global.get $pending_seen) (then (call $pending_gap)))
     (if (global.get $native_store_on) (then (call $native_store_invalidate)))
+    (if (i32.and (global.get $selective_watch_on) (global.get $selective_watch_running))
+      (then (i32.atomic.store offset=20 (global.get $SELECTIVE_WATCH) (i32.const 4))))
     (call $gdi_thread_scratch_init (local.get $tid))
     ;; A reused Worker instance must not retain heap-backed queue overflow from
     ;; its previous guest thread. Do this before replacing allocator cursors.
@@ -2280,7 +2417,14 @@
     (call $invocation_thread_begin (local.get $tid))
     (call $getmessage_hook_reset (global.get $current_thread_id))
     (call $getmessage_hook_open_owner (global.get $current_thread_id))
-    (call $shared_post_queue_reset_tid (global.get $current_thread_id))
+    ;; A worker's shared USER queue is NOT reset here. It belongs to the Win32
+    ;; thread id, which the creator already holds (CreateThread returned it
+    ;; and ThreadManager.createThread cleared the queue then); with the Worker
+    ;; backend this init runs later, asynchronously, and a reset here dropped
+    ;; messages posted in between (UT's splash thread lost its WM_QUIT, issue
+    ;; #30). The main thread (tid 0) still starts from an empty queue.
+    (if (i32.eqz (local.get $tid))
+      (then (call $shared_post_queue_reset_tid (global.get $current_thread_id))))
     (global.set $post_queue_count (i32.const 0))
     (global.set $pq_read_off (i32.const 0))
     (global.set $sync_msg_depth (i32.const 0))
@@ -2345,6 +2489,10 @@
     (local $msg_ptr i32) (local $eip_parked i32)
     (if (i32.ne (global.get $yield_reason) (i32.const 7))
       (then (return (i32.const 0))))
+    ;; This ordinary resumption owns the old reason-7 wait. Clear its flag
+    ;; before re-entering USER so a newly yielded callback remains distinct
+    ;; from the completed wait; never clear a yield produced by the new call.
+    (global.set $yield_flag (i32.const 0))
     (local.set $msg_ptr (global.get $message_wait_msg_ptr))
     (global.set $message_wait_msg_ptr (i32.const 0))
     (global.set $yield_reason (i32.const 0))
@@ -2731,6 +2879,8 @@
     (if (call $paint_flag_any) (then (return (i32.const 1))))
     (if (call $timer_check_due (i32.const 0) (i32.const 0))
       (then (return (i32.const 1))))
+    ;; A WM_MOUSELEAVE/WM_MOUSEHOVER the next GetMessage would post.
+    (if (call $tme_poll (i32.const 0)) (then (return (i32.const 1))))
     (i32.const 0))
 
   ;; next_timer_due_ms() — milliseconds until the soonest timer this thread owns
@@ -2802,6 +2952,8 @@
         (local.set $i (i32.add (local.get $i) (i32.const 1)))
         (br $mm_loop)))
     ;; A playing MCI avivideo device wants its next frame.
+    ;; A TrackMouseEvent hover deadline, or the leave check's poll interval.
+    (local.set $best (call $tme_due_ms (local.get $best)))
     (call $mciavi_due_ms (local.get $best)))
 
   (func (export "get_com_dll_name") (result i32) (global.get $com_dll_name))
@@ -2966,6 +3118,7 @@
               (i32.or (i32.ne (global.get $trace_eip_flag) (i32.const 0))
                       (i32.ne (global.get $handler_hist_enabled) (i32.const 0))))))))
     (global.set $dbg_any (i32.or (global.get $dbg_any) (global.get $native_store_on)))
+    (global.set $dbg_any (i32.or (global.get $dbg_any) (global.get $selective_watch_on)))
     (global.set $dbg_chain_guard (global.get $dbg_any))
     (if (global.get $benchmark_chain_bp)
       (then (global.set $dbg_chain_guard
@@ -2977,7 +3130,7 @@
     ;; Not a debug facility: a depth-0 frame owes the spill's full flush, which
     ;; only $run's desk takes (04-cache.wat $sync_depth_leave).
     (global.set $dbg_chain_guard
-      (i32.or (global.get $native_store_on)
+      (i32.or (i32.or (global.get $native_store_on) (global.get $selective_watch_on))
         (i32.or (global.get $dbg_chain_guard) (global.get $spill_desk_forced))))
     ;; The same set minus the histogram. Benchmark mode exempts the breakpoint
     ;; here exactly as it does above, so the tier's behaviour under
@@ -2992,7 +3145,8 @@
             (i32.or (i32.ne (global.get $trace_esp_flag) (i32.const 0))
                     (i32.ne (global.get $trace_eip_flag) (i32.const 0)))))))
     ;; Store receipts require original instruction boundaries and gsN helpers.
-    (global.set $dbg_tier_guard (i32.or (global.get $dbg_tier_guard) (global.get $native_store_on))))
+    (global.set $dbg_tier_guard (i32.or (global.get $dbg_tier_guard)
+      (i32.or (global.get $native_store_on) (global.get $selective_watch_on)))))
   (func (export "get_dbg_tier_guard") (result i32) (global.get $dbg_tier_guard))
   (func (export "set_benchmark_chain_bp") (param $on i32)
     (global.set $benchmark_chain_bp (local.get $on)) (call $dbg_recompute))
@@ -4286,11 +4440,11 @@
   ;; would overwrite the bytes just written anyway.
   (func (export "invalidate_code_range") (param $ga i32) (param $len i32)
     (local $bypass i32)
-    (local.set $bypass (global.get $d3dim_lazy_bypass))
-    (global.set $d3dim_lazy_bypass (i32.const 1))
+    (local.set $bypass (global.get $gps_lazy_bypass))
+    (global.set $gps_lazy_bypass (i32.const 1))
     (call $page_watch_write_guest (local.get $ga) (local.get $len))
     (call $invalidate_code_range (local.get $ga) (local.get $len))
-    (global.set $d3dim_lazy_bypass (local.get $bypass)))
+    (global.set $gps_lazy_bypass (local.get $bypass)))
 
   ;; Write guest memory (guest addr)
   (func (export "guest_write32") (param $ga i32) (param $val i32)
@@ -4743,6 +4897,12 @@
     (i32.store offset=12 (global.get $PROCESS_IMAGE_STATE) (global.get $exe_drive))
     (i32.store (global.get $PROCESS_IMAGE_STATE)
       (i32.or (i32.load (global.get $PROCESS_IMAGE_STATE)) (i32.const 2))))
+
+  ;; GetModuleFileName(NULL) into a guest buffer, for the host loader: a
+  ;; LoadLibrary of a relative name is found in the EXE's directory first, and
+  ;; the module path it records must be that full path (lib/process-boot.js).
+  (func (export "exe_module_file_name") (param $buf_g i32) (param $size i32) (result i32)
+    (call $module_file_name (local.get $buf_g) (local.get $size) (i32.const 0)))
 
   ;; Get GUEST_BASE for direct WASM memory access
   (func (export "get_guest_base") (result i32) (global.get $GUEST_BASE))
@@ -5663,6 +5823,158 @@
   ;; Keep the existing export's input-routing semantics unchanged.
   (func (export "dialogbox_hwnd") (result i32)
     (i32.atomic.load (global.get $SHARED_DLG_PUMP_HWND)))
+  ;; Actor-local native dispatch-return witness. Historical identities survive
+  ;; a BUTTON destroying its dialog; the host must match the NEW sequence and
+  ;; exact pre-dispatch reviewed identity, never merely inspect the last row.
+  (global $native_button_sequence (mut i64) (i64.const 0))
+  (global $native_button_generation (mut i64) (i64.const 0))
+  (global $native_button_hwnd (mut i32) (i32.const 0))
+  (global $native_button_pid (mut i32) (i32.const 0))
+  (global $native_button_tid (mut i32) (i32.const 0))
+  (global $native_button_parent (mut i32) (i32.const 0))
+  (global $native_button_msg (mut i32) (i32.const 0))
+  (global $native_button_wparam (mut i32) (i32.const 0))
+  (global $native_button_invocation (mut i64) (i64.const 0))
+  (global $native_button_root (mut i64) (i64.const 0))
+  (func $native_button_returned (param $h i32) (param $gen i64)
+    (param $pid i32) (param $tid i32) (param $parent i32) (param $msg i32) (param $wp i32)
+    (global.set $native_button_hwnd (local.get $h))
+    (global.set $native_button_generation (local.get $gen))
+    (global.set $native_button_pid (local.get $pid))
+    (global.set $native_button_tid (local.get $tid))
+    (global.set $native_button_parent (local.get $parent))
+    (global.set $native_button_msg (local.get $msg))
+    (global.set $native_button_wparam (local.get $wp))
+    (global.set $native_button_invocation (call $invocation_current))
+    (global.set $native_button_root (global.get $invocation_root))
+    (global.set $native_button_sequence (i64.add (global.get $native_button_sequence) (i64.const 1))))
+  (func $native_button_receipt (export "native_button_receipt") (param $field i32) (result i64)
+    (if (i32.eqz (local.get $field)) (then (return (global.get $native_button_sequence))))
+    (if (i32.eq (local.get $field) (i32.const 1)) (then (return (global.get $native_button_generation))))
+    (if (i32.eq (local.get $field) (i32.const 2)) (then (return (i64.extend_i32_u (global.get $native_button_hwnd)))))
+    (if (i32.eq (local.get $field) (i32.const 3)) (then (return (i64.extend_i32_u (global.get $native_button_pid)))))
+    (if (i32.eq (local.get $field) (i32.const 4)) (then (return (i64.extend_i32_u (global.get $native_button_tid)))))
+    (if (i32.eq (local.get $field) (i32.const 5)) (then (return (i64.extend_i32_u (global.get $native_button_parent)))))
+    (if (i32.eq (local.get $field) (i32.const 6)) (then (return (i64.extend_i32_u (global.get $native_button_msg)))))
+    (if (i32.eq (local.get $field) (i32.const 7)) (then (return (i64.extend_i32_u (global.get $native_button_wparam)))))
+    (if (i32.eq (local.get $field) (i32.const 8)) (then (return (global.get $native_button_invocation))))
+    (if (i32.eq (local.get $field) (i32.const 9)) (then (return (global.get $native_button_root))))
+    (i64.const 0))
+  (func (export "native_button_receipt_word") (param $field i32) (param $hi i32) (result i32)
+    (i32.wrap_i64 (i64.shr_u (call $native_button_receipt (local.get $field))
+      (i64.extend_i32_u (i32.mul (i32.and (local.get $hi) (i32.const 1)) (i32.const 32))))))
+  (func (export "native_window_generation_word") (param $h i32) (param $hi i32) (result i32)
+    (i32.wrap_i64 (i64.shr_u (call $wnd_lookup_generation (local.get $h))
+      (i64.extend_i32_u (i32.shl (i32.and (local.get $hi) (i32.const 1)) (i32.const 5))))))
+  ;; Creation-only records, parallel to WND_RECORDS. A recycled slot cannot
+  ;; inherit one: the immutable 64-bit USER generation must still match.
+  ;; +0 generation:i64, +8 hwnd, +12 pid, +16 tid, +20 owner,
+  ;; +24 initial callback, +28 invocation return site. No guest text/state.
+  (global $NATIVE_DIALOGBOX_IDENTITIES i32 (region.addr $NATIVE_DIALOGBOX_IDENTITIES 0))
+  (global $NATIVE_DIALOGBOX_IDENTITIES_SIZE i32 (region.size $NATIVE_DIALOGBOX_IDENTITIES))
+  (func $native_dialogbox_begin (param $hwnd i32) (param $proc i32) (param $ret i32)
+    (local $slot i32) (local $p i32)
+    (local.set $slot (call $wnd_table_find (local.get $hwnd)))
+    (if (i32.lt_s (local.get $slot) (i32.const 0)) (then (return)))
+    (local.set $p (i32.add (global.get $NATIVE_DIALOGBOX_IDENTITIES)
+      (i32.mul (local.get $slot) (i32.const 32))))
+    (i64.store (local.get $p) (call $wnd_lookup_generation (local.get $hwnd)))
+    (i32.store offset=8 (local.get $p) (local.get $hwnd))
+    (i32.store offset=12 (local.get $p) (call $current_process_id))
+    (i32.store offset=16 (local.get $p) (global.get $current_thread_id))
+    (i32.store offset=20 (local.get $p) (call $wnd_get_owner (local.get $hwnd)))
+    (i32.store offset=24 (local.get $p) (local.get $proc))
+    (i32.store offset=28 (local.get $p) (local.get $ret)))
+  ;; Actor-local active pump + shared end state + immutable creation tuple.
+  ;; Suspended outer dialogs fail until the nested invocation actually returns.
+  ;; EndDialog, destruction, callback replacement and generation reuse fail.
+  (func $native_dialogbox_identity (export "native_dialogbox_identity") (param $field i32) (result i64)
+    (local $h i32) (local $slot i32) (local $p i32)
+    (local.set $h (global.get $dlg_pump_hwnd))
+    (if (i32.eqz (local.get $h)) (then (return (i64.const 0))))
+    (if (i32.ne (local.get $h) (i32.atomic.load (global.get $SHARED_DLG_PUMP_HWND)))
+      (then (return (i64.const 0))))
+    (if (i32.or (global.get $dlg_ended) (i32.atomic.load (global.get $SHARED_DLG_ENDED)))
+      (then (return (i64.const 0))))
+    (if (i32.eqz (call $wnd_lookup_live (local.get $h))) (then (return (i64.const 0))))
+    (local.set $slot (call $wnd_table_find (local.get $h)))
+    (if (i32.lt_s (local.get $slot) (i32.const 0)) (then (return (i64.const 0))))
+    (local.set $p (i32.add (global.get $NATIVE_DIALOGBOX_IDENTITIES)
+      (i32.mul (local.get $slot) (i32.const 32))))
+    (if (i64.ne (i64.load (local.get $p)) (call $wnd_lookup_generation (local.get $h)))
+      (then (return (i64.const 0))))
+    (if (i32.ne (i32.load offset=8 (local.get $p)) (local.get $h)) (then (return (i64.const 0))))
+    (if (i32.ne (i32.load offset=12 (local.get $p)) (call $current_process_id)) (then (return (i64.const 0))))
+    (if (i32.ne (i32.load offset=16 (local.get $p)) (global.get $current_thread_id)) (then (return (i64.const 0))))
+    (if (i32.ne (i32.load offset=16 (local.get $p)) (call $wnd_get_thread (local.get $h))) (then (return (i64.const 0))))
+    (if (i32.ne (i32.load offset=20 (local.get $p)) (call $wnd_get_owner (local.get $h))) (then (return (i64.const 0))))
+    (if (i32.eqz (global.get $dlg_proc)) (then (return (i64.const 0))))
+    (if (i32.ne (i32.load offset=24 (local.get $p)) (global.get $dlg_proc)) (then (return (i64.const 0))))
+    (if (i32.ne (global.get $dlg_proc) (call $dialog_proc_get (local.get $h))) (then (return (i64.const 0))))
+    (if (i32.eqz (global.get $dlg_ret_addr)) (then (return (i64.const 0))))
+    (if (i32.ne (i32.load offset=28 (local.get $p)) (global.get $dlg_ret_addr)) (then (return (i64.const 0))))
+    (if (i32.eq (local.get $field) (i32.const 1)) (then (return (i64.load (local.get $p)))))
+    (if (i32.gt_u (local.get $field) (i32.const 6)) (then (return (i64.const 0))))
+    (if (i32.eqz (local.get $field)) (then (return (i64.extend_i32_u (local.get $h)))))
+    (i64.extend_i32_u (i32.load (i32.add (local.get $p)
+      (i32.add (i32.const 4) (i32.mul (local.get $field) (i32.const 4)))))))
+  ;; Actor-local MessageBox creation seal. Retain the outer invocation tuple
+  ;; before yielding into the common-dialog pump; owner equality alone cannot
+  ;; prove that this MessageBox was called by that DialogBox invocation.
+  (global $nested_box_hwnd (mut i32) (i32.const 0))
+  (global $nested_box_gen (mut i64) (i64.const 0))
+  (global $nested_box_pid (mut i64) (i64.const 0))
+  (global $nested_box_tid (mut i64) (i64.const 0))
+  (global $nested_box_owner (mut i64) (i64.const 0))
+  (global $nested_box_owner_gen (mut i64) (i64.const 0))
+  (global $nested_box_callback (mut i64) (i64.const 0))
+  (global $nested_box_return (mut i64) (i64.const 0))
+  (global $nested_box_callsite (mut i32) (i32.const 0))
+  (func $native_nested_messagebox_begin (param $h i32)
+    (global.set $nested_box_hwnd (local.get $h))
+    (global.set $nested_box_gen (call $wnd_lookup_generation (local.get $h)))
+    (global.set $nested_box_pid (call $native_dialogbox_identity (i32.const 2)))
+    (global.set $nested_box_tid (call $native_dialogbox_identity (i32.const 3)))
+    (global.set $nested_box_owner (call $native_dialogbox_identity (i32.const 0)))
+    (global.set $nested_box_owner_gen (call $native_dialogbox_identity (i32.const 1)))
+    (global.set $nested_box_callback (call $native_dialogbox_identity (i32.const 5)))
+    (global.set $nested_box_return (call $native_dialogbox_identity (i32.const 6)))
+    (global.set $nested_box_callsite (call $gl32 (i32.load offset=16 (global.get $reg_base)))))
+  (func $native_nested_messagebox_identity (export "native_nested_messagebox_identity") (param $field i32) (result i64)
+    (local $h i32)
+    (local.set $h (global.get $nested_box_hwnd))
+    (if (i32.eqz (local.get $h)) (then (return (i64.const 0))))
+    (if (i32.ne (local.get $h) (global.get $modal_dlg_hwnd)) (then (return (i64.const 0))))
+    (if (i32.ne (local.get $h) (i32.atomic.load (global.get $SHARED_MODAL_DLG_HWND))) (then (return (i64.const 0))))
+    (if (i32.atomic.load (global.get $SHARED_MODAL_DONE)) (then (return (i64.const 0))))
+    (if (i32.eqz (global.get $nested_box_callsite)) (then (return (i64.const 0))))
+    (if (i32.ne (global.get $nested_box_callsite) (global.get $modal_ret_addr)) (then (return (i64.const 0))))
+    (if (i32.eqz (call $wnd_lookup_live (local.get $h))) (then (return (i64.const 0))))
+    (if (i64.ne (global.get $nested_box_gen) (call $wnd_lookup_generation (local.get $h))) (then (return (i64.const 0))))
+    (if (i32.ne (call $ctrl_table_get_class (local.get $h)) (i32.const 16)) (then (return (i64.const 0))))
+    (if (i64.eqz (global.get $nested_box_owner)) (then (return (i64.const 0))))
+    (if (i64.ne (global.get $nested_box_owner) (i64.extend_i32_u (call $wnd_get_owner (local.get $h)))) (then (return (i64.const 0))))
+    (if (i64.ne (global.get $nested_box_tid) (i64.extend_i32_u (call $wnd_get_thread (local.get $h)))) (then (return (i64.const 0))))
+    (if (i64.ne (global.get $nested_box_owner) (call $native_dialogbox_identity (i32.const 0))) (then (return (i64.const 0))))
+    (if (i64.ne (global.get $nested_box_owner_gen) (call $native_dialogbox_identity (i32.const 1))) (then (return (i64.const 0))))
+    (if (i64.ne (global.get $nested_box_pid) (call $native_dialogbox_identity (i32.const 2))) (then (return (i64.const 0))))
+    (if (i64.ne (global.get $nested_box_tid) (call $native_dialogbox_identity (i32.const 3))) (then (return (i64.const 0))))
+    (if (i64.ne (global.get $nested_box_callback) (call $native_dialogbox_identity (i32.const 5))) (then (return (i64.const 0))))
+    (if (i64.ne (global.get $nested_box_return) (call $native_dialogbox_identity (i32.const 6))) (then (return (i64.const 0))))
+    (if (i32.eqz (local.get $field)) (then (return (i64.extend_i32_u (local.get $h)))))
+    (if (i32.eq (local.get $field) (i32.const 1)) (then (return (global.get $nested_box_gen))))
+    (if (i32.eq (local.get $field) (i32.const 2)) (then (return (global.get $nested_box_owner_gen))))
+    (if (i32.eq (local.get $field) (i32.const 3)) (then (return (i64.extend_i32_u (global.get $nested_box_callsite)))))
+    (i64.const 0))
+  ;; The existing Worker export channel carries numbers, not i64 values.
+  ;; Expose lossless words of these same validated observations for that actor.
+  (func (export "native_modal_identity_word") (param $nested i32) (param $field i32) (param $high i32) (result i32)
+    (local $value i64)
+    (if (local.get $nested)
+      (then (local.set $value (call $native_nested_messagebox_identity (local.get $field))))
+      (else (local.set $value (call $native_dialogbox_identity (local.get $field)))))
+    (i32.wrap_i64 (i64.shr_u (local.get $value)
+      (select (i64.const 32) (i64.const 0) (local.get $high)))))
   (func (export "modal_cancel_if_hwnd") (param $hwnd i32)
     (if (i32.eq (i32.atomic.load (global.get $SHARED_MODAL_DLG_HWND)) (local.get $hwnd))
       (then
@@ -5770,6 +6082,59 @@
   ;; Control class (1=Button, 2=Edit, 3=Static; 0 if not a control).
   (func (export "ctrl_get_class") (param $hwnd i32) (result i32)
     (call $ctrl_table_get_class (local.get $hwnd)))
+
+  ;; Read-only native ProgressBar state. Selector 0 is availability, never a
+  ;; fabricated range/position default. Callers must retain HWND generation,
+  ;; actor, parent and style from USER alongside these public control values.
+  ;; No message dispatch, lazy allocation, guest callback or state mutation.
+  (func (export "native_progress_get") (param $hwnd i32) (param $field i32) (result i32)
+    (local $state i32) (local $sw i32) (local $proc i32)
+    (if (i32.eqz (call $wnd_lookup_live (local.get $hwnd)))
+      (then (return (i32.const 0))))
+    (if (i32.ne (call $ctrl_table_get_class (local.get $hwnd)) (i32.const 17))
+      (then (return (i32.const 0))))
+    (local.set $proc (call $wnd_table_get (local.get $hwnd)))
+    (if (i32.and (i32.ne (local.get $proc) (global.get $WNDPROC_BUILTIN))
+                 (i32.ne (local.get $proc) (global.get $WNDPROC_CTRL_NATIVE)))
+      (then (return (i32.const 0))))
+    (local.set $state (call $wnd_get_state_ptr (local.get $hwnd)))
+    (if (i32.eqz (local.get $state)) (then (return (i32.const 0))))
+    (local.set $sw (call $g2w (local.get $state)))
+    (if (i32.eqz (local.get $field)) (then (return (i32.const 1))))
+    (if (i32.eq (local.get $field) (i32.const 1)) (then (return (call $prog_min (local.get $sw)))))
+    (if (i32.eq (local.get $field) (i32.const 2)) (then (return (call $prog_max (local.get $sw)))))
+    (if (i32.eq (local.get $field) (i32.const 3)) (then (return (call $prog_pos (local.get $sw)))))
+    (if (i32.eq (local.get $field) (i32.const 4)) (then (return (call $prog_step (local.get $sw)))))
+    (i32.const 0))
+
+  ;; Retained native storage is distinct from virtual PBM_* results and paint
+  ;; ownership. A guest subclass can chain to the native procedure while owning
+  ;; WM_PAINT. Keep native_progress_get's strict dispatch contract unchanged.
+  ;; Status: 1 ready, -1 retired, -2 wrong class, -3 unsupported procedure,
+  ;; -4 no initialized state, -5 unmapped state. Never initialize on a read.
+  (func (export "native_progress_storage_get") (param $hwnd i32) (param $field i32) (result i32)
+    (local $state i32) (local $sw i32) (local $proc i32)
+    (if (i32.eqz (call $wnd_lookup_live (local.get $hwnd))) (then (return (i32.const -1))))
+    (if (i32.ne (call $ctrl_table_get_class (local.get $hwnd)) (i32.const 17)) (then (return (i32.const -2))))
+    (local.set $proc (call $wnd_table_get (local.get $hwnd)))
+    (if (i32.eqz (i32.or
+          (i32.or (i32.eq (local.get $proc) (global.get $WNDPROC_BUILTIN))
+                  (i32.eq (local.get $proc) (global.get $WNDPROC_CTRL_NATIVE)))
+          (i32.and (i32.gt_u (local.get $proc) (i32.const 0))
+                   (i32.lt_u (local.get $proc) (i32.const 0xfffe0000)))))
+      (then (return (i32.const -3))))
+    (local.set $state (call $wnd_get_state_ptr (local.get $hwnd)))
+    (if (i32.eqz (local.get $state)) (then (return (i32.const -4))))
+    (if (i32.eqz (call $native_edit_contiguous (local.get $state) (i32.const 16)))
+      (then (return (i32.const -5))))
+    (local.set $sw (call $g2w (local.get $state)))
+    (if (i32.eqz (local.get $field)) (then (return (i32.const 1))))
+    (if (i32.eq (local.get $field) (i32.const 1)) (then (return (call $prog_min (local.get $sw)))))
+    (if (i32.eq (local.get $field) (i32.const 2)) (then (return (call $prog_max (local.get $sw)))))
+    (if (i32.eq (local.get $field) (i32.const 3)) (then (return (call $prog_pos (local.get $sw)))))
+    (if (i32.eq (local.get $field) (i32.const 4)) (then (return (call $prog_step (local.get $sw)))))
+    (if (i32.eq (local.get $field) (i32.const 5)) (then (return (local.get $proc))))
+    (i32.const 0))
 
   ;; --- Dialog record readers ---
   ;; The JS renderer reads dialog header fields from WND_DLG_RECORDS
@@ -5884,6 +6249,242 @@
       (param $hwnd i32) (param $bar i32) (param $arrows i32) (result i32)
     (call $enable_scroll_bar_core
       (local.get $hwnd) (local.get $bar) (local.get $arrows)))
+
+  ;; Read-only public USER text, equivalent to WM_GETTEXT. Native controls
+  ;; share a backing canvas and need not have a JS renderer window. These
+  ;; readers expose their actual captions without allocating guest buffers,
+  ;; sending messages, or examining application-private state.
+  (func $native_user_text_ptr (export "native_user_text_ptr")
+    (param $hwnd i32) (result i32)
+    (local $class i32) (local $state i32) (local $sw i32) (local $ptr i32)
+    (local.set $class (call $ctrl_table_get_class (local.get $hwnd)))
+    (if (i32.and (i32.ge_u (local.get $class) (i32.const 1))
+                 (i32.le_u (local.get $class) (i32.const 3)))
+      (then
+        (local.set $state (call $wnd_get_state_ptr (local.get $hwnd)))
+        (if (i32.eqz (local.get $state)) (then (return (i32.const 0))))
+        (local.set $sw (call $g2w (local.get $state)))
+        (if (i32.eq (local.get $class) (i32.const 1))
+          (then (local.set $ptr (call $btn_text_ptr (local.get $sw)))))
+        (if (i32.eq (local.get $class) (i32.const 2))
+          (then (local.set $ptr (load.field EditState text_buf_ptr
+            (cast ptr<EditState> (local.get $sw))))))
+        (if (i32.eq (local.get $class) (i32.const 3))
+          (then (local.set $ptr (call $static_text_ptr (local.get $sw)))))
+        (if (i32.eqz (local.get $ptr)) (then (return (i32.const 0))))
+        (return (call $g2w (local.get $ptr)))))
+    (call $title_table_get_ptr (local.get $hwnd)))
+
+  (func (export "native_user_text_length") (param $hwnd i32) (result i32)
+    (local $class i32) (local $state i32) (local $sw i32) (local $ptr i32)
+    (local.set $class (call $ctrl_table_get_class (local.get $hwnd)))
+    (if (i32.and (i32.ge_u (local.get $class) (i32.const 1))
+                 (i32.le_u (local.get $class) (i32.const 3)))
+      (then
+        (local.set $state (call $wnd_get_state_ptr (local.get $hwnd)))
+        (if (i32.eqz (local.get $state)) (then (return (i32.const -1))))
+        (local.set $sw (call $g2w (local.get $state)))
+        (if (i32.eq (local.get $class) (i32.const 1))
+          (then (return (call $btn_text_len (local.get $sw)))))
+        (if (i32.eq (local.get $class) (i32.const 2))
+          (then (return (load.field EditState text_len (cast ptr<EditState> (local.get $sw))))))
+        (return (call $static_text_len (local.get $sw)))))
+    (local.set $ptr (call $native_user_text_ptr (local.get $hwnd)))
+    (if (i32.eqz (local.get $ptr)) (then (return (i32.const 0))))
+    (call $strlen (local.get $ptr)))
+
+  ;; Public EDIT allocation proof. Unlike HeapValidate this never flushes bins,
+  ;; allocates, pages in guest memory or invokes callbacks. All walks share a
+  ;; finite budget. Exact arena boundaries plus local free-list/bin accounting
+  ;; must explain the shared live-byte count; foreign unexplained frees refuse.
+  (global $native_edit_heap_work (mut i32) (i32.const 0))
+  (func $native_edit_contiguous (param $ptr i32) (param $len i32) (result i32)
+    (local $p i32) (local $i i32) (local $step i32)
+    (if (i32.or (i32.eqz (local.get $ptr))
+          (i32.lt_u (i32.add (local.get $ptr) (local.get $len)) (local.get $ptr)))
+      (then (return (i32.const 0))))
+    (if (i32.eqz (call $guest_addr_mapped (local.get $ptr))) (then (return (i32.const 0))))
+    (local.set $p (call $g2w (local.get $ptr)))
+    (if (i64.ge_u (i64.add (i64.extend_i32_u (local.get $p)) (i64.extend_i32_u (local.get $len)))
+          (i64.shl (i64.extend_i32_u (memory.size)) (i64.const 16)))
+      (then (return (i32.const 0))))
+    (loop $pages
+      (if (i32.eqz (call $guest_addr_mapped (i32.add (local.get $ptr) (local.get $i))))
+        (then (return (i32.const 0))))
+      (if (i32.ne (call $g2w (i32.add (local.get $ptr) (local.get $i)))
+            (i32.add (local.get $p) (local.get $i))) (then (return (i32.const 0))))
+      (if (i32.lt_u (local.get $i) (local.get $len))
+        (then
+          (local.set $step (i32.sub (i32.const 4096)
+            (i32.and (i32.add (local.get $ptr) (local.get $i)) (i32.const 4095))))
+          (local.set $i (i32.add (local.get $i)
+            (select (i32.sub (local.get $len) (local.get $i)) (local.get $step)
+              (i32.lt_u (i32.sub (local.get $len) (local.get $i)) (local.get $step)))))
+          (br $pages))))
+    (i32.const 1))
+  (func $native_edit_extent (param $ptr i32) (result i32)
+    (local $rec i32) (local $cur i32) (local $end i32) (local $raw i32) (local $size i32)
+    (if (i32.ne (i32.and (local.get $ptr) (i32.const 7)) (i32.const 4))
+      (then (return (i32.const 0))))
+    (local.set $rec (call $heap_arena_find (i32.sub (local.get $ptr) (i32.const 4))))
+    (if (i32.eqz (local.get $rec)) (then (return (i32.const 0))))
+    (local.set $cur (i32.atomic.load (local.get $rec)))
+    (local.set $end (i32.atomic.load offset=8 (local.get $rec)))
+    (loop $walk
+      (if (i32.or (i32.eqz (global.get $native_edit_heap_work))
+            (i32.ge_u (local.get $cur) (local.get $end))) (then (return (i32.const 0))))
+      (global.set $native_edit_heap_work (i32.sub (global.get $native_edit_heap_work) (i32.const 1)))
+      (if (i32.eqz (call $guest_addr_mapped (local.get $cur))) (then (return (i32.const 0))))
+      (local.set $raw (i32.atomic.load (call $g2w (local.get $cur))))
+      (if (i32.and (local.get $raw) (i32.const 6)) (then (return (i32.const 0))))
+      (local.set $size (i32.and (local.get $raw) (i32.const -8)))
+      (if (call $heap_block_bad (local.get $cur) (local.get $size)) (then (return (i32.const 0))))
+      (if (i32.eq (i32.add (local.get $cur) (i32.const 4)) (local.get $ptr))
+        (then (return (local.get $size))))
+      (local.set $cur (i32.add (local.get $cur) (local.get $size)))
+      (if (i32.gt_u (local.get $cur) (local.get $ptr)) (then (return (i32.const 0))))
+      (br $walk))
+    (i32.const 0))
+
+  (func $native_edit_live_payload (param $ptr i32) (result i32)
+    (local $extent i32) (local $rec i32) (local $base i32) (local $end i32)
+    (local $list i32) (local $cur i32) (local $size i32) (local $free i32) (local $live i32)
+    (local.set $extent (call $native_edit_extent (local.get $ptr)))
+    (if (i32.eqz (local.get $extent)) (then (return (i32.const 0))))
+    (local.set $rec (call $heap_arena_find (i32.sub (local.get $ptr) (i32.const 4))))
+    (local.set $base (i32.atomic.load (local.get $rec)))
+    (local.set $end (i32.atomic.load offset=8 (local.get $rec)))
+    (local.set $live (i32.atomic.load offset=12 (local.get $rec)))
+    (loop $lists
+      (local.set $cur (select (global.get $free_list)
+        (i32.wrap_i64 (call $heap_bin_get (i32.sub (local.get $list) (i32.const 1))))
+        (i32.eqz (local.get $list))))
+      (block $done (loop $free_walk
+        (br_if $done (i32.eqz (local.get $cur)))
+        (local.set $size (call $native_edit_extent (i32.add (local.get $cur) (i32.const 4))))
+        (if (i32.eqz (local.get $size)) (then (return (i32.const 0))))
+        (if (i32.and (i32.atomic.load (call $g2w (local.get $cur))) (i32.const 7))
+          (then (return (i32.const 0))))
+        (if (i32.eq (i32.add (local.get $cur) (i32.const 4)) (local.get $ptr))
+          (then (return (i32.const 0))))
+        (if (i32.eq (call $heap_arena_find (local.get $cur)) (local.get $rec))
+          (then
+            (if (i32.gt_u (local.get $size) (i32.sub (local.get $end) (local.get $base)))
+              (then (return (i32.const 0))))
+            (local.set $free (i32.add (local.get $free) (local.get $size)))
+            (if (i32.gt_u (local.get $free) (i32.sub (local.get $end) (local.get $base)))
+              (then (return (i32.const 0))))))
+        (local.set $cur (i32.load offset=4 (call $g2w (local.get $cur))))
+        (br $free_walk)))
+      (local.set $list (i32.add (local.get $list) (i32.const 1)))
+      (br_if $lists (i32.le_u (local.get $list) (global.get $HEAP_BIN_COUNT))))
+    (if (i32.or (i32.gt_u (local.get $live) (i32.sub (local.get $end) (local.get $base)))
+          (i32.ne (local.get $free) (i32.sub (i32.sub (local.get $end) (local.get $base)) (local.get $live))))
+      (then (return (i32.const 0))))
+    (i32.sub (local.get $extent) (i32.const 4)))
+
+  ;; Prepare is read-only except for per-instance observation/layout scratch.
+  ;; It validates the actual native state/buffer allocations and every page of
+  ;; the exported contiguous span before layout or host reads. Passwords return
+  ;; before touching EditState. Fields 1..10 describe the prepared viewport;
+  ;; no guest messages, forced paint, DC mutation or replacement pixels.
+  (global $native_edit_observed_hwnd (mut i32) (i32.const 0))
+  (global $native_edit_observed_generation (mut i64) (i64.const 0))
+  (global $native_edit_observed_state (mut i32) (i32.const 0))
+  (global $native_edit_observed_allocation (mut i32) (i32.const 0))
+  (global $native_edit_observed_total (mut i32) (i32.const 0))
+  (global $native_edit_observed_w (mut i32) (i32.const 0))
+  (global $native_edit_observed_h (mut i32) (i32.const 0))
+  (func (export "native_edit_viewport") (param $hwnd i32) (param $field i32) (param $index i32) (result i32)
+    (local $state i32) (local $sw ptr<EditState>) (local $ptr i32) (local $p i32)
+    (local $len i32) (local $cap i32) (local $size i32) (local $w i32) (local $h i32)
+    (local $style i32) (local $sz i32) (local $i i32) (local $top i32)
+    (local.set $style (call $wnd_get_style (local.get $hwnd)))
+    (if (i32.or (i32.eqz (call $wnd_lookup_live (local.get $hwnd)))
+          (i32.or (i32.ne (call $ctrl_table_get_class (local.get $hwnd)) (i32.const 2))
+            (i32.ne (i32.and (local.get $style) (i32.const 32)) (i32.const 0))))
+      (then (return (i32.const -1))))
+    (local.set $state (call $wnd_get_state_ptr (local.get $hwnd)))
+    (if (i32.eqz (local.get $field))
+      (then
+        (global.set $native_edit_observed_hwnd (i32.const 0))
+        (global.set $native_edit_heap_work (i32.const 65536))
+        (if (i32.lt_u (call $native_edit_live_payload (local.get $state)) (i32.const 40))
+          (then (return (i32.const -2))))
+        (if (i32.eqz (call $native_edit_contiguous (local.get $state) (i32.const 39)))
+          (then (return (i32.const -2))))
+        (local.set $sw (call $g2w (local.get $state)))
+        (if (i32.and (load.field EditState flags (local.get $sw)) (i32.const 2))
+          (then (return (i32.const -1))))
+        (local.set $len (load.field EditState text_len (local.get $sw)))
+        (local.set $cap (load.field EditState text_cap (local.get $sw)))
+        (local.set $ptr (load.field EditState text_buf_ptr (local.get $sw)))
+        ;; Bounded observation work, independent of complete-caption limit.
+        (if (i32.or (i32.gt_u (local.get $len) (i32.const 1048576))
+              (i32.or (i32.gt_u (local.get $len) (local.get $cap))
+                (i32.ge_u (local.get $cap) (i32.const 2147483647))))
+          (then (return (i32.const -3))))
+        (local.set $size (call $native_edit_live_payload (local.get $ptr)))
+        (if (i32.le_u (local.get $size) (local.get $cap)) (then (return (i32.const -4))))
+        (if (i32.eqz (call $native_edit_contiguous (local.get $ptr) (local.get $len)))
+          (then (return (i32.const -5))))
+        (local.set $p (call $g2w (local.get $ptr)))
+        (if (i32.ne (i32.load8_u (i32.add (local.get $p) (local.get $len))) (i32.const 0))
+          (then (return (i32.const -6))))
+        (local.set $sz (call $ctrl_get_wh_packed (local.get $hwnd)))
+        (local.set $w (i32.and (local.get $sz) (i32.const 65535)))
+        (local.set $h (i32.shr_u (local.get $sz) (i32.const 16)))
+        (if (i32.and (local.get $style) (i32.const 0x00200000))
+          (then (if (i32.gt_u (local.get $w) (i32.const 16))
+            (then (local.set $w (i32.sub (local.get $w) (i32.const 16)))))))
+        (if (call $edit_hscroll_reserved (local.get $hwnd))
+          (then (if (i32.gt_u (local.get $h) (i32.const 16))
+            (then (local.set $h (i32.sub (local.get $h) (i32.const 16)))))))
+        (if (i32.or (i32.eqz (i32.and (local.get $style) (i32.const 4)))
+              (i32.or (i32.lt_u (local.get $h) (i32.const 8)) (i32.gt_u (local.get $h) (i32.const 4096))))
+          (then (return (i32.const -7))))
+        (if (call $edit_wraps (local.get $hwnd))
+          (then
+            (if (i32.eqz (call $edit_layout_matches (local.get $sw)
+                  (i32.add (local.get $hwnd) (i32.const 0x40000)) (local.get $w)))
+              (then (return (i32.const -8))))
+            (global.set $native_edit_observed_total (global.get $edit_layout_count)))
+          (else (global.set $native_edit_observed_total
+            (i32.add (call $edit_line_from_char (local.get $sw) (local.get $len)) (i32.const 1)))))
+        (global.set $native_edit_observed_hwnd (local.get $hwnd))
+        (global.set $native_edit_observed_generation (call $wnd_lookup_generation (local.get $hwnd)))
+        (global.set $native_edit_observed_state (local.get $state))
+        (global.set $native_edit_observed_allocation (local.get $size))
+        (global.set $native_edit_observed_w (local.get $w))
+        (global.set $native_edit_observed_h (local.get $h))
+        (return (i32.const 1))))
+    (if (i32.or (i32.ne (global.get $native_edit_observed_hwnd) (local.get $hwnd))
+          (i32.or (i32.ne (global.get $native_edit_observed_state) (local.get $state))
+            (i64.ne (global.get $native_edit_observed_generation) (call $wnd_lookup_generation (local.get $hwnd)))))
+      (then (return (i32.const -1))))
+    (local.set $sw (call $g2w (local.get $state)))
+    (if (i32.eq (local.get $field) (i32.const 1)) (then (return (global.get $native_edit_observed_allocation))))
+    (if (i32.eq (local.get $field) (i32.const 2)) (then (return (load.field EditState text_cap (local.get $sw)))))
+    (if (i32.eq (local.get $field) (i32.const 3)) (then (return (load.field EditState scroll_top (local.get $sw)))))
+    (if (i32.eq (local.get $field) (i32.const 4)) (then (return (load.field EditState scroll_x (local.get $sw)))))
+    (if (i32.eq (local.get $field) (i32.const 5)) (then (return (global.get $native_edit_observed_total))))
+    (if (i32.eq (local.get $field) (i32.const 6)) (then (return (global.get $native_edit_observed_w))))
+    (if (i32.eq (local.get $field) (i32.const 7)) (then (return (global.get $native_edit_observed_h))))
+    (if (i32.eq (local.get $field) (i32.const 8)) (then (return (call $edit_wraps (local.get $hwnd)))))
+    (local.set $top (i32.add (load.field EditState scroll_top (local.get $sw)) (local.get $index)))
+    (if (i32.or (i32.ge_u (local.get $top) (global.get $native_edit_observed_total))
+          (i32.ge_u (local.get $index) (i32.const 257))) (then (return (i32.const -1))))
+    (if (i32.eq (local.get $field) (i32.const 9))
+      (then
+        (if (call $edit_wraps (local.get $hwnd))
+          (then (return (call $edit_layout_start (local.get $top)))))
+        (return (call $edit_line_index (local.get $sw) (local.get $top)))))
+    (if (i32.eq (local.get $field) (i32.const 10))
+      (then
+        (if (call $edit_wraps (local.get $hwnd))
+          (then (return (call $edit_layout_len (local.get $top)))))
+        (return (call $edit_line_text_len (local.get $sw) (call $edit_line_index (local.get $sw) (local.get $top))))))
+    (i32.const -1))
 
   ;; ButtonState text reader (parallel to get_edit_text).
   (func (export "button_get_text")

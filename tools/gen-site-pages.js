@@ -26,10 +26,10 @@ const { createGitDates } = require('./site-page-dates');
 const { marked } = require('marked');
 
 const ROOT = path.join(__dirname, '..');
-const SITE = 'https://wine-assembly.berrry.app';
-const SITE_NAME = 'Wine-Assembly';
+const SITE = 'https://berrry.wine';
+const SITE_NAME = 'Berrry Wine';
 const AUTHOR = 'Vladimir Grichina';
-const REPO = 'https://github.com/vgrichina/wine-assembly';
+const REPO = 'https://github.com/vgrichina/berrry-wine';
 const OG_IMAGE = `${SITE}/icons/og-image.png`;
 // Pinned: a diagram that rendered under one mermaid parser should keep
 // rendering, and a floating "latest" has broken flowchart syntax before.
@@ -85,6 +85,11 @@ const STYLE = `
     .app-launch { display: inline-block; background: #008080; color: #fff !important; text-decoration: none; padding: 9px 16px; border-radius: 4px; font-weight: 600; margin: 0.4em 0 1em; }
     .app-launch:hover { background: #006666; }
     .app-shot { border: 1px solid #d8d2c4; }
+    .ed-facts { margin: 0.6em 0 1.2em; font-size: 0.9em; }
+    .ed-facts dt { font-weight: 600; margin-top: 0.7em; }
+    .ed-facts dd { margin: 0.15em 0 0 0; color: #333; }
+    .ed-facts dd span { white-space: nowrap; margin-right: 0.9em; }
+    .ed-legend { color: #666; }
 `;
 
 const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -360,6 +365,16 @@ function exeFormat(rel) {
   } catch (_) { return null; }
 }
 
+// An app that streams its data from a browser manifest mounts those files
+// too; counting only `files` made a whole game look like two INI files.
+function manifestFileCount(app) {
+  if (!app.localFileManifest) return 0;
+  try {
+    const m = JSON.parse(fs.readFileSync(path.join(ROOT, app.localFileManifest), 'utf-8'));
+    return Array.isArray(m.files) ? m.files.length : 0;
+  } catch (_) { return 0; }
+}
+
 function loadDesktopApps() {
   const { APPS, DESKTOP_APPS, appFileUrl } = require(path.join(ROOT, 'lib', 'apps.js'));
   const blurbs = JSON.parse(fs.readFileSync(path.join(ROOT, APP_BLURBS_REL), 'utf-8'));
@@ -386,14 +401,16 @@ function loadDesktopApps() {
     const group = groups.get(id) || NO_GROUP;
     return {
       id, name, emoji,
-      blurb: blurbs[id] || `${name}, one of the programs on the Wine-Assembly desktop.`,
+      blurb: blurbs[id] || `${name}, one of the programs on the Berrry Wine desktop.`,
       group,
       game: group !== 'Win98 Accessories' && !notGames.has(id),
       persist: app.persistFiles || [],
       exe: exe ? path.posix.basename(exe) : null,
       format: exe ? exeFormat(exe) : null,
       dlls: (app.dlls || []).map(d => path.posix.basename(d)),
-      files: (app.files || []).map(appFileUrl).filter(Boolean).length,
+      files: (app.files || []).map(appFileUrl).filter(Boolean).length + manifestFileCount(app),
+      about: (blurbs._about && blurbs._about[id]) || null,
+      opengl: (blurbs._opengl || []).includes(id),
       args: app.args || '',
       lan: !!app.lan,
       touch: !!app.touchControls,
@@ -409,18 +426,49 @@ const ARTICLE_FOR_FORMAT = {
   '32-bit Windows (PE)': ['/articles/loading-real-windows-dlls-in-the-browser.html', 'how the program and its DLLs are loaded'],
 };
 
-function appPageMd(app, siblings, qa) {
+// A hosted title's compat data lives on its app page: the app page is the one
+// answer to "does X run in the browser", and compat/<slug>.html only points
+// at it (see generatePages). `compat` is { t, affiliate } or null.
+function appCompatMd(app, compat) {
+  if (!compat) return [];
+  const { t, affiliate } = compat;
+  const st = COMPAT_STATUS[t.status] || COMPAT_STATUS.unknown;
+  const L = [];
+  L.push(`## Does ${esc(t.title)} run in the browser?`);
+  L.push('');
+  const who = [t.developer, t.year].filter(Boolean).join(', ');
+  L.push(`**${st.mark} ${st.label}.** ${esc(t.title)}${who ? ` (${esc(who)})` : ''}, measured edition by edition:`);
+  L.push('');
+  L.push(...compatTableMd(t));
+  const unhosted = t.editions.some(e => !e.playId) || (t.store || []).length;
+  if (unhosted) {
+    // The section heads one level down: they belong to this game, not the page.
+    L.push(...bringYourOwnMd().map(l => l.replace(/^## /, '### ')));
+  }
+  L.push(...whereToGetMd(t, affiliate).map(l => l.replace(/^## /, '### ')));
+  return L;
+}
+
+function appPageMd(app, siblings, qa, compat = null) {
   const L = [];
   L.push(`# ${appHeading(app)}`);
   L.push('');
-  L.push(`${app.blurb} ${app.name} runs in Wine-Assembly, a Windows 98 emulator written in WebAssembly Text, so it starts in the browser with nothing to install.`);
+  L.push(`${app.blurb} ${app.name} runs in Berrry Wine, a Windows 98 emulator written in WebAssembly Text, so it starts in the browser with nothing to install.`);
   L.push('');
   L.push(`<a class="app-launch" href="/?app=${app.id}">Launch ${app.name} &rarr;</a>`);
   L.push('');
   if (app.shot) {
-    L.push(`<img class="app-shot" src="/${app.shot}" alt="${esc(app.name)} running in Wine-Assembly" ${sizeAttrs(app.shotSize)}>`);
+    L.push(`<img class="app-shot" src="/${app.shot}" alt="${esc(app.name)} running in Berrry Wine" ${sizeAttrs(app.shotSize)}>`);
     L.push('');
   }
+  // `_about` in site-app-blurbs.json: a few paragraphs on what the program
+  // is and what this copy contains, for titles a one-line blurb undersells.
+  if (app.about) {
+    L.push(`## About ${app.game ? 'the game' : 'the program'}`);
+    L.push('');
+    for (const p of [].concat(app.about)) { L.push(p); L.push(''); }
+  }
+  L.push(...appCompatMd(app, compat));
   L.push('## About this program');
   L.push('');
   L.push('| Detail | |');
@@ -438,7 +486,10 @@ function appPageMd(app, siblings, qa) {
   L.push('');
   const fmt = ARTICLE_FOR_FORMAT[app.format];
   L.push(`The x86 code is interpreted by [threaded code written in WebAssembly Text](/articles/x86-interpreter-in-webassembly-text.html); ` +
-    `windows, controls, menus and dialogs are the emulator's own [Win32 layer](/articles/win32-api-in-webassembly.html), and every pixel is drawn by a [software GDI](/articles/software-gdi-in-webassembly.html) in the same module.` +
+    `windows, controls, menus and dialogs are the emulator's own [Win32 layer](/articles/win32-api-in-webassembly.html)` +
+    (app.opengl
+      ? `, and the 3D world goes through the emulator's [OpenGL 1.x frontend](/articles/directdraw-direct3d-in-the-browser.html), which hands its draw calls to WebGL.`
+      : `, and every pixel is drawn by a [software GDI](/articles/software-gdi-in-webassembly.html) in the same module.`) +
     (fmt ? ` See [${fmt[1]}](${fmt[0]}).` : ''));
   L.push('');
   if (app.notes.length) {
@@ -463,7 +514,7 @@ function appPageMd(app, siblings, qa) {
     L.push(siblings.map(s => `[${s.name}](/apps/${s.id}.html)`).join(' · '));
     L.push('');
   }
-  L.push(`[All programs on the desktop](/apps/) · [How Wine-Assembly was built](/story.html)`);
+  L.push(`[All programs on the desktop](/apps/) · [How Berrry Wine was built](/story.html)`);
   L.push('');
   return L.join('\n');
 }
@@ -477,9 +528,10 @@ function appsIndexMd(apps) {
   const L = [];
   L.push('# Windows 98 programs you can run in your browser');
   L.push('');
-  L.push(`Every icon on the Wine-Assembly desktop, with a page each: what the program is, a picture of it running here, and a link that starts it. ` +
+  L.push(`Every icon on the Berrry Wine desktop, with a page each: what the program is, a picture of it running here, and a link that starts it. ` +
     `They are real Windows 98 executables, not ports; the emulator underneath is an x86 interpreter and Win32 layer written in WebAssembly Text. ` +
-    `Programs the site cannot redistribute (game demos, shareware installers, the DirectX SDK samples) are in the debug dropdown on the [main page](/?debug) instead.`);
+    `Programs the site cannot redistribute (game demos, shareware installers, the DirectX SDK samples) are in the debug dropdown on the [main page](/?debug) instead. ` +
+    `For everything else the emulator has been tried on, and how to run your own copy, see the [compatibility list](/compat/).`);
   L.push('');
   for (const [group, list] of byGroup) {
     L.push(`## ${group}`);
@@ -491,6 +543,293 @@ function appsIndexMd(apps) {
       L.push(`<a class="app-card" href="/apps/${a.id}.html">${img}<span>${esc(a.name)}</span><small>${esc(first)}</small></a>`);
     }
     L.push('</div>');
+    L.push('');
+  }
+  return L.join('\n');
+}
+
+// compat/: one page per title the emulator has been tried on, answering the
+// search "does X run in the browser" with the measured status of each
+// edition, the way to bring your own copy, and where to get the game.
+// tools/site-compat.json is the data; every status there comes from an RE
+// note's evidence, never from a guess. Store links are plain unless
+// `_affiliate` holds a template for that store, and then they are marked
+// rel="sponsored" and disclosed on the page.
+const COMPAT_REL = 'tools/site-compat.json';
+const COMPAT_STATUS = {
+  playable: { rank: 6, label: 'Plays', mark: '●' },
+  issues: { rank: 5, label: 'Plays, with issues', mark: '◐' },
+  // Gameplay is on screen and answers input, but only a moment of it was
+  // driven (one shot aimed, a unit selected): too little to say "plays".
+  ingame: { rank: 4, label: 'Reaches gameplay', mark: '◑' },
+  menus: { rank: 3, label: 'Reaches the menu', mark: '◔' },
+  starts: { rank: 2, label: 'Starts only', mark: '○' },
+  fails: { rank: 1, label: 'Does not run yet', mark: '✕' },
+  unknown: { rank: 0, label: 'Not tested yet', mark: '?' },
+};
+const EDITION_LABEL = {
+  demo: 'Demo', shareware: 'Shareware', trial: 'Trial', freeware: 'Freeware', retail: 'Full game',
+  gog: 'GOG release', beta: 'Beta demo', installer: 'Installer', other: 'Other build',
+  wep: 'Entertainment Pack (16-bit)', bundled: 'Came with Windows',
+};
+
+// Per-edition fields, in the style of a WineHQ AppDB test report. Every one is
+// optional and null means "not measured": the page prints "—" for it, never a
+// default. A key this table does not name, or a value of the wrong type, stops
+// the build, because a typo ("audo": true) would otherwise vanish silently.
+//   testedOn  {build, browser, device, os, date, evidence} or an array of them;
+//             `evidence` (a scratch/runs id or a docs path) is kept for review
+//             and not printed.
+//   notTested what has not been tried, kept apart from `issues` (real defects).
+//   facts     {installs, audio, saves, touchPlayable: bool; multiplayer:
+//             none|lobby|works|untested; phoneFps: number}
+//   version, source  which build of the game was tested and where it came from.
+const COMPAT_MULTIPLAYER = ['none', 'lobby', 'works', 'untested'];
+const COMPAT_FACT_TYPES = {
+  installs: 'boolean', audio: 'boolean', saves: 'boolean', touchPlayable: 'boolean',
+  multiplayer: 'multiplayer', phoneFps: 'number',
+};
+const COMPAT_TESTED_ON_KEYS = ['build', 'browser', 'device', 'os', 'date', 'evidence'];
+const COMPAT_EDITION_TYPES = {
+  note: 'string', edition: 'string', appIds: 'strings', status: 'status', statusDate: 'date',
+  works: 'string', issues: 'string', notTested: 'string', version: 'string', source: 'string',
+  testedOn: 'testedOn', facts: 'facts',
+};
+const isDate = v => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v);
+
+function validateCompatEdition(e, where) {
+  const fail = msg => { throw new Error(`${COMPAT_REL}: ${where}: ${msg}`); };
+  if (!e || typeof e !== 'object' || Array.isArray(e)) fail('edition is not an object');
+  for (const [k, v] of Object.entries(e)) {
+    const type = COMPAT_EDITION_TYPES[k];
+    if (!type) fail(`unknown key "${k}"`);
+    if (v === null) continue;
+    switch (type) {
+      case 'string': if (typeof v !== 'string') fail(`"${k}" must be a string or null`); break;
+      case 'strings': if (!Array.isArray(v) || v.some(x => typeof x !== 'string')) fail(`"${k}" must be an array of strings`); break;
+      case 'status': if (!COMPAT_STATUS[v]) fail(`"status" "${v}" is not one of ${Object.keys(COMPAT_STATUS).join('/')}`); break;
+      case 'date': if (v !== '' && !isDate(v)) fail(`"${k}" must be YYYY-MM-DD or "" (unknown)`); break;
+      case 'testedOn': {
+        const list = Array.isArray(v) ? v : [v];
+        if (!list.length) fail('"testedOn" is an empty array; use null');
+        list.forEach((t, i) => {
+          const at = Array.isArray(v) ? `testedOn[${i}]` : 'testedOn';
+          if (!t || typeof t !== 'object' || Array.isArray(t)) fail(`"${at}" must be an object`);
+          for (const [tk, tv] of Object.entries(t)) {
+            if (!COMPAT_TESTED_ON_KEYS.includes(tk)) fail(`unknown key "${at}.${tk}"`);
+            if (tv !== null && typeof tv !== 'string') fail(`"${at}.${tk}" must be a string or null`);
+            if (tk === 'date' && tv !== null && !isDate(tv)) fail(`"${at}.date" must be YYYY-MM-DD`);
+          }
+        });
+        break;
+      }
+      case 'facts': {
+        if (typeof v !== 'object' || Array.isArray(v)) fail('"facts" must be an object');
+        for (const [fk, fv] of Object.entries(v)) {
+          const ft = COMPAT_FACT_TYPES[fk];
+          if (!ft) fail(`unknown key "facts.${fk}"`);
+          if (fv === null) continue;
+          if (ft === 'boolean' && typeof fv !== 'boolean') fail(`"facts.${fk}" must be true, false or null`);
+          if (ft === 'number' && !(typeof fv === 'number' && Number.isFinite(fv) && fv > 0)) fail(`"facts.${fk}" must be a positive number or null`);
+          if (ft === 'multiplayer' && !COMPAT_MULTIPLAYER.includes(fv)) fail(`"facts.${fk}" must be one of ${COMPAT_MULTIPLAYER.join('/')} or null`);
+        }
+        break;
+      }
+    }
+  }
+  if (typeof e.edition !== 'string') fail('"edition" is required');
+}
+
+function validateCompat(data) {
+  if (!data || !Array.isArray(data.titles)) throw new Error(`${COMPAT_REL}: "titles" must be an array`);
+  data.titles.forEach((t, ti) => {
+    (t.editions || []).forEach((e, ei) => validateCompatEdition(e, `${t.slug || `titles[${ti}]`}.editions[${ei}]`));
+  });
+  return data;
+}
+
+function loadCompat(desktopIds) {
+  const file = path.join(ROOT, COMPAT_REL);
+  if (!fs.existsSync(file)) return null;
+  const data = validateCompat(JSON.parse(fs.readFileSync(file, 'utf-8')));
+  const titles = (data.titles || []).map(t => {
+    const editions = (t.editions || []).map(e => ({
+      ...e,
+      // Playable here only when the site hosts it: the public desktop set.
+      playId: (e.appIds || []).find(id => desktopIds.has(id)) || null,
+    }));
+    const best = editions.reduce((b, e) => (COMPAT_STATUS[e.status] || COMPAT_STATUS.unknown).rank > (COMPAT_STATUS[b] || COMPAT_STATUS.unknown).rank ? e.status : b, 'unknown');
+    // The desktop app whose page stands for the whole title, if the site hosts one.
+    const hostId = (editions.find(e => e.playId) || {}).playId || null;
+    return { ...t, editions, status: best, hostId };
+  });
+  titles.sort((a, b) => a.title.localeCompare(b.title));
+  return { affiliate: data._affiliate || {}, titles };
+}
+
+function storeLink(store, affiliate) {
+  // Keyed by store ("GOG"); a listing's name may add the edition after it.
+  const key = Object.keys(affiliate).find(k => affiliate[k] && store.name.startsWith(k));
+  const tpl = key && affiliate[key];
+  const href = tpl ? tpl.replace('{url}', encodeURIComponent(store.url)).replace('{raw}', store.url) : store.url;
+  return { href, sponsored: !!tpl };
+}
+
+// The pieces of a title's compat page that an app page reuses when the site
+// hosts that title: the measured status per edition, how to try your own
+// copy, and where to buy it. Each returns markdown lines ending in a blank.
+function compatTableMd(t) {
+  const L = [];
+  L.push('| Edition | Status | Tested | What works | Not yet |');
+  L.push('|---|---|---|---|---|');
+  const cell = s => esc(s || '').replace(/\|/g, '\\|');
+  for (const e of t.editions) {
+    const es = COMPAT_STATUS[e.status] || COMPAT_STATUS.unknown;
+    const env = testedOnList(e)[0];
+    const on = env ? envShort(env) : '';
+    const tested = `${e.statusDate || '—'}${on ? `<br><small>on ${cell(on)}</small>` : ''}`;
+    L.push(`| ${cell(EDITION_LABEL[e.edition] || e.edition)} | ${es.mark} ${es.label} | ${tested} | ${cell(e.works)} | ${cell(e.issues)} |`);
+  }
+  L.push('');
+  L.push(...compatFactsMd(t));
+  return L;
+}
+
+const testedOnList = e => (e.testedOn == null ? [] : [].concat(e.testedOn));
+// "iPhone, Safari" or "desktop Chrome 155": the device, plus the browser when
+// the device string does not already name it.
+function envShort(env) {
+  const parts = [];
+  if (env.device) parts.push(env.device);
+  if (env.browser && !(env.device || '').includes(env.browser)) parts.push(env.browser);
+  if (env.os && !parts.some(p => p.includes(env.os))) parts.push(env.os);
+  return parts.join(', ');
+}
+const yesNo = v => v === true ? 'yes' : v === false ? 'no' : '—';
+const MULTIPLAYER_LABEL = { none: 'none', lobby: 'lobby only', works: 'works', untested: '—' };
+
+// The AppDB-style facts under the table: one entry per edition, with the
+// yes/no facts, what has not been tried, and every environment it was tested
+// in. Null is printed as "—" and the legend says that means untested.
+function compatFactsMd(t) {
+  const L = ['<dl class="ed-facts">'];
+  for (const e of t.editions) {
+    const f = e.facts || {};
+    const name = EDITION_LABEL[e.edition] || e.edition;
+    const ver = [e.version ? `version ${e.version}` : null, e.source].filter(Boolean).join(', ');
+    L.push(`<dt>${esc(name)}${ver ? ` <small>(${esc(ver)})</small>` : ''}</dt>`);
+    const facts = [
+      ['Installs', yesNo(f.installs)], ['Sound', yesNo(f.audio)], ['Saves', yesNo(f.saves)],
+      ['Multiplayer', f.multiplayer == null ? '—' : MULTIPLAYER_LABEL[f.multiplayer]],
+      ['Touch', yesNo(f.touchPlayable)], ['Phone FPS', f.phoneFps == null ? '—' : `about ${f.phoneFps}`],
+    ];
+    L.push(`<dd>${facts.map(([k, v]) => `<span>${k}: ${esc(v)}</span>`).join(' ')}</dd>`);
+    if (e.notTested) L.push(`<dd>Not tested: ${esc(e.notTested)}</dd>`);
+    const envs = testedOnList(e).map(env => [env.date, envShort(env), env.build ? `build ${env.build}` : null].filter(Boolean).join(' · '));
+    if (envs.length) L.push(`<dd>Tested on: ${envs.map(esc).join('; ')}</dd>`);
+  }
+  L.push('</dl>');
+  L.push('');
+  L.push('<p class="ed-legend"><small>“—” means not tested yet: a fact is filled in only from a recorded test run, never guessed.</small></p>');
+  L.push('');
+  return L;
+}
+
+function bringYourOwnMd() {
+  return [
+    '## Bring your own copy',
+    '',
+    `Have the CD or the installer? Drop the \`.iso\`, \`.zip\` or \`setup.exe\` on the [desktop](/), or use Start → Add a Game. ` +
+      `The disc stays in your browser and is never uploaded; only small save files can sync, and only if you sign in. ` +
+      `Retail discs are not hosted here, so this is how the full game is tried.`,
+    '',
+    `<a class="app-launch" href="/?add-game">Add your copy &rarr;</a>`,
+    '',
+  ];
+}
+
+function whereToGetMd(t, affiliate) {
+  const L = [];
+  const stores = t.store || [];
+  if (!(stores.length || t.demo || t.archive || t.bundled)) return L;
+  L.push(`## Where to get ${esc(t.title)}`);
+  L.push('');
+  if (t.bundled) L.push(`- It came with ${esc(t.bundled)}.`);
+  let sponsored = false;
+  for (const s of stores) {
+    const { href, sponsored: sp } = storeLink(s, affiliate);
+    sponsored = sponsored || sp;
+    L.push(`- Buy the full game: <a href="${esc(href)}" rel="${sp ? 'sponsored ' : ''}noopener">${esc(s.name)}</a>${sp ? ' ¹' : ''}`);
+  }
+  if (t.demo) L.push(`- ${esc(t.demo.label || 'Demo')}: <a href="${esc(t.demo.url)}" rel="noopener">${esc(new URL(t.demo.url).hostname)}</a>`);
+  if (t.archive && !stores.length) L.push(`- Not sold today. A preservation copy is on the <a href="${esc(t.archive)}" rel="noopener">Internet Archive</a>.`);
+  if (sponsored) { L.push(''); L.push('¹ Affiliate link: a purchase through it supports this project at no extra cost to you.'); }
+  L.push('');
+  return L;
+}
+
+function compatPageMd(t, affiliate) {
+  const st = COMPAT_STATUS[t.status] || COMPAT_STATUS.unknown;
+  const L = [];
+  L.push(`# Does ${t.title} run in the browser?`);
+  L.push('');
+  const who = [t.developer, t.year].filter(Boolean).join(', ');
+  L.push(`**${st.mark} ${st.label}.** ${esc(t.title)}${who ? ` (${esc(who)})` : ''} has been tried on Berrry Wine, a Windows 98 emulator that runs the original program in a browser tab. This is what was measured, edition by edition.`);
+  L.push('');
+  const play = t.editions.find(e => e.playId);
+  if (play) L.push(`<a class="app-launch" href="/apps/${play.playId}.html">Play the ${esc((EDITION_LABEL[play.edition] || 'hosted').toLowerCase())} here &rarr;</a>`);
+  L.push('');
+  L.push(...compatTableMd(t));
+  L.push(...bringYourOwnMd());
+  L.push(...whereToGetMd(t, affiliate));
+  const notes = [...new Set(t.editions.map(e => e.note).filter(Boolean))];
+  if (notes.length) {
+    L.push('## Technical notes');
+    L.push('');
+    L.push(`How it runs, what was fixed and what is still open, for the curious: ${notes.map(n => `[${n}](/docs/re-notes/${n}.html)`).join(', ')}.`);
+    L.push('');
+  }
+  L.push('See the [whole compatibility list](/compat/) or the [programs on the desktop](/apps/).');
+  return L.join('\n');
+}
+
+function compatDescription(t) {
+  const st = COMPAT_STATUS[t.status] || COMPAT_STATUS.unknown;
+  const lead = `${t.title}${t.year ? ` (${t.year})` : ''} in the browser: ${st.label.toLowerCase()} on Berrry Wine, the Windows 98 emulator.`;
+  const best = t.editions.find(e => e.status === t.status);
+  const more = best && best.works ? ` ${best.works}` : '';
+  const full = lead + more;
+  if (full.length <= 158) return full;
+  return lead.length <= 158 ? lead : lead.slice(0, 157) + '…';
+}
+
+function compatIndexMd(titles) {
+  const L = [];
+  L.push('# Windows games in the browser: compatibility list');
+  L.push('<!-- description: Which Windows 95 and 98 games run in a browser tab on Berrry Wine, edition by edition, from measured runs: plays, reaches the menu or not yet. -->');
+  L.push('');
+  L.push(`Every program Berrry Wine has been tried on, with what was measured, not hoped. ` +
+    `Titles with a ▶ are hosted and start with one click; for the rest, [add your own copy](/?add-game) (an ISO, a zip or an installer), which stays in your browser.`);
+  L.push('');
+  const legend = Object.values(COMPAT_STATUS).map(s => `${s.mark} ${s.label}`).join(' · ');
+  L.push(`<small>${legend}</small>`);
+  L.push('');
+  const order = Object.keys(COMPAT_STATUS).sort((a, b) => COMPAT_STATUS[b].rank - COMPAT_STATUS[a].rank);
+  for (const key of order) {
+    const list = titles.filter(t => t.status === key);
+    if (!list.length) continue;
+    const st = COMPAT_STATUS[key];
+    L.push(`## ${st.mark} ${st.label} (${list.length})`);
+    L.push('');
+    L.push('| Game | Year | Tested editions |');
+    L.push('|---|---|---|');
+    for (const t of list) {
+      // A hosted title's page is its app page; compat/<slug>.html only points there.
+      const play = t.hostId ? ' ▶' : '';
+      const href = t.hostId ? `/apps/${t.hostId}.html` : `/compat/${t.slug}.html`;
+      const eds = t.editions.map(e => EDITION_LABEL[e.edition] || e.edition).join(', ');
+      L.push(`| [${esc(t.title)}](${href})${play} | ${t.year || ''} | ${esc(eds)} |`);
+    }
     L.push('');
   }
   return L.join('\n');
@@ -527,7 +866,7 @@ function articleDateline(dates) {
   const parts = [];
   if (dates.published) parts.push(`Published ${dates.published}`);
   if (dates.modified && dates.modified !== dates.published) parts.push(`updated ${dates.modified}`);
-  parts.push(`<a href="/design/">How Wine-Assembly works</a>`);
+  parts.push(`<a href="/design/">How Berrry Wine works</a>`);
   return `<p class="dateline">${parts.join(' · ')}</p>`;
 }
 function articlePager(prev, next) {
@@ -561,6 +900,8 @@ function generatePages({ progress = () => {} } = {}) {
   const started = Date.now();
   const history = createGitDates(ROOT, { progress });
   const gitDate = (rel, which) => history.get(rel)[which === 'first' ? 'published' : 'modified'];
+  // Nearly every date lookup is a doc or an article; answer them in one go.
+  history.prefetch([...listDocs().map(d => d.rel), ...listArticles().map(a => a.rel)]);
   progress('rendering static pages');
   const pages = [];
   const urls = [{ loc: `${SITE}/`, priority: '1.0', changefreq: 'weekly' }];
@@ -573,8 +914,8 @@ function generatePages({ progress = () => {} } = {}) {
     name: 'story.html',
     content: pageHtml({
       md: storyMd,
-      title: 'How Wine-Assembly was built: a Windows 98 emulator in raw WebAssembly',
-      description: 'The history of Wine-Assembly, a Windows 98 emulator in WebAssembly: from the first x86 decoder to a browser running Pinball, Winamp, DirectX and Win16 apps.',
+      title: 'How Berrry Wine was built: a Windows 98 emulator in raw WebAssembly',
+      description: 'The history of Berrry Wine, a Windows 98 emulator in WebAssembly: from the first x86 decoder to a browser running Pinball, Winamp, DirectX and Win16 apps.',
       urlPath: 'story.html', sourceRel: 'PROJECT_STORY.md',
       dates: storyDates,
     }),
@@ -604,10 +945,22 @@ function generatePages({ progress = () => {} } = {}) {
   const apps = loadDesktopApps();
   const blurbDates = { published: gitDate(APP_BLURBS_REL, 'first'), modified: gitDate(APP_BLURBS_REL) };
   const faq = fs.existsSync(path.join(ROOT, APP_FAQ_REL)) ? JSON.parse(fs.readFileSync(path.join(ROOT, APP_FAQ_REL), 'utf-8')) : {};
+  const compat = loadCompat(new Set(apps.map(a => a.id)));
+  // Every desktop app that plays an edition of a compat title carries that
+  // title's status, own-copy route and store links on its own page.
+  const compatFor = new Map();
+  for (const t of (compat ? compat.titles : [])) {
+    for (const e of t.editions) {
+      if (e.playId && !compatFor.has(e.playId)) compatFor.set(e.playId, { t, affiliate: compat.affiliate });
+    }
+  }
   for (const app of apps) {
     const siblings = apps.filter(s => s.group === app.group && s.id !== app.id);
     const qa = appFaq(app, faq);
-    const md = appPageMd(app, siblings, qa);
+    const md = appPageMd(app, siblings, qa, compatFor.get(app.id) || null);
+    // Its compat data changes the page too: the later of the two edits.
+    const appDates = compatFor.has(app.id) && gitDate(COMPAT_REL) > (blurbDates.modified || "")
+      ? { ...blurbDates, modified: gitDate(COMPAT_REL) } : blurbDates;
     // The app's own 1200x630 link-preview card, built from its screenshot.
     // Generated beside the pages (screenshots/og/ is not committed) and
     // uploaded by deploy-berrry.js with the other binary directories.
@@ -626,7 +979,7 @@ function generatePages({ progress = () => {} } = {}) {
         // in the page body only pads a snippet.
         description: appDescription(app),
         urlPath: `apps/${app.id}.html`, sourceRel: APP_BLURBS_REL,
-        dates: blurbDates,
+        dates: appDates,
         ogImage,
         ldMore: [faqLd(qa)],
         ldExtra: {
@@ -636,7 +989,7 @@ function generatePages({ progress = () => {} } = {}) {
         },
       }),
     });
-    urls.push({ loc: `${SITE}/apps/${app.id}.html`, lastmod: blurbDates.modified, priority: '0.7', changefreq: 'monthly' });
+    urls.push({ loc: `${SITE}/apps/${app.id}.html`, lastmod: appDates.modified, priority: '0.7', changefreq: 'monthly' });
   }
   const appsIndex = appsIndexMd(apps);
   pages.push({
@@ -650,6 +1003,50 @@ function generatePages({ progress = () => {} } = {}) {
     }),
   });
   urls.push({ loc: `${SITE}/apps/`, lastmod: blurbDates.modified, priority: '0.8', changefreq: 'monthly' });
+
+  if (compat) {
+    const compatDates = { published: gitDate(COMPAT_REL, 'first'), modified: gitDate(COMPAT_REL) };
+    for (const t of compat.titles) {
+      // A hosted title is answered by its app page. Its compat URL is already
+      // indexed and the deploy cannot delete a file, so it keeps serving the
+      // same content but names the app page canonical and forwards visitors
+      // there, like the articles folded into design/; it leaves the sitemap.
+      const host = t.hostId ? `apps/${t.hostId}.html` : null;
+      pages.push({
+        name: `compat/${t.slug}.html`,
+        content: pageHtml({
+          md: compatPageMd(t, compat.affiliate),
+          title: `Does ${t.title} run in the browser?`,
+          description: compatDescription(t),
+          urlPath: `compat/${t.slug}.html`, sourceRel: COMPAT_REL,
+          dates: compatDates,
+          ...(host ? { canonical: host, extraHead: `\n  <meta http-equiv="refresh" content="0; url=/${host}">` } : {}),
+          ldExtra: {
+            '@type': 'WebPage',
+            about: {
+              '@type': 'VideoGame', name: t.title, gamePlatform: 'PC', operatingSystem: 'Windows 95, Windows 98',
+              ...(t.year ? { datePublished: String(t.year) } : {}),
+              ...(t.developer ? { author: { '@type': 'Organization', name: t.developer } } : {}),
+              ...(t.publisher ? { publisher: { '@type': 'Organization', name: t.publisher } } : {}),
+            },
+          },
+        }),
+      });
+      if (!host) urls.push({ loc: `${SITE}/compat/${t.slug}.html`, lastmod: compatDates.modified, priority: '0.6', changefreq: 'monthly' });
+    }
+    const indexMd = compatIndexMd(compat.titles);
+    pages.push({
+      name: 'compat/index.html',
+      content: pageHtml({
+        md: indexMd,
+        title: 'Windows games in the browser: compatibility list',
+        description: extractMeta(indexMd).description,
+        urlPath: 'compat/', sourceRel: COMPAT_REL,
+        dates: compatDates,
+      }),
+    });
+    urls.push({ loc: `${SITE}/compat/`, lastmod: compatDates.modified, priority: '0.8', changefreq: 'weekly' });
+  }
 
   const articlesIndexRel = 'articles/README.md';
   if (fs.existsSync(path.join(ROOT, articlesIndexRel))) {
@@ -726,8 +1123,8 @@ function generatePages({ progress = () => {} } = {}) {
   const articlesBody = fs.existsSync(path.join(ROOT, articlesIndexRel))
     ? fs.readFileSync(path.join(ROOT, articlesIndexRel), 'utf-8').replace(/^[\s\S]*?(?=^## )/m, '').replace(/^## /gm, '### ')
     : '';
-  const designMd = `# How Wine-Assembly works: articles, design docs and reverse-engineering notes\n\n` +
-    `Wine-Assembly runs real Windows 98 programs in the browser: an x86 interpreter, a Win32 API layer, ` +
+  const designMd = `# How Berrry Wine works: articles, design docs and reverse-engineering notes\n\n` +
+    `Berrry Wine runs real Windows 98 programs in the browser: an x86 interpreter, a Win32 API layer, ` +
     `a software GDI, DirectX and a 16-bit loader, all written directly in WebAssembly Text. ` +
     `The articles below each answer one question about how that is built and are the place to start; ` +
     `the design docs and per-application reverse-engineering notes after them are the working record ` +
@@ -737,7 +1134,7 @@ function generatePages({ progress = () => {} } = {}) {
     `1. [How to write an x86 interpreter in raw WebAssembly Text](/articles/x86-interpreter-in-webassembly-text.html), the machine everything else runs on.\n` +
     `2. [Implementing the Win32 API in WebAssembly](/articles/win32-api-in-webassembly.html), the operating system the program thinks it is talking to.\n` +
     `3. [A software GDI in WebAssembly](/articles/software-gdi-in-webassembly.html), how pixels get from the program to the canvas.\n` +
-    `4. [Wine-Assembly vs v86](/articles/wine-assembly-vs-v86.html), what this approach gives up and gains against booting a real Windows 98.\n` +
+    `4. [Berrry Wine vs v86](/articles/wine-assembly-vs-v86.html), what this approach gives up and gains against booting a real Windows 98.\n` +
     `5. [Building an emulator with AI coding agents](/articles/building-an-emulator-with-ai-coding-agents.html), how it was actually written.\n\n` +
     `## Articles\n\n` + articlesBody.trim() + `\n\n` +
     `## Design docs and reverse-engineering notes\n\n` + docsIntro + `\n\n` + docsSections.replace(/^## /gm, '### ');
@@ -745,7 +1142,7 @@ function generatePages({ progress = () => {} } = {}) {
     name: 'design/index.html',
     content: pageHtml({
       md: designMd,
-      title: 'How Wine-Assembly works: articles, design docs and reverse-engineering notes',
+      title: 'How Berrry Wine works: articles, design docs and reverse-engineering notes',
       description: 'How a Windows 98 emulator in WebAssembly Text works: articles on the x86 interpreter, lazy flags, DLLs, GDI, DirectX and Win16, plus design docs and RE notes.',
       urlPath: 'design/', sourceRel: 'articles/README.md',
       dates: { modified: today },
@@ -753,14 +1150,14 @@ function generatePages({ progress = () => {} } = {}) {
   });
   urls.push({ loc: `${SITE}/design/`, priority: '0.8', changefreq: 'weekly' });
 
-  const indexMd = `# Wine-Assembly design docs and reverse-engineering notes\n\n` +
-    `Wine-Assembly runs real Windows 98 executables in the browser: an x86 interpreter and a Win32 API layer ` +
+  const indexMd = `# Berrry Wine design docs and reverse-engineering notes\n\n` +
+    `Berrry Wine runs real Windows 98 executables in the browser: an x86 interpreter and a Win32 API layer ` +
     `written directly in WebAssembly Text. ` + docsIntro + `\n\n` + docsSections;
   pages.push({
     name: 'docs/index.html',
     content: pageHtml({
       md: indexMd,
-      title: 'Wine-Assembly design docs and reverse-engineering notes',
+      title: 'Berrry Wine design docs and reverse-engineering notes',
       description: 'Design docs and reverse-engineering notes for a Windows 98 emulator in WebAssembly Text: memory map, x86 dispatch, lazy flags, software GDI, DirectX, Win16.',
       urlPath: 'docs/', sourceRel: 'docs',
       canonical: 'design/',
@@ -787,7 +1184,7 @@ function writePages(pages) {
   }
 }
 
-module.exports = { generatePages, writePages, extractMeta, SITE };
+module.exports = { generatePages, writePages, extractMeta, SITE, validateCompat, validateCompatEdition, compatTableMd };
 
 if (require.main === module) {
   const pages = generatePages();

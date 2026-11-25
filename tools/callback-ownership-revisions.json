@@ -1,0 +1,494 @@
+{
+  "version": 1,
+  "revisions": [
+    {
+      "file": "src/09a5-handlers-window.wat",
+      "name": "$handle_DispatchMessageA",
+      "baseSHA256": "cc3f6596cac597cdd57c62a52245f8fcd6019cf6a528966bb7dbc6e2c5470982",
+      "sha256": "cb479065b8b6c20b4fd199cbfdd1177d724b02b906f1b4f24b4479789fdba34d",
+      "reason": "Review 20261117 native hover pump observation: an opt-in per-consumer budget records only the DispatchMessage public MSG header and entry identity before the unchanged dispatch body. It reads no private game state, executes no new guest callback, and never acknowledges hover or input delivery. Native Peek/Get entry and handler-return records distinguish consumed API frame, parked wait and possible redirect; callback return remains unmeasured. All existing EIP writes, callback admission, restoration, actor/window/focus/frame/writer checks and independent release rules remain unchanged. Actual x86 nested callback, native trace-on/off output parity, filtered refusal, owner transition, lifetime and bounded cost proofs are in run20261117-disciples2-native-hover-pump-completion. General retained-context ownership remains pending."
+    },
+    {
+      "file": "lib/renderer-input.js",
+      "name": "host-file",
+      "baseSHA256": "a8de6b537ff492cebe763fee3a9e30bd5b7e16a0751a63e922671045f73c4fcf",
+      "sha256": "be58e49e07260151e6c1e1137036183f42b60ec778f2e1fd74aa81eed8de01cd",
+      "reason": "Review 20261117 coordinate press hover: retain the original canvas coordinates in local constants before native mapping and cursor clipping, then pass them to the existing synchronous handleMouseMove call. Non-strict argument aliasing previously remapped the native point. No callback, scheduling, retained owner, continuation, input receipt, physical release or context-restoration rule changes; ownership remains pending. Actual native hover and DOWN coordinates plus production transform and refusal regressions qualify this bounded repair. Review 20261117 comctl32: inputHoldDeadlineMs only reports when queued press/hover holds release; it calls no guest code. Review 20261117: class12 native file-dialog keys and WM_CHAR now enqueue ordinary physical events for the owning native modal pump instead of synchronously executing shadow dialog/edit functions. All other modal/menu routes, physical release, guard rules and immutable deadlines remain unchanged. No native receipt is fabricated. Main and actual CPUWorker authored keyboard/focus and unchanged input regressions qualify the bounded routing change; general retained callback ownership remains pending."
+    },
+    {
+      "file": "src/09a5-handlers-window.wat",
+      "name": "$handle_PeekMessageA_fetch",
+      "baseSHA256": "efcb7dda81314d186771f176b66ff594a7ebb82b6718db9cccd3a7b1270ef929",
+      "sha256": "403ffc8ba151e610958392f2eed234d6979e36b6bb51e97182e810f2426a5c2f",
+      "reason": "Review 20261117 native consumer confirmation: host dequeue creates only an opaque immutable-intent token. Peek/Get validate token and exact memory/context before routing or guest-visible MSG; successful native USER return confirms exact full MSG, actual owner thread and API/removal provenance only after hooks/callbacks complete synchronously with matching stack. PM_NOREMOVE may confirm an exact successful owner return; filtered, sibling, stale, yielded, asynchronous-state-only and nonconsumer routes cannot confirm. Existing callback admission, stack restoration and empty unfiltered hover observation remain unchanged. Authored real x86 main plus CPUWorker positives/refusals and published baseline false acknowledgments recorded in run20261117-caesar3-native-consumer-confirmation-repair; general callback ownership remains pending."
+    },
+    {
+      "file": "lib/storage.js",
+      "name": "host-file",
+      "baseSHA256": "0c04f8c5886a8d6d0717efc275339e66ead64430d901a4b62371a9fd80d40053",
+      "sha256": "df79acd708a83f6e10b6fd4be33c8ab74d4bdaedb5b959ca284bf6615226117d",
+      "reason": "Merged HKCR registry lookup and synchronous mutation retain existing disk and registry ownership; aliases and inferred roots introduce no guest callback, asynchronous frame or context restoration. Generic Interface root enables genuine system registrar execution; arbitrary missing keys remain errors. Native qualification is recorded separately. Review 20261117: physical registry paths strip trailing separators before existence/read/write/delete and import lookup, preventing existing-key CreateKey from clearing values. Synchronous shared backend only; no new guest callback, scheduling, actor, context or lifecycle behavior. Authored ordinary/main Win32 and Win16/CPUWorker preservation and persistence controls recorded in run20261117-neverhood-native-registry-persistence-repair; general retained ownership remains pending. Review 20261117 owned native type-description transport: SYSTEM PS lookup is synchronous and adds no callback; source pin includes the actual contract and value codecs. Returned interface attachments use authenticated exporter packets and exact caller leases, release on cancelled/unpolled replies, and retain existing real guest continuation/epoch/flags/stack fences. No new owner-restoration authority; general ownership remains pending. Focused native qualification in 20261117-sims-owned-native-typeinfo-factory-dispatch-integration."
+    },
+    {
+      "file": "src/09b-dispatch.wat",
+      "name": "$win32_dispatch_inner",
+      "baseSHA256": "5a9f6a834b9ad5a58d4090c18f714961416dc9583908990087503ebbf715f25b",
+      "sha256": "682ab78e7e3f03d7a784f6552a8dd57de56bd637c2874de1d4fbb8a3930ab92f",
+      "reason": "TreatAs activation uses the existing COM jump/continuation mechanism with a private guest-stack frame. Marker CACA0041 restores the original stdcall frame after ordinary activation completes, including DLL-load yields and native class-factory callbacks. No foreign activation frame, global GUID scratch, callback admission or nonlocal ownership assertion is added; native guest-DLL, builtin-chain, cycle and unchanged activation regressions qualify the bounded route; ownership remains pending."
+    },
+    {
+      "file": "lib/dll-loader.js",
+      "name": "host-file",
+      "baseSHA256": "deb6b1b6bd417cac7007c7f27748ad117729349a9c5fb64e2237dca4ccb99bd5",
+      "sha256": "cbdca7ed6ecce5d26002c13b42a613e3637c9c5ecd4a95e8c9c6b0670f138ca0",
+      "reason": "Sims native child waits use an external monotonic deadline and yield the host loop without changing guest clocks. COM automatic roots are consumed under the existing loader lock before callbacks; normal roots, pins and generation retirement stay authoritative. Pending automatic-load intent is captured once before nested initializers. Existing synchronous, asynchronous and scoped unload paths share the operation snapshot; nested cleanup cannot consume outer intents twice. Broader invocation ownership remains pending; native lifecycle qualification is required."
+    },
+    {
+      "file": "src/09a-handlers1-user.wat",
+      "name": "$handle_DialogBoxParamA",
+      "baseSHA256": "6ab4c8eb1ba74c919323924e51e6e3091868946ddeea36905feff099644125c6",
+      "sha256": "c08da8f4c33135fea46a3ff44ad4edaa4310b5bd16099bc7e52dae12522726ba",
+      "reason": "Capture an immutable native USER generation, process/thread, owner, callback and return site after template creation and before guest WM_INITDIALOG. Read-only observation requires the executing actor active pump, unchanged callback/return site, live generation and no EndDialog. Existing guest stack nesting, callback frames, return cleanup and general invocation ownership remain unchanged/pending. Native x86 DialogBox tests qualify this observation separately."
+    },
+    {
+      "file": "src/09e1-native-ft-relay.wat",
+      "name": "$win16_ft_prolog",
+      "baseSHA256": "38b7b4a34b859a10d1be548cffcaec7b91f0ed802dd4fdd1190ffdf487bcb303",
+      "sha256": "ddbb708bd495f1b89629aef8a1e65574f3028f5ac298fdc8ac2c0c19c557029c",
+      "reason": "Reject actual QT call continuations as FT parents at either alignment, preserving FT compiler frames, alignment and restoration. Native FT and invalidQT-asFT controls retained in run20261117-neverhood-ls32-qt-implementation; general invocation ownership remains pending."
+    },
+    {
+      "file": "lib/process-boot.js",
+      "name": "host-file",
+      "baseSHA256": "ba54542269320d2a6bcf82d33445989840a872a62d27448e349afe0f97113a9c",
+      "sha256": "a9bb737744fc93f5d4c5b8aed3bd648615f968c2175ad49b2e4006a7e92a9bba",
+      "reason": "Review 20261117 comctl32: COMCTL32.DLL joins the static system-module placeholder files (file presence and RT_VERSION only, never mapped); no host boundary, run loop or guest-control change. Review 20261117 web LS16 release blocker: handleLoadLibraryYield routes an NE request (yield 18) on a non-Worker host through the existing owned asynchronous NE preflight whenever the caller supplies an awaitable findDll, under the same acquired callback gate as PE loads; the parked request token is revalidated after every await. Hosts without findDll keep the synchronous service. No new guest entry or context restoration; ownership remains pending."
+    },
+    {
+      "file": "host.js",
+      "name": "host-file",
+      "baseSHA256": "2f0b9ae34726c27c662f5c3df4451689c51bfc4cefe459cedc45c25aab2ebc6a",
+      "sha256": "9ab98ed90c863db118ca2537507d163eb0b8fd90c763958dfc1ed76ec7ff7d01",
+      "reason": "Review 20261117 d3d9-retire S4: removes the old JS D3D8/9 path only -- the D3D9 Bridge (gpu_gl_call 0x30000-0x30019 except the 0x30018 zero answer), yield-16 render wait and its token exports, api-4 snapshot publication, D3D9 render-worker loading and the noteWorldTrace diagnostic. No callback, EIP write, run/sync boundary, continuation or restoration path is added or moved; remaining entry points are unchanged and only lose D3D9 branches. retire/d3dim-20261117: D3DIM is GPU stream only; removed the d3dim_gpu_enable / set_d3dim_gpu_present switches and the retired 0x20000-0x20004 host forwarding. No producer shape, write, boundary or lifetime change. Review 20261117 web LS16 release blocker: the main-thread page boot maps its startup DLL set with the existing owned DllLoader.loadDllsAsync (the loader the guest Worker already runs) instead of the synchronous loader, and services a nested LoadLibrary/NE yield through ProcessBoot.handleLoadLibraryYield with the page asynchronous resolver. The synchronous loader remains the fallback when the async entry is unavailable. No new guest entry, continuation or context restoration; DllMain frames, gate ownership and quarantine are the existing loader ones; ownership remains pending. Review 20261117 current-display ticket servicing: existing ordinary completed host boundary services only clean live host/shared DirectDraw queues and unheld renderer/paint/damage. A ticket armed with pending host damage still requires later ordinary publication. Readback uses retained published canvases, preserves exact publication/timestamp and schedules no frame, guest entry, flush, timer or callback. Host stop explicitly fails only its own pending current-display ticket and invalidates its retained display receipt. Scoped producer loss/retirement invalidation preserves foreign tickets and completed immutable bytes. Actual x86 GL guest/render Worker clean-slice before timeout versus same-publication serviced after, literal source/output, cancellation/identity/writer/fault regressions in run20261117-gl-gps-current-display-ticket-servicing-repair. Broader retained callback ownership remains pending. Review 20261117 d3dim-replay cleanup: deletes the dead D3DIM render-worker replay (0x20000/0x20002/0x20003 records, d3dim_worker_draw, draw-trace/ground diagnostics, the onD3dimFrame -> presentD3dimGpuFrame chain); the legacy endpoint is software-GL only (no backend option, no frames) and gpu_gl_call routes exactly 0x20001/0x20005/0x20006 to it. No callback owner added; one removed (onD3dimFrame). Review 20261117 d3d9-retire S4: removes the old JS D3D8/9 path only -- the D3D9 Bridge (gpu_gl_call 0x30000-0x30019 except the 0x30018 zero answer), yield-16 render wait and its token exports, api-4 snapshot publication, D3D9 render-worker loading and the noteWorldTrace diagnostic. No callback, EIP write, run/sync boundary, continuation or restoration path is added or moved; remaining entry points are unchanged and only lose D3D9 branches. retire/d3dim-20261117: D3DIM is GPU stream only; removed the d3dim_gpu_enable / set_d3dim_gpu_present switches and the retired 0x20000-0x20004 host forwarding. No producer shape, write, boundary or lifetime change. Review 20261117 web LS16 release blocker: the main-thread page boot maps its startup DLL set with the existing owned DllLoader.loadDllsAsync (the loader the guest Worker already runs) instead of the synchronous loader, and services a nested LoadLibrary/NE yield through ProcessBoot.handleLoadLibraryYield with the page asynchronous resolver. The synchronous loader remains the fallback when the async entry is unavailable. No new guest entry, continuation or context restoration; DllMain frames, gate ownership and quarantine are the existing loader ones; ownership remains pending. Review 20261117 current-display ticket servicing: existing ordinary completed host boundary services only clean live host/shared DirectDraw queues and unheld renderer/paint/damage. A ticket armed with pending host damage still requires later ordinary publication. Readback uses retained published canvases, preserves exact publication/timestamp and schedules no frame, guest entry, flush, timer or callback. Host stop explicitly fails only its own pending current-display ticket and invalidates its retained display receipt. Scoped producer loss/retirement invalidation preserves foreign tickets and completed immutable bytes. Actual x86 GL guest/render Worker clean-slice before timeout versus same-publication serviced after, literal source/output, cancellation/identity/writer/fault regressions in run20261117-gl-gps-current-display-ticket-servicing-repair. Broader retained callback ownership remains pending. Review 20261117 browser native receipt bridge: opt-in browser handler tags its exact physical DOWN edge, broker scopes calls to the live Worker slot, and Worker-local public USER context travels with validation and native return. Only the native input_consumed return confirms the token; the page idle instance is never used as actor. No guest callback, EIP write, clock, continuation or restoration change. Scope lifetime and explicit owner/context/token/deadline negatives are tested in run20261117-gltron-browser-native-receipt-bridge-gameplay. General callback ownership remains pending. Review 20261117 GLTron paused producer: pending current-display tickets service the existing clean retained-display path on status/read as well as completed slices; pin host renderer/instance/process before servicing. No new guest call, callback admission, frame, pump, upload, timer or ownership weakening. Original host queue and renderer writer/damage/publication checks remain required. Completed tickets read copied bytes without live-state service. Native paused last-frame, queued damage, generation, GPU error/contextloss/retirement and UNKNOWN tests recorded in run20261117-gltron-fresh-native-scene-webgl-ticket-gameplay; broader invocation ownership remains pending. Review 20261117 GLTron continuous capture lifecycle: a new current-display observation refuses an already recorded native GPS producer error before creating a pending ticket, including during an executing writer. No callback, guest entry, scheduling or timeout change. Actual native WebGL context loss and focused active-writer refusal recorded in run20261117-gltron-continuous-capture-release-arm-gameplay; broader callback ownership remains pending."
+    },
+    {
+      "file": "lib/guest-thread-host.js",
+      "name": "host-file",
+      "baseSHA256": "490dadce6dac421df16529b075919ff5effe3c7dc4679e1ad9d1d2d8be3c8253",
+      "sha256": "bdd69751bbdb96beed36e2ddc6c96261ccf2a0ab0dc2de58dcb6fd2586938a8e",
+      "reason": "Review 20261117 d3d9-retire S4: removes the old JS D3D8/9 path only -- the D3D9 Bridge (gpu_gl_call 0x30000-0x30019 except the 0x30018 zero answer), yield-16 render wait and its token exports, api-4 snapshot publication, D3D9 render-worker loading and the noteWorldTrace diagnostic. No callback, EIP write, run/sync boundary, continuation or restoration path is added or moved; remaining entry points are unchanged and only lose D3D9 branches. retire/d3dim-20261117: D3DIM is GPU stream only; removed the d3dim_gpu_enable / set_d3dim_gpu_present switches and the retired 0x20000-0x20004 host forwarding. No producer shape, write, boundary or lifetime change. Review 20261117 d3dim-replay cleanup: deletes the dead D3DIM render-worker replay (0x20000/0x20002/0x20003 records, d3dim_worker_draw, draw-trace/ground diagnostics, the onD3dimFrame -> presentD3dimGpuFrame chain); the legacy endpoint is software-GL only (no backend option, no frames) and gpu_gl_call routes exactly 0x20001/0x20005/0x20006 to it. No callback owner added; one removed (onD3dimFrame)."
+    },
+    {
+      "file": "lib/guest-worker.js",
+      "name": "host-file",
+      "baseSHA256": "9fa351560f5e7d865ff366eb8ee8049cd948cedbe10efd8ca1d3cd73aba3088e",
+      "sha256": "31946075d164bf1cb82d463e8c2c4ebbab0648a3b6b41bc64851867fd701bb24",
+      "reason": "Review 20261117 d3d9-retire S4: removes the old JS D3D8/9 path only -- the D3D9 Bridge (gpu_gl_call 0x30000-0x30019 except the 0x30018 zero answer), yield-16 render wait and its token exports, api-4 snapshot publication, D3D9 render-worker loading and the noteWorldTrace diagnostic. No callback, EIP write, run/sync boundary, continuation or restoration path is added or moved; remaining entry points are unchanged and only lose D3D9 branches. retire/d3dim-20261117: D3DIM is GPU stream only; removed the d3dim_gpu_enable / set_d3dim_gpu_present switches and the retired 0x20000-0x20004 host forwarding. No producer shape, write, boundary or lifetime change. Review 20261117 d3dim-replay cleanup: deletes the dead D3DIM render-worker replay (0x20000/0x20002/0x20003 records, d3dim_worker_draw, draw-trace/ground diagnostics, the onD3dimFrame -> presentD3dimGpuFrame chain); the legacy endpoint is software-GL only (no backend option, no frames) and gpu_gl_call routes exactly 0x20001/0x20005/0x20006 to it. No callback owner added; one removed (onD3dimFrame)."
+    },
+    {
+      "file": "lib/host-imports.js",
+      "name": "host-file",
+      "baseSHA256": "c3aad3ad155217dd7b7480825a8f250766c7299564e63fccae1d25295d4081d9",
+      "sha256": "0a015dee8e79e685e15e84f8b1c942b173812c4ff242d3524308fc19920ff8c3",
+      "reason": "Review 20261117 d3d9-retire S4: removes the old JS D3D8/9 path only -- the D3D9 Bridge (gpu_gl_call 0x30000-0x30019 except the 0x30018 zero answer), yield-16 render wait and its token exports, api-4 snapshot publication, D3D9 render-worker loading and the noteWorldTrace diagnostic. No callback, EIP write, run/sync boundary, continuation or restoration path is added or moved; remaining entry points are unchanged and only lose D3D9 branches. retire/d3dim-20261117: D3DIM is GPU stream only; removed the d3dim_gpu_enable / set_d3dim_gpu_present switches and the retired 0x20000-0x20004 host forwarding. No producer shape, write, boundary or lifetime change. Review 20261117 Boids repair: native per-window primary allocation and actual PRESENT rt/record identity validate delayed frames. Actual native window GDI uploads retain disjoint dirty rectangles ordered by their preceding native PRESENT. GPU-only or read-only materialized primary DIBs do not become signature-polled CPU publications; later watched CPU Lock writes remain eligible. No guest callback, continuation, host clock, stepping, pause or extra publication is introduced. Existing process/endpoint retirement and CPU-present guards remain active; general invocation ownership remains pending. Qualification: run 20261117-boids-primary-gdi-ownership-repair. Review 20261117 d3dim-replay cleanup: deletes the dead D3DIM render-worker replay (0x20000/0x20002/0x20003 records, d3dim_worker_draw, draw-trace/ground diagnostics, the onD3dimFrame -> presentD3dimGpuFrame chain); the legacy endpoint is software-GL only (no backend option, no frames) and gpu_gl_call routes exactly 0x20001/0x20005/0x20006 to it. No callback owner added; one removed (onD3dimFrame). Review 20261117 d3d9-retire S4: removes the old JS D3D8/9 path only -- the D3D9 Bridge (gpu_gl_call 0x30000-0x30019 except the 0x30018 zero answer), yield-16 render wait and its token exports, api-4 snapshot publication, D3D9 render-worker loading and the noteWorldTrace diagnostic. No callback, EIP write, run/sync boundary, continuation or restoration path is added or moved; remaining entry points are unchanged and only lose D3D9 branches. retire/d3dim-20261117: D3DIM is GPU stream only; removed the d3dim_gpu_enable / set_d3dim_gpu_present switches and the retired 0x20000-0x20004 host forwarding. No producer shape, write, boundary or lifetime change. Review 20261117 Boids repair: native per-window primary allocation and actual PRESENT rt/record identity validate delayed frames. Actual native window GDI uploads retain disjoint dirty rectangles ordered by their preceding native PRESENT. GPU-only or read-only materialized primary DIBs do not become signature-polled CPU publications; later watched CPU Lock writes remain eligible. No guest callback, continuation, host clock, stepping, pause or extra publication is introduced. Existing process/endpoint retirement and CPU-present guards remain active; general invocation ownership remains pending. Qualification: run 20261117-boids-primary-gdi-ownership-repair. Review 20261117 Caesar III native Quit rendering: native primary PRESENT records its renderer write order at the existing dx_trace boundary. A delayed host pixel upload consumes that order once, so it cannot falsely cover a later native MessageBox paint. Later real primary presents, retained CPU uploads without a pending present, clipped coverage and native repaint ordering remain unchanged. Pending order retires with the exact surface. No guest callback, paint, input, pump, scheduling, EIP, native receipt, clock or restoration behavior is added or changed. Actual authored guest public-COM DirectDraw primary followed by owned MessageBox reproduces the absent modal on the pinned 9099 module and shows it after this host-only fix. Baseline-failing/fixed-passing upload/compositor order, later-cover, native-repaint, retained-write, existing dialog freshness, forced pixels and no synthetic paint regressions are recorded in run20261117-caesar3-fresh-reviewed-native-quit. Original FileExit reached Quit metadata but no Yes was sent, so original nativeQuit remains unproved; general retained callback ownership remains pending. Review 20261117 Sims ordinal162: add only OLEAUT32.DLL#162 -> existing LoadRegTypeLib name to synchronous ordinal lookup data. No callback, owner, continuation, retained reference, scheduling or restoration change. Native x86 ordinal-only import and public GetProcAddress ABI/lifetime proof in run20261117-sims-oleaut32-ordinal162-native-typelib-install; general ownership remains pending. Review 20261117 Conan D3D9 Worker visibility: accepted frames capture render endpoint and bridge epoch; reject failure, close, replacement and retirement instead of querying the idle page instance-local ring. No guest calls, callbacks, pump, clock, guards or publication changes; local native activity check unchanged. Baseline-failing/fixed-passing existing renderer boundary regression covers idle0/failure/closed/retire/reopen/localactive. General invocation ownership remains pending. Evidence run20261117-conan-current-startup-boundary-visible-progress. Review 20261117 Sims VariantChangeType: synchronous OLEAUT32.DLL#12 ordinal name lookup only. Native conversion has no guest callback or retained context; stdcall frame tested in 20261117-sims-owned-native-typeinfo-factory-dispatch-integration. General ownership remains pending. Review 20261117 Sims native SafeArrayGetElement: synchronous ordinal25 name lookup only. Native counted BSTR copy and bounds/error/frame tests in run20261117-sims-native-coercion-installer-file-progress; no callback or retained-context change. General ownership remains pending. Review 20261117 Sims SafeArrayPutElement: synchronous ordinal26 name mapping only, no callback/context/lifetime change in host. Native BSTR staging/replacement tested in same run. General ownership remains pending. Review 20261117 native SafeArrayCopy ordinal17 adds only a synchronous resolver alias; independent descriptor/data/BSTR cloning has no callbacks, retained contexts, actor transitions or scheduling. Existing continuation/cancellation fences remain unchanged. Actual native frame, ownership, errors and rollback tests in 20261117-sims-native-coercion-installer-file-progress; general retained ownership remains pending. Review 20261117 SafeArrayPtrOfIndex ordinal202 is a synchronous borrowed-address lookup only, with no element lifetime, callback, scheduling or lock ownership transition. Native exact frames, bounds and caller-lock tests qualify the resolver addition in the same run; general retained ownership remains pending. Review 20261117 d3d9-retire S4: removes the old JS D3D8/9 path only -- the D3D9 Bridge (gpu_gl_call 0x30000-0x30019 except the 0x30018 zero answer), yield-16 render wait and its token exports, api-4 snapshot publication, D3D9 render-worker loading and the noteWorldTrace diagnostic. No callback, EIP write, run/sync boundary, continuation or restoration path is added or moved; remaining entry points are unchanged and only lose D3D9 branches. retire/d3dim-20261117: D3DIM is GPU stream only; removed the d3dim_gpu_enable / set_d3dim_gpu_present switches and the retired 0x20000-0x20004 host forwarding. No producer shape, write, boundary or lifetime change. Review 20261117 Boids repair: native per-window primary allocation and actual PRESENT rt/record identity validate delayed frames. Actual native window GDI uploads retain disjoint dirty rectangles ordered by their preceding native PRESENT. GPU-only or read-only materialized primary DIBs do not become signature-polled CPU publications; later watched CPU Lock writes remain eligible. No guest callback, continuation, host clock, stepping, pause or extra publication is introduced. Existing process/endpoint retirement and CPU-present guards remain active; general invocation ownership remains pending. Qualification: run 20261117-boids-primary-gdi-ownership-repair. Review 20261117 Caesar III native Quit rendering: native primary PRESENT records its renderer write order at the existing dx_trace boundary. A delayed host pixel upload consumes that order once, so it cannot falsely cover a later native MessageBox paint. Later real primary presents, retained CPU uploads without a pending present, clipped coverage and native repaint ordering remain unchanged. Pending order retires with the exact surface. No guest callback, paint, input, pump, scheduling, EIP, native receipt, clock or restoration behavior is added or changed. Actual authored guest public-COM DirectDraw primary followed by owned MessageBox reproduces the absent modal on the pinned 9099 module and shows it after this host-only fix. Baseline-failing/fixed-passing upload/compositor order, later-cover, native-repaint, retained-write, existing dialog freshness, forced pixels and no synthetic paint regressions are recorded in run20261117-caesar3-fresh-reviewed-native-quit. Original FileExit reached Quit metadata but no Yes was sent, so original nativeQuit remains unproved; general retained callback ownership remains pending. Review 20261117 Sims ordinal162: add only OLEAUT32.DLL#162 -> existing LoadRegTypeLib name to synchronous ordinal lookup data. No callback, owner, continuation, retained reference, scheduling or restoration change. Native x86 ordinal-only import and public GetProcAddress ABI/lifetime proof in run20261117-sims-oleaut32-ordinal162-native-typelib-install; general ownership remains pending. Review 20261117 Conan D3D9 Worker visibility: accepted frames capture render endpoint and bridge epoch; reject failure, close, replacement and retirement instead of querying the idle page instance-local ring. No guest calls, callbacks, pump, clock, guards or publication changes; local native activity check unchanged. Baseline-failing/fixed-passing existing renderer boundary regression covers idle0/failure/closed/retire/reopen/localactive. General invocation ownership remains pending. Evidence run20261117-conan-current-startup-boundary-visible-progress. Review 20261117 Sims VariantChangeType: synchronous OLEAUT32.DLL#12 ordinal name lookup only. Native conversion has no guest callback or retained context; stdcall frame tested in 20261117-sims-owned-native-typeinfo-factory-dispatch-integration. General ownership remains pending. Review 20261117 Sims native SafeArrayGetElement: synchronous ordinal25 name lookup only. Native counted BSTR copy and bounds/error/frame tests in run20261117-sims-native-coercion-installer-file-progress; no callback or retained-context change. General ownership remains pending. Review 20261117 Sims SafeArrayPutElement: synchronous ordinal26 name mapping only, no callback/context/lifetime change in host. Native BSTR staging/replacement tested in same run. General ownership remains pending. Review 20261117 native SafeArrayCopy ordinal17 adds only a synchronous resolver alias; independent descriptor/data/BSTR cloning has no callbacks, retained contexts, actor transitions or scheduling. Existing continuation/cancellation fences remain unchanged. Actual native frame, ownership, errors and rollback tests in 20261117-sims-native-coercion-installer-file-progress; general retained ownership remains pending. Review 20261117 SafeArrayPtrOfIndex ordinal202 is a synchronous borrowed-address lookup only, with no element lifetime, callback, scheduling or lock ownership transition. Native exact frames, bounds and caller-lock tests qualify the resolver addition in the same run; general retained ownership remains pending. Correction 20261117: verified actual OLEAUT32 PE export table and one-argument native callsites: ordinal17 GetDim,27 Copy,148 PtrOfIndex;202 CreateErrorInfo remains closed/unimplemented. Previous17/202 aliases were erroneous, superseded here. Resolver correction only; no new callback or retained context. Native dimensions/frames and wrong202 refusal test in same run. Review 20261117 corrective run 20261117-sims-correct-ordinal17-getdim-installer-progress: independent static PE export and exact iKernel one-argument x86 caller checks supersede earlier wrong-map acceptance. GetDim is UINT with ret4; Copy ret8 stays on27 and borrowed PtrOfIndex ret12 stays on148. No callbacks, retained contexts or ownership changes in host aliases. Review corrective Sims run: synchronous SafeArrayGetLBound20 and GetUBound19 aliases only, following actual ordinal20 three-argument caller. Native metadata queries do not allocate, transfer element owners or acquire locks; exact frame, dimensions, output atomicity and overflow tests qualify this addition. General callback ownership remains pending. Review 20261117 native VariantCopyInd11: ordinal mapping is synchronous. Interface-only native memory lifetime adapter parks the original two-argument frame in the existing owner-thread operation; actual IUnknown AddRef/Release executes via ComGuestContinuation with exact token/epoch/root, current exports/memory, nested stack/flags/SEH/yield restoration and retired-owner fences unchanged. WAT stages scalar/BSTR/SAFEARRAY values before replacing destination; borrowed BYREF Copy retains no reference, CopyInd takes an independent owned reference. Failed callbacks remain errors, never native S_OK. Focused native lifetime/alias/failure/frame tests in 20261117-sims-native-variantcopyind-installer-progress; general ownership remains pending."
+    },
+    {
+      "file": "lib/thread-manager.js",
+      "name": "host-file",
+      "baseSHA256": "a71ff357dbdf0d47c9f7333247a168ebd9a63cf2ba37a97ab8e401d3de8fdbd3",
+      "sha256": "6731d953f1d044c01ccb6684574580732f6b8a993ac9c7093a0e4120666d2dc2",
+      "reason": "Review 20261117 AoWII wait completion: _runWorkerThread synchronously admits one invocation per thread and retains inFlight through preparatory waits, slice replies and asynchronous completion acknowledgement, releasing in outer finally on every return/error. Nested pumps cannot issue a second slice for the same parked frame or overtake completion. No guest EIP write, wait result, callback frame, context restoration, input/release or termination rule changes. Actual original passive replies prove duplicate wait completions consuming the same stdcall frame and setting EIP0; production-handler regression fails original admission and passes this ownership fix, including parked/immediate completion, unsatisfied wait and transport failure. Evidence run20261117-aow2-audio-wait-continuation-gameplay. Prior d3d9-retire S4 removals remain unchanged. General retained callback ownership remains pending."
+    },
+    {
+      "file": "lib/worker-imports.js",
+      "name": "host-file",
+      "baseSHA256": "53d6f5370385dcd23c45d263c7cc08a02f46f2d1e82ed08dcb24f97b8ee59d05",
+      "sha256": "4dd4c6dbc032c1168b755e47be9c3ba36010f18943bda7744e66f02edad29717",
+      "reason": "retire/d3dim-20261117: D3DIM is GPU stream only; removed the d3dim_gpu_enable / set_d3dim_gpu_present switches and the retired 0x20000-0x20004 host forwarding. No producer shape, write, boundary or lifetime change."
+    },
+    {
+      "file": "lib/ne-guest-bridge.js",
+      "name": "host-file",
+      "baseSHA256": "e2fbe5e0307efb4bb6e805b51b850ef51763b00d5afda1055cb9dfb1733fa419",
+      "sha256": "794d03ac69f8f10c1954e2fc62af931f5ba93586b5b032b43bc392d41888461a",
+      "reason": "Review 20261117 web LS16 release blocker: a ThunkConnect32 attach whose 16-bit companion is definitely absent (NeLoadError guest code 2 from source preflight) settles once through the native win16_guest_ls32_settle_absent export; the asynchronous LS32 preflight stops on a typed absence and leaves translation to the same synchronous service. Malformed, refused and asynchronous-only sources still throw. No NE execution, pairing, publication or new restoration path; ownership remains pending. Review 20261117 QT nested native image loading: a distinct per-frame request serial plus full frame-generation token parks only KERNEL.95/96 below the exact active QT/LS connection. Settlement validates actor, caller EIP/ESP/CS/SS/far return, original alias descriptor and backing lease, module lifetime and PE generation; the PE request is untouched. Source bytes use the process resolver and canonical resident identity. Actual LibMain, Win4 semantic usage notifications, native handles/exports/pins/refcounts, rollback, WEP and final unload remain owned by the native lifecycle. Worker source I/O parks the same command/callback owner and checks it after each await; synchronous initializer reentry cannot fetch unavailable async sources. Native success, reference reuse, reentry, cancellation/fault/missing/wrong source, generation/actor/selector/lease/retired refusal and actual CPUWorker proofs are in run20261117-neverhood-native-nested-image-load. No FT, general callback or unrelated direction admission; general ownership remains pending."
+    },
+    {
+      "file": "lib/renderer.js",
+      "name": "host-file",
+      "baseSHA256": "06e2d182efe7d6859bc318e731c3f8c0f0e48d2a674d61aa99e55994d1faf4ec",
+      "sha256": "445a016ec692679a64798554521cd82c4f7c61fdb9e592ad5e09560767621e1e",
+      "reason": "Review 20261117 current-display ticket servicing: existing ordinary completed host boundary services only clean live host/shared DirectDraw queues and unheld renderer/paint/damage. A ticket armed with pending host damage still requires later ordinary publication. Readback uses retained published canvases, preserves exact publication/timestamp and schedules no frame, guest entry, flush, timer or callback. Host stop explicitly fails only its own pending current-display ticket and invalidates its retained display receipt. Scoped producer loss/retirement invalidation preserves foreign tickets and completed immutable bytes. Actual x86 GL guest/render Worker clean-slice before timeout versus same-publication serviced after, literal source/output, cancellation/identity/writer/fault regressions in run20261117-gl-gps-current-display-ticket-servicing-repair. Broader retained callback ownership remains pending. Review 20261117 active producer: after current-display observation is requested, each ordinary unheld publication copies only its completed source and output canvas caches together. Later reads may use that exact retained publication while a new native writer is active; live owner/window/process/instance/output geometry and visibility, poison, retirement and context-loss refusals remain. No guest surface flush, pump, rendering, future-frame substitution or timeout change is introduced. Pending first observations keep the original unheld publication fences. Focused tests and native recipes recorded in run20261117-gltron-continuous-capture-release-arm-gameplay. Review 20261117 native canvas repaint: retained publication copies use ordinary Canvas2D storage rather than readback-optimized storage; copy operation, geometry, alpha, publication sequence, owner/window/process/instance checks and ticket lifetimes are unchanged. Actual WebGL bitmap-to-compositor authored 800x600 source/1060x744 output isolates 730-805ms native drawImage in the retained copy, matched 120-frame normal-storage case removes that repaint delay with full source/output byte hashes and alpha unchanged. Current-display servicing, immutable ticket, input and presentation regressions are in run20261117-gltron-repaint-native-canvas-causal-repair. No new callback or boundary admission; broader ownership remains pending."
+    },
+    {
+      "file": "lib/ne-invoke.js",
+      "name": "host-file",
+      "baseSHA256": "7ba05ed04385218cd0da7fdb9639531bdfcf3c973729aab7304daf5c5be5da88",
+      "sha256": "d0c0c80910e34c4adc7a07dad8f78cdd94bf7ff518e422a911d8494e4306dfb0",
+      "reason": "Review 20261117 QT nested native image loading: a distinct per-frame request serial plus full frame-generation token parks only KERNEL.95/96 below the exact active QT/LS connection. Settlement validates actor, caller EIP/ESP/CS/SS/far return, original alias descriptor and backing lease, module lifetime and PE generation; the PE request is untouched. Source bytes use the process resolver and canonical resident identity. Actual LibMain, Win4 semantic usage notifications, native handles/exports/pins/refcounts, rollback, WEP and final unload remain owned by the native lifecycle. Worker source I/O parks the same command/callback owner and checks it after each await; synchronous initializer reentry cannot fetch unavailable async sources. Native success, reference reuse, reentry, cancellation/fault/missing/wrong source, generation/actor/selector/lease/retired refusal and actual CPUWorker proofs are in run20261117-neverhood-native-nested-image-load. No FT, general callback or unrelated direction admission; general ownership remains pending."
+    },
+    {
+      "file": "src/13-exports.wat",
+      "name": "export:resume_message_wait",
+      "baseSHA256": "dfaab82f4b250df4b516c6d6be15bd26ecb57c1836fddc7f07765fa492e0caae",
+      "sha256": "7ca351abbc0f119e4d4e130a7e5d1ac956bab84095b5dea42cf1d3714090a7ba",
+      "reason": "Review 20261117 ordinary native GetMessage wait resumption: clear the old reason-7 yield flag before calling the existing handler together with its existing reason reset. Previously a completed GetMessage could inherit stale suspended state and lose exact native return confirmation. No new guest call, callback admission, stack change, flush, deadline or interpreter budget; fresh handler/callback yields remain unconfirmed. Authored main plus CPUWorker, filtered/sibling/nonconsumer refusals and delayed Peek/Get after UP are recorded in run20261117-caesar3-native-consumer-confirmation-repair; general invocation ownership remains pending."
+    },
+    {
+      "file": "src/09c3a-dialog-runtime.wat",
+      "name": "$modal_begin",
+      "baseSHA256": "1c13804d9553f10f792e5fa293075c2f56bcea3e9e32a3cff609acf653a54dfa",
+      "sha256": "0f2d01c475d33ded2503466e7fab3bb1b7dedbb888d7c12679f1f44159934432",
+      "reason": "Review 20261117 exact modal/native BUTTON lifetime repair: actual CPU actor is checked before effects; native synchronous consumer has an exact child/root/depth, private MSG and pre/post modal, owner and focus generations. Nested continuations retain their own guest return and parent frame, validate callback stack/invocation, and refuse retired/reused windows. Real native regression qualification remains in progress; no installed invocation or general retained ownership admission."
+    },
+    {
+      "file": "src/09c3a-dialog-runtime.wat",
+      "name": "$modal_pump_step",
+      "baseSHA256": "dc12e4d662a9a2c5ad3e0f181a744d7b487f0666c204df515c105dd22dd63da0",
+      "sha256": "cb79df54b8234f396eb6e64daa885b74fd3ef0950eac7821093782f9d050ec0b",
+      "reason": "Review 20261117 exact modal/native BUTTON lifetime repair: actual CPU actor is checked before effects; native synchronous consumer has an exact child/root/depth, private MSG and pre/post modal, owner and focus generations. Nested continuations retain their own guest return and parent frame, validate callback stack/invocation, and refuse retired/reused windows. Real native regression qualification remains in progress; no installed invocation or general retained ownership admission. Foreign CPU actor in the parked pump yields without invoking or unwinding the initiating actor; actual native main/Worker actor mutation controls cover refusal."
+    },
+    {
+      "file": "src/09a-handlers1-user.wat",
+      "name": "$handle_DestroyWindow",
+      "baseSHA256": "16fd031bb06e678c4fead7e54bb9239eb63c3d2f72a7cac9d751fe85e16a4b71",
+      "sha256": "f3dd83325a72d5f8b2e1b34973484d664912777d6452d20ee94ef9a2c8f46cf1",
+      "reason": "Review 20261117 exact modal/native BUTTON lifetime repair: actual CPU actor is checked before effects; native synchronous consumer has an exact child/root/depth, private MSG and pre/post modal, owner and focus generations. Nested continuations retain their own guest return and parent frame, validate callback stack/invocation, and refuse retired/reused windows. Real native regression qualification remains in progress; no installed invocation or general retained ownership admission."
+    },
+    {
+      "file": "lib/com-guest-continuation.js",
+      "name": "host-file",
+      "baseSHA256": "f8cfed9c5a0c97886749116fa479acb0eb2b992ddbfcaaf06cd2abd3375f5afb",
+      "sha256": "0b748885e3797ac82dd636b0746dc0d05a8c6a1a09bec94694a02a5304ed4d48",
+      "reason": "Review 20261117 Sims native COM yield12: actual owner-thread pending ReadFile fills asynchronously; retry preserves real VFS fault and native HRESULT. Exact native child token, original exports/memory and native epoch/root fence success and exceptional restoration of registers, stack, private IP/thunk, FS/SEH, flags and suspended yield. Host retirement fences new work while validated local cleanup retires output allocations, RPC buffers, packets and real interface refs before native retirement. Replacement never receives a saved frame. Authenticated exporter failure settles the executing pin without claiming a native result; caller cancellation retains executing pins until actual stub unwind. Focused actual-native same-path nesting/error/cancel/retirement and lifetime proof in run20261117-sims-native-com-yield12-continuation-repair. General ownership remains pending."
+    },
+    {
+      "file": "lib/com-interface-runtime.js",
+      "name": "host-file",
+      "baseSHA256": "bc812cae071f1b78f6a7bba9ccfe2095d3d9035743f760d55f8c6d7cbff4560c",
+      "sha256": "a5e01c792d18ee3e666d699a8cad8cdc84f32456466606cf8e05c996e837a61b",
+      "reason": "Review 20261117 Sims native COM yield12: actual owner-thread pending ReadFile fills asynchronously; retry preserves real VFS fault and native HRESULT. Exact native child token, original exports/memory and native epoch/root fence success and exceptional restoration of registers, stack, private IP/thunk, FS/SEH, flags and suspended yield. Host retirement fences new work while validated local cleanup retires output allocations, RPC buffers, packets and real interface refs before native retirement. Replacement never receives a saved frame. Authenticated exporter failure settles the executing pin without claiming a native result; caller cancellation retains executing pins until actual stub unwind. Focused actual-native same-path nesting/error/cancel/retirement and lifetime proof in run20261117-sims-native-com-yield12-continuation-repair. General ownership remains pending. Review 20261117 owned native type-description transport: SYSTEM PS lookup is synchronous and adds no callback; source pin includes the actual contract and value codecs. Returned interface attachments use authenticated exporter packets and exact caller leases, release on cancelled/unpolled replies, and retain existing real guest continuation/epoch/flags/stack fences. No new owner-restoration authority; general ownership remains pending. Focused native qualification in 20261117-sims-owned-native-typeinfo-factory-dispatch-integration. Review 20261117 native VariantCopyInd11: ordinal mapping is synchronous. Interface-only native memory lifetime adapter parks the original two-argument frame in the existing owner-thread operation; actual IUnknown AddRef/Release executes via ComGuestContinuation with exact token/epoch/root, current exports/memory, nested stack/flags/SEH/yield restoration and retired-owner fences unchanged. WAT stages scalar/BSTR/SAFEARRAY values before replacing destination; borrowed BYREF Copy retains no reference, CopyInd takes an independent owned reference. Failed callbacks remain errors, never native S_OK. Focused native lifetime/alias/failure/frame tests in 20261117-sims-native-variantcopyind-installer-progress; general ownership remains pending. Native query bit 0x100 only inspects an existing exact operation/frame/thread/stamp record, without enqueue/consume; complete callbacks are consumed once before rereading a replaced destination. It preserves all stale/abandoned/foreign-frame refusals. Local staged cleanup uses the validated cleanup scope on exceptions/retirement. Review 20261117 VARIANT SAFEARRAY: operations24-27 retain exact pending operation/frame/thread/stamp query and consume once before destination inspection; nested native VARIANT interface lifetimes use existing checked ComGuestContinuation, staged ownership and validated exceptional cleanup. No new callback restoration authority; full ownership qualification remains pending."
+    },
+    {
+      "file": "lib/com-owned-proxy.js",
+      "name": "host-file",
+      "baseSHA256": "10fb71d7574aed4e9ffea326770f061505c89591434c99143fb9444cd873780e",
+      "sha256": "400a7687b2037f349b0050ed471f9fea6ceadd2a88766e535e0a962a07bb3bfc",
+      "reason": "Review 20261117 Sims native COM yield12: actual owner-thread pending ReadFile fills asynchronously; retry preserves real VFS fault and native HRESULT. Exact native child token, original exports/memory and native epoch/root fence success and exceptional restoration of registers, stack, private IP/thunk, FS/SEH, flags and suspended yield. Host retirement fences new work while validated local cleanup retires output allocations, RPC buffers, packets and real interface refs before native retirement. Replacement never receives a saved frame. Authenticated exporter failure settles the executing pin without claiming a native result; caller cancellation retains executing pins until actual stub unwind. Focused actual-native same-path nesting/error/cancel/retirement and lifetime proof in run20261117-sims-native-com-yield12-continuation-repair. General ownership remains pending. Review 20261117 owned native type-description transport: SYSTEM PS lookup is synchronous and adds no callback; source pin includes the actual contract and value codecs. Returned interface attachments use authenticated exporter packets and exact caller leases, release on cancelled/unpolled replies, and retain existing real guest continuation/epoch/flags/stack fences. No new owner-restoration authority; general ownership remains pending. Focused native qualification in 20261117-sims-owned-native-typeinfo-factory-dispatch-integration."
+    },
+    {
+      "file": "lib/host-audio.js",
+      "name": "host-file",
+      "baseSHA256": "78756704277e20f2d8b1be3bd7c7bb37fbd56c82582dea95d3fcb875c162d014",
+      "sha256": "71888ea52749325cf13e70051aab2aa13c7b6bfde06cf9143905abda4ba48618",
+      "reason": "Review 20261118 AoE MCI notify: sequencer/waveaudio MCI_PLAY records MCI_NOTIFY hwnd; end of play posts MM_MCINOTIFY SUCCESSFUL from the existing per-batch guest-time pump; STOP/CLOSE post ABORTED, a new notify play posts SUPERSEDED; CLI sequencer keeps playing on the MCI clock without an AudioContext. Same _cdNotify -> post_window_message path cdaudio already used; no new callback, export or guest EIP write. Run 20261118-aoe-mci-notify."
+    },
+    {
+      "file": "lib/browser-shell.js",
+      "name": "host-file",
+      "baseSHA256": "6c1e8f7412c85b3a45ba5f30aa893bc5b74098508f315a247a0f1c3e520812a7",
+      "sha256": "7f74c0fe7b48d9b6e048bf200e858e6028f1947777d495d1500414bc7b18fdd8",
+      "reason": "Review 20261117 brand rename: only display strings and comments changed ('Wine-Assembly' -> 'Berrry Wine' in the crash-report title, fatal-error heading and a comment). No callback producer, boundary call, write, export or lifetime changed."
+    }
+  ],
+  "additions": [
+    {
+      "file": "lib/com-guest-continuation.js",
+      "name": "host-file",
+      "sha256": "f8cfed9c5a0c97886749116fa479acb0eb2b992ddbfcaaf06cd2abd3375f5afb",
+      "kind": "host-entry",
+      "reason": "Actual owner-only COM callbacks retain full i64 child tokens and validate source/process/thread/generation before and after suspension. All registers, private IP/thunk, handler, SEH and parent yield are restored only after a complete native stdcall return and ABI checks. Trap, unsupported wait or replacement leaves the child live for explicit retirement; no shadow CPU or finally resurrection.",
+      "ownership": "pending"
+    },
+    {
+      "file": "lib/com-interface-runtime.js",
+      "name": "host-file",
+      "sha256": "bc812cae071f1b78f6a7bba9ccfe2095d3d9035743f760d55f8c6d7cbff4560c",
+      "kind": "host-entry",
+      "reason": "One iterator remains attached to the original root invocation, with exact owner token, process/thread/generation, registers, stack, ABI, thunk and handler checked before and after awaited advances. Changed or retired frames are abandoned without restoration or replay. Incomplete advances preserve yield 23 and permit ordinary Worker slice completion; main and nested operations retain their original whole-operation path. Native Automation factory and typed proxy operations use the same checked suspended frame and ComGuestContinuation, including nested channel-to-stub callbacks; they transfer owned bytes rather than guest pointers. Actual x86 invocation, unregister lifetime and malformed/error qualification is recorded in run20261117-sims-native-interface-proxy-registration. Broader ownership remains pending.",
+      "ownership": "pending"
+    },
+    {
+      "file": "src/09a7b-ole.wat",
+      "name": "$com_interface_bridge",
+      "writes": 1,
+      "boundaryCalls": [],
+      "exports": [],
+      "targets": [
+        [
+          "global.get",
+          "$current_thunk_eip"
+        ]
+      ],
+      "sha256": "7377ce8aba18065b539e4f78b563d454c257eaada7b59b82b2e5190f55c42ea9",
+      "kind": "continuation",
+      "reason": "COM interface bridge retains and re-enters the exact original stdcall thunk on yield 23; owner root and epoch exports validate the existing full-width invocation lifetime. No foreign CPU entry or pointer serialization. Ownership remains pending outside this bounded implementation.",
+      "ownership": "pending"
+    },
+    {
+      "file": "src/09a7b-ole.wat",
+      "name": "export:com_owner_epoch",
+      "writes": 0,
+      "boundaryCalls": [
+        "$invocation_validate"
+      ],
+      "exports": [
+        "com_owner_epoch"
+      ],
+      "targets": [],
+      "sha256": "2c2590aad9f2059b9cb83e9eb49e9ab1970d3017e284cfe818cde2ac008f1ae5",
+      "kind": "continuation",
+      "reason": "COM interface bridge retains and re-enters the exact original stdcall thunk on yield 23; owner root and epoch exports validate the existing full-width invocation lifetime. No foreign CPU entry or pointer serialization. Ownership remains pending outside this bounded implementation.",
+      "ownership": "pending"
+    },
+    {
+      "file": "src/09a7b-ole.wat",
+      "name": "export:com_owner_root",
+      "writes": 0,
+      "boundaryCalls": [
+        "$invocation_validate"
+      ],
+      "exports": [
+        "com_owner_root"
+      ],
+      "targets": [],
+      "sha256": "d4e464b828542fb3c3e9fa8b5e7640eb752e8fef3fc908f29b34adfaf0806ced",
+      "kind": "continuation",
+      "reason": "COM interface bridge retains and re-enters the exact original stdcall thunk on yield 23; owner root and epoch exports validate the existing full-width invocation lifetime. No foreign CPU entry or pointer serialization. Ownership remains pending outside this bounded implementation.",
+      "ownership": "pending"
+    },
+    {
+      "file": "src/09a7b-ole.wat",
+      "name": "export:com_owner_token",
+      "writes": 0,
+      "boundaryCalls": [
+        "$invocation_current"
+      ],
+      "exports": [
+        "com_owner_token"
+      ],
+      "targets": [],
+      "sha256": "a3f19420266b812d3cdf719a319a646540dbabb964817ab1a6310363d27fc4d1",
+      "kind": "continuation",
+      "reason": "Read-only full-width current invocation token export used to authenticate the original parked COM frame. It neither enters a guest callback nor mutates or restores invocation state; broader ownership remains pending.",
+      "ownership": "pending"
+    },
+    {
+      "file": "lib/com-owned-proxy.js",
+      "name": "host-file",
+      "sha256": "10fb71d7574aed4e9ffea326770f061505c89591434c99143fb9444cd873780e",
+      "kind": "continuation",
+      "reason": "Remote QI retains the existing proxy root while awaiting authenticated exporter work. It reads the full-width current invocation token before suspension and validates token, exact IID and owner around every await. Ordinary HRESULT completion cancels pending work and releases the pin; traps and changed ownership do not replay or clean an abandoned guest frame. No new guest entry or context restoration; broader ownership remains pending.",
+      "ownership": "pending"
+    },
+    {
+      "file": "src/09e1-native-ft-relay.wat",
+      "name": "export:win16_guest_ls32_settle_absent",
+      "writes": 1,
+      "boundaryCalls": [],
+      "exports": [
+        "win16_guest_ls32_settle_absent"
+      ],
+      "targets": [
+        [
+          "global.get",
+          "$win16_guest_return"
+        ]
+      ],
+      "sha256": "b972570e58b350f2fda4ed6bb6041595941ea00a3f02144eb44bb5c8e363f30a",
+      "kind": "lifecycle",
+      "reason": "Absent-companion ThunkConnect32 attach settlement: valid parked op-5 request with attach reason only; cancels any lease owned by that request, returns TRUE and consumes the exact 28-byte stdcall frame to the recorded return like win16_guest_ft_connect_settle, publishing nothing into the LS32 header or relays. Single settlement; the request token is cleared. Ownership remains pending.",
+      "ownership": "pending"
+    },
+    {
+      "file": "src/09e-win16-api.wat",
+      "name": "export:win16_nested_request_settle",
+      "writes": 0,
+      "boundaryCalls": [
+        "$win16_nested_request_valid",
+        "$win16_bridge_module_resolve",
+        "$win16_bridge_module_readable",
+        "$win16_name_scratch",
+        "$win16_cstr_to_pstr",
+        "$win16_module_id",
+        "$g2w",
+        "$win16_api_return"
+      ],
+      "exports": [
+        "win16_nested_request_settle"
+      ],
+      "targets": [],
+      "sha256": "e78e836eed0e673163c4ff36b3ecd386d4d03d1f1e44e51229c8c7a13b2bc7d9",
+      "kind": "continuation",
+      "reason": "Review 20261117 QT nested native image loading: a distinct per-frame request serial plus full frame-generation token parks only KERNEL.95/96 below the exact active QT/LS connection. Settlement validates actor, caller EIP/ESP/CS/SS/far return, original alias descriptor and backing lease, module lifetime and PE generation; the PE request is untouched. Source bytes use the process resolver and canonical resident identity. Actual LibMain, Win4 semantic usage notifications, native handles/exports/pins/refcounts, rollback, WEP and final unload remain owned by the native lifecycle. Worker source I/O parks the same command/callback owner and checks it after each await; synchronous initializer reentry cannot fetch unavailable async sources. Native success, reference reuse, reentry, cancellation/fault/missing/wrong source, generation/actor/selector/lease/retired refusal and actual CPUWorker proofs are in run20261117-neverhood-native-nested-image-load. No FT, general callback or unrelated direction admission; general ownership remains pending.",
+      "ownership": "pending"
+    },
+    {
+      "file": "src/09c3a-dialog-runtime.wat",
+      "name": "$dialog_native_mouse",
+      "writes": 0,
+      "boundaryCalls": [
+        "$sync_depth_enter",
+        "$invocation_current",
+        "$invocation_current",
+        "$sync_depth_leave"
+      ],
+      "exports": [],
+      "targets": [],
+      "sha256": "7b871dd51133a2b33be6c686a54b14c42b0eb863d9519c9bf7d34349b4b1d7cf",
+      "kind": "continuation",
+      "reason": "Review 20261117 exact modal/native BUTTON lifetime repair: actual CPU actor is checked before effects; native synchronous consumer has an exact child/root/depth, private MSG and pre/post modal, owner and focus generations. Nested continuations retain their own guest return and parent frame, validate callback stack/invocation, and refuse retired/reused windows. Real native regression qualification remains in progress; no installed invocation or general retained ownership admission.",
+      "ownership": "pending"
+    },
+    {
+      "file": "src/09c3a-dialog-runtime.wat",
+      "name": "$modal_callback_return",
+      "writes": 0,
+      "boundaryCalls": [
+        "$invocation_current",
+        "$sync_depth_leave"
+      ],
+      "exports": [],
+      "targets": [],
+      "sha256": "cec9b668f7ae74a93ea36c52891a0fb8eda6fc0b48e10b166e44c18cc64458dc",
+      "kind": "continuation",
+      "reason": "Review 20261117 exact modal/native BUTTON lifetime repair: actual CPU actor is checked before effects; native synchronous consumer has an exact child/root/depth, private MSG and pre/post modal, owner and focus generations. Nested continuations retain their own guest return and parent frame, validate callback stack/invocation, and refuse retired/reused windows. Real native regression qualification remains in progress; no installed invocation or general retained ownership admission.",
+      "ownership": "pending"
+    },
+    {
+      "file": "src/09c3a-dialog-runtime.wat",
+      "name": "$modal_dispatch_posted",
+      "writes": 1,
+      "boundaryCalls": [
+        "$sync_depth_enter",
+        "$invocation_current"
+      ],
+      "exports": [],
+      "targets": [
+        [
+          "local.get",
+          "$proc"
+        ]
+      ],
+      "sha256": "6d7fe3bf1a8e81f3187c5e1e476f60fe7e891d8a9c6682bbce9edc5dce725a74",
+      "kind": "continuation",
+      "reason": "Review 20261117 exact modal/native BUTTON lifetime repair: actual CPU actor is checked before effects; native synchronous consumer has an exact child/root/depth, private MSG and pre/post modal, owner and focus generations. Nested continuations retain their own guest return and parent frame, validate callback stack/invocation, and refuse retired/reused windows. Real native regression qualification remains in progress; no installed invocation or general retained ownership admission.",
+      "ownership": "pending"
+    },
+    {
+      "file": "src/09c3a-dialog-runtime.wat",
+      "name": "$modal_frame_invocation_check",
+      "writes": 0,
+      "boundaryCalls": [
+        "$invocation_current"
+      ],
+      "exports": [],
+      "targets": [],
+      "sha256": "009eedf5edb640c39f2fd244fdc2240363baa55e72bc978811e3082098abe3aa",
+      "kind": "continuation",
+      "reason": "Review 20261117 exact modal/native BUTTON lifetime repair: actual CPU actor is checked before effects; native synchronous consumer has an exact child/root/depth, private MSG and pre/post modal, owner and focus generations. Nested continuations retain their own guest return and parent frame, validate callback stack/invocation, and refuse retired/reused windows. Real native regression qualification remains in progress; no installed invocation or general retained ownership admission.",
+      "ownership": "pending"
+    },
+    {
+      "file": "src/09c3a-dialog-runtime.wat",
+      "name": "$modal_frame_save",
+      "writes": 0,
+      "boundaryCalls": [
+        "$invocation_ensure",
+        "$invocation_current"
+      ],
+      "exports": [],
+      "targets": [],
+      "sha256": "5ab61939c87407f628bbbdbd04e59e12167cfcd2d56649b383fb298e0416c000",
+      "kind": "continuation",
+      "reason": "Review 20261117 exact modal/native BUTTON lifetime repair: actual CPU actor is checked before effects; native synchronous consumer has an exact child/root/depth, private MSG and pre/post modal, owner and focus generations. Nested continuations retain their own guest return and parent frame, validate callback stack/invocation, and refuse retired/reused windows. Real native regression qualification remains in progress; no installed invocation or general retained ownership admission.",
+      "ownership": "pending"
+    },
+    {
+      "file": "src/09c3a-dialog-runtime.wat",
+      "name": "$modal_native_key",
+      "writes": 0,
+      "boundaryCalls": [
+        "$sync_depth_enter",
+        "$invocation_current",
+        "$sync_depth_leave",
+        "$invocation_current",
+        "$sync_depth_leave"
+      ],
+      "exports": [],
+      "targets": [],
+      "sha256": "67f5716e10539643fa0b24472bedd625d499a5f99f9875fb8dc3143fdb70c4ba",
+      "kind": "continuation",
+      "reason": "Review 20261117 exact modal/native BUTTON lifetime repair: actual CPU actor is checked before effects; native synchronous consumer has an exact child/root/depth, private MSG and pre/post modal, owner and focus generations. Nested continuations retain their own guest return and parent frame, validate callback stack/invocation, and refuse retired/reused windows. Real native regression qualification remains in progress; no installed invocation or general retained ownership admission.",
+      "ownership": "pending"
+    },
+    {
+      "file": "src/09c3a-dialog-runtime.wat",
+      "name": "$modal_resume_completed",
+      "writes": 1,
+      "boundaryCalls": [],
+      "exports": [],
+      "targets": [
+        [
+          "load.field",
+          "ModalContinuation",
+          "ret",
+          [
+            "local.get",
+            "$f"
+          ]
+        ]
+      ],
+      "sha256": "103677bfe91dd075ea24411f3bf3612a289b26cbb72c4deb4eea3f3f38c3c6bb",
+      "kind": "continuation",
+      "reason": "Review 20261117 exact modal/native BUTTON lifetime repair: actual CPU actor is checked before effects; native synchronous consumer has an exact child/root/depth, private MSG and pre/post modal, owner and focus generations. Nested continuations retain their own guest return and parent frame, validate callback stack/invocation, and refuse retired/reused windows. Real native regression qualification remains in progress; no installed invocation or general retained ownership admission.",
+      "ownership": "pending"
+    },
+    {
+      "file": "src/13-exports.wat",
+      "name": "$native_button_returned",
+      "writes": 0,
+      "boundaryCalls": [
+        "$invocation_current"
+      ],
+      "exports": [],
+      "targets": [],
+      "sha256": "05260eeca0f427972fe16b0207fb138b6c852d11d515cbf0941485a9887d2dd2",
+      "kind": "continuation",
+      "reason": "Review 20261117 exact modal/native BUTTON lifetime repair: actual CPU actor is checked before effects; native synchronous consumer has an exact child/root/depth, private MSG and pre/post modal, owner and focus generations. Nested continuations retain their own guest return and parent frame, validate callback stack/invocation, and refuse retired/reused windows. Real native regression qualification remains in progress; no installed invocation or general retained ownership admission.",
+      "ownership": "pending"
+    },
+    {
+      "file": "src/13-exports.wat",
+      "name": "export:com_callback_get_flags",
+      "writes": 0,
+      "boundaryCalls": [
+        "$com_callback_check"
+      ],
+      "exports": [
+        "com_callback_get_flags"
+      ],
+      "targets": [],
+      "sha256": "86c313c3ed8bc9413386e1caab909d2c697b7c21b926d8f92f377239b88306a4",
+      "kind": "context-restore",
+      "reason": "Token-checked lazy x86 flags snapshot/restore for the exact owned COM child; stale invocation traps before mutation. No guest callback or success acknowledgment. Focused native continuation proof in run20261117-sims-native-com-yield12-continuation-repair; general ownership remains pending.",
+      "ownership": "pending"
+    },
+    {
+      "file": "src/13-exports.wat",
+      "name": "export:com_callback_set_flags",
+      "writes": 0,
+      "boundaryCalls": [
+        "$com_callback_check"
+      ],
+      "exports": [
+        "com_callback_set_flags"
+      ],
+      "targets": [],
+      "sha256": "e31539527389bed686bec99ebe005c00775efb7006a6119e94f68e661160b860",
+      "kind": "context-restore",
+      "reason": "Token-checked lazy x86 flags snapshot/restore for the exact owned COM child; stale invocation traps before mutation. No guest callback or success acknowledgment. Focused native continuation proof in run20261117-sims-native-com-yield12-continuation-repair; general ownership remains pending.",
+      "ownership": "pending"
+    }
+  ]
+}
