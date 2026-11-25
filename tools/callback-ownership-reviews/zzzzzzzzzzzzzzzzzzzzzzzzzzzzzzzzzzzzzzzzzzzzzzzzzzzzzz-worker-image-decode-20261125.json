@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "revisions": [
+    {
+      "file": "host.js",
+      "name": "host-file",
+      "baseSHA256": "30810fad80d83ac1fafbe34d89f621032cf3c8bcc7b714afb8b29ed715c2bd6f",
+      "sha256": "cc6cf9e9d995e79db86dd4ef32013b2f6544141483cb1d2a8c6980021457a9c1",
+      "reason": "Review 20261125: _decodeMountedImage tries createImageBitmap before requiring a document, so a Worker host decodes mounted images. Image decoding only; no EIP write, callback frame, guest stack, HWND lifetime, hook or message delivery changed; callback ownership remains pending."
+    }
+  ]
+}
