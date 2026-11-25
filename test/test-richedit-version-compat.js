@@ -206,13 +206,13 @@ async function main() {
   got = getEx(v2, 64, 2, 0);
   check('EM_GETTEXTEX with GT_SELECTION copies the selection',
     got.n === 4 && got.out === 'beta', JSON.stringify(got));
-  const lines = e.test_create_richedit(2, style, allocAscii('one\r\ntwo'));
-  got = getEx(lines, 64, 0, 0);
+  const paragraphs = e.test_create_richedit(2, style, allocAscii('one\r\ntwo'));
+  got = getEx(paragraphs, 64, 0, 0);
   check('EM_GETTEXTEX reads a paragraph break as CR',
-    got.out === 'one\rtwo' && lenEx(lines, 0, 0) === 7, JSON.stringify(got));
-  got = getEx(lines, 64, 1, 0);
+    got.out === 'one\rtwo' && lenEx(paragraphs, 0, 0) === 7, JSON.stringify(got));
+  got = getEx(paragraphs, 64, 1, 0);
   check('EM_GETTEXTEX with GT_USECRLF reads it as CRLF',
-    got.out === 'one\r\ntwo' && lenEx(lines, 1, 0) === 8, JSON.stringify(got));
+    got.out === 'one\r\ntwo' && lenEx(paragraphs, 1, 0) === 8, JSON.stringify(got));
   check('RichEdit 1.0 leaves EM_GETTEXTLENGTHEX unsupported',
     lenEx(v1, 0, 0) === 0);
 

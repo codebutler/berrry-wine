@@ -32,8 +32,11 @@ async function fixture() {
     (func (export "guest_read32") (param $p i32) (result i32) (i32.load (local.get $p)))
     (func (export "guest_write32") (param $p i32) (param $v i32) (i32.store (local.get $p) (local.get $v)))
     (func (export "has_pending_message") (result i32) (i32.const 1))
+    ;; Like src/13-exports.wat, the export owns EIP: it returns to the
+    ;; caller's return address (or enters a hook the handler redirects to).
     (func (export "resume_message_wait") (result i32)
       (global.set $yield_reason (i32.const 0))
+      (global.set $eip (i32.load (global.get $esp)))
       (global.set $esp (i32.add (global.get $esp) (i32.const 4))) (i32.const 1))
     (func (export "set_yield_state") (param $y i32) (param $f i32)
       (global.set $yield_reason (local.get $y)) (global.set $yield_flag (local.get $f)))
